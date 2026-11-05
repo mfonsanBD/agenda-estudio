@@ -280,6 +280,11 @@ adminMeta, width %). Estrutura repetida = classe.
 ## 4c. Navegação (Sidebar + barra inferior)
 
 Fonte única: `config/nav.ts` (`CLIENT_NAV`/`ADMIN_NAV`). Página nova = UMA entrada lá.
+Página nova da equipe = também UMA entrada em `STAFF_ROUTE_ACCESS` (`perm: [...]` = qualquer uma
+destas chaves; `adminOnly: true` = só o ADMIN), espalhada no item do menu e usada pelo `StaffRoute`
+da rota: o menu da equipe é `filterNav(ADMIN_NAV, can, isAdmin)` (itens e subitens; o pai some sem
+filho liberado). Subitem de Configurações = `settingsSub(sec, label)`, com a permissão da seção e o
+rótulo igual ao `STAFF_SETTINGS_SECTIONS` do backend (o `eq-permissions-sync` confere).
 
 - **Sidebar recolhida** (desktop, Ctrl+B): cada item (inclusive o expansível
   Configurações e o bloco do usuário) usa `<Tooltip placement="right"
@@ -291,12 +296,54 @@ Fonte única: `config/nav.ts` (`CLIENT_NAV`/`ADMIN_NAV`). Página nova = UMA ent
   (máx. 4: Início, Agenda, Hoje, Sessões) + aba **"Mais"**, que abre um `BottomSheetModal`
   com o excedente agrupado por `section` (item ativo destacado; fecha ao navegar). Item novo
   sem `mobilePrimary` cai sozinho no "Mais". Rótulo da barra = `shortLabel ?? label`
-  (curto: slot de ~72px a 360px).
+  (curto: slot de ~72px a 360px). Colaborador com menos de 4 `mobilePrimary` liberados:
+  `splitMobileNav` completa as vagas com os próximos itens do menu filtrado.
+- **Rótulo do usuário** (Sidebar e barra): "Administrador", o cargo do colaborador (ou
+  "Colaborador") ou "Cliente" — `roleLabelOf(user)` de `hooks/usePermission.ts`.
 - Item ativo = rota exata **ou aninhada** (`isNavItemActive`: `/admin/contracts/:id` ativa
   Contratos; na barra, a aba "Mais" fica ativa quando a rota pertence ao excedente).
 - Contrato: manter a classe `.bottom-tab-bar-wrap` e a altura de 64px (`--bottom-tab-h`) —
   o `BottomSheetModal` mede o wrap para abrir acima da barra, e a save bar/banner PWA se
   posicionam por essa altura. Tooltip não aparece no toque (barra não usa Tooltip).
+
+## 4d. Permissões na interface (equipe)
+
+Regras de negócio em [permissoes-equipe.md](permissoes-equipe.md). Esconder na tela é conforto:
+quem protege é o servidor (403 `PERMISSION_DENIED`).
+
+- **Guardas de rota** (`App.tsx`): `ProtectedRoute` (logado) envolve `StaffRoute
+  access={STAFF_ROUTE_ACCESS['/admin/x']}` (equipe; cliente volta ao Painel sem aviso, equipe sem a
+  chave volta com o toast "Você não tem acesso a essa área. Voltamos para o painel."), `ClientRoute`
+  (`/minhas-gravacoes`, `/meus-*`), `CalendarRoute` (`/calendar`) e `SettingsSectionGuard` (`?sec=`
+  de Configurações). O aviso sai por `RedirectWithNotice` (efeito, nunca no render). Nunca checar
+  `role === 'ADMIN'` para "é equipe": use `isStaff`; para "é cliente", `role === 'CLIENTE'`.
+- **No componente**: `const { can, canAny, canAll, isAdmin, isStaff, isClient, roleLabel } =
+  usePermission()` (`hooks/usePermission.ts`) ou `<Can perm|anyOf|allOf|adminOnly|staffOnly
+  fallback>` (`components/auth/Can.tsx`). Chaves tipadas por `constants/permissions.ts` (união das
+  chaves do backend, sem rótulos — os rótulos vêm do `GET /api/staff/catalog`).
+- **Esconder × desabilitar**: ação sem a chave some (botão, coluna "Ações" inteira quando não sobra
+  nenhuma, link do nome do cliente vira texto sem `clientes.ver`). Quando esconder confundiria
+  (opção de um grupo, campo de um formulário que a pessoa vê), fica **desabilitado com `<Tooltip>`
+  dizendo a permissão** (padrão do botão `disabled`: Tooltip num `<span style={{ display:
+  'inline-flex' }}>`), ou só leitura com uma nota curta ("Somente leitura: …"). Ex.: "Confirmado" no
+  Novo agendamento sem `cobrancas.baixa`; opções de status do `EditBookingModal` e do status inline
+  filtradas pelo espelho `bookingPermissions.ts`; campos travados do Editar contrato (opacidade
+  inline, porque `.form-input:disabled` ainda não tem estilo global).
+- **Cargas condicionais**: a tela só pede o que a pessoa pode ler (um 403 não pode derrubar a
+  tela): `Promise.allSettled`/cargas independentes por permissão, como no Painel.
+- **Estados vazios do Painel**: sem nenhuma permissão, "Seu acesso ainda não tem módulos
+  liberados." + "Fale com o administrador."; com permissões que não abrem tela, "Suas permissões
+  atuais não abrem nenhuma tela."; com telas mas sem bloco do painel, "O painel não tem blocos para
+  o seu acesso" com atalhos.
+- **Tela Equipe** (`pages/AdminTeamPage.tsx`, `components/admin/team/*`): CSS em
+  `styles/team.css` (só tokens, sem hex; importado pela página e pelos componentes da equipe).
+  Selos de tipo e situação em `constants/adminMeta.ts`: `STAFF_ROLE_META` (ADMIN "Administrador",
+  âmbar, `ShieldCheck`; COLABORADOR "Colaborador", teal, `UserCog`) e `STAFF_STATUS_META` (Ativo;
+  Desativado em cinza). O `TeamMemberModal` segue o padrão de wizard (§3b) e a etapa Permissões
+  mostra, por módulo, só os níveis **distintos** do catálogo (vazio ou repetido some; Cobranças =
+  "Cobrar o cliente"/"Tudo"; Avisos = "Tudo") + "Personalizado" quando as caixas não batem;
+  dependência travada = caixa desabilitada com o motivo; exclusivas do admin em cinza; selos com a
+  dica no `title` (informativo, §4b).
 
 ## 5. Animação
 

@@ -13,6 +13,7 @@ import BrandLoader from '../components/ui/BrandLoader';
 import { useUI } from '../context/UIContext';
 import { useDeleteClient } from '../hooks/useDeleteClient';
 import { getErrorMessage } from '../utils/errors';
+import { usePermission } from '../hooks/usePermission';
 
 /** dd/mm/aaaa no fuso do estúdio. */
 const formatSpDate = (iso: string) => new Date(iso).toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
@@ -22,6 +23,16 @@ export default function ClientProfilePage() {
     const navigate = useNavigate();
     const { showToast } = useUI();
     const { requestDelete, previewingId } = useDeleteClient();
+    // A página abre com clientes.ver (guarda da rota); cada bloco que altera algo segue a sua permissão:
+    // observações = clientes.editar; card "Pagamento" (parcelas, cartão salvo, cobrança automática) =
+    // clientes.ver, financeiro.ver OU cobrancas.automatica — EQ-REQ-05 / DECISÕES resposta 3: sem
+    // financeiro.ver some só a receita consolidada, não as parcelas do cliente. O interruptor continua só
+    // com cobrancas.automatica; excluir = clientes.excluir.
+    const { can, canAny } = usePermission();
+    const canEditProfile = can('clientes.editar');
+    const canSeePayments = canAny('clientes.ver', 'financeiro.ver', 'cobrancas.automatica');
+    const canToggleAutoCharge = can('cobrancas.automatica');
+    const canDeleteClient = can('clientes.excluir');
     const [user, setUser] = useState<UserDetail | null>(null);
     const [loading, setLoading] = useState(true);
     const [loadError, setLoadError] = useState(false);
@@ -39,7 +50,25 @@ export default function ClientProfilePage() {
     // A visão de pagamento chega DEPOIS do perfil: enquanto a 1ª busca não volta, o card mostra o loading de marca
     // (antes o bloco simplesmente "aparecia" sem aviso). Em refetch silencioso o card já exibido continua na tela.
     const [payLoading, setPayLoading] = useState(false);
+    // Lido pelo loadUser (closure do 1º render) e pelo efeito abaixo: a permissão pode chegar ou mudar
+    // depois da carga do perfil (refreshPermissions após um 403, volta para a aba).
+    const canSeePaymentsRef = useRef(canSeePayments);
+    canSeePaymentsRef.current = canSeePayments;
     useEffect(() => { if (id) loadUser(); }, [id]);
+
+    const loadPayOverview = useCallback((clientId: string) => {
+        setPayLoading(true);
+        usersApi.paymentOverview(clientId).then(setPayOverview).catch(() => setPayOverview(null)).finally(() => setPayLoading(false));
+    }, []);
+    // Permissão de ver pagamento mudou com o perfil já na tela: busca (ou esconde) o card sem recarregar a página.
+    const userLoaded = !!user;
+    const userDeleted = !!user?.deletedAt;
+    useEffect(() => {
+        if (!id || !userLoaded || userDeleted) return;
+        if (!canSeePayments) { setPayOverview(null); return; }
+        if (!payOverview && !payLoading) loadPayOverview(id);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [canSeePayments, userLoaded]);
 
     /**
      * Grava AGORA a observação pendente do debounce, em vez de descartá-la (sair da página, trocar de
@@ -78,16 +107,15 @@ export default function ClientProfilePage() {
             setUser(res.user);
             setNotes(res.user.notes || '');
             // Cliente excluído (D3): sem cartões nem cobrança automática — não há visão de pagamento a buscar.
-            if (res.user.deletedAt) setPayOverview(null);
-            else {
-                setPayLoading(true);
-                usersApi.paymentOverview(id!).then(setPayOverview).catch(() => setPayOverview(null)).finally(() => setPayLoading(false));
-            }
+            // Sem financeiro.ver nem cobrancas.automatica, a rota daria 403: nem pede.
+            if (res.user.deletedAt || !canSeePaymentsRef.current) setPayOverview(null);
+            else loadPayOverview(id!);
         } catch (err) { console.error(err); setLoadError(true); }
         finally { if (!silent) setLoading(false); }
     };
 
     const handleNotesChange = (value: string) => {
+        if (!canEditProfile) return;
         setNotes(value);
         setNotesSaved(false);
         pendingNotesRef.current = { id: id!, value };
@@ -127,7 +155,7 @@ export default function ClientProfilePage() {
     // D3: cliente excluído (soft delete) = perfil só-histórico. O PATCH do cadastro responde 409,
     // então editores, notas, cobrança automática e a Zona de perigo ficam ocultos.
     const isDeleted = !!user.deletedAt;
-    const canDelete = !isDeleted && user.role !== 'ADMIN';
+    const canDelete = !isDeleted && canDeleteClient;
     const deleting = previewingId === user.id;
 
     const handleDelete = async () => {
@@ -162,7 +190,7 @@ export default function ClientProfilePage() {
             <ClientHealthCards user={user} />
 
             {!isDeleted && payOverview && (
-                <PaymentOverviewCard overview={payOverview} autoSaving={autoSaving} onToggleAutoCharge={handleAutoCharge} />
+                <PaymentOverviewCard overview={payOverview} autoSaving={autoSaving} onToggleAutoCharge={handleAutoCharge} canToggleAutoCharge={canToggleAutoCharge} />
             )}
             {!isDeleted && !payOverview && payLoading && (
                 <div className="card" style={{ padding: '20px', marginBottom: '16px' }}>
@@ -185,11 +213,17 @@ export default function ClientProfilePage() {
                 <textarea
                     className="form-input"
                     style={{ minHeight: 120, resize: 'vertical', fontFamily: 'inherit', width: '100%', boxSizing: 'border-box' }}
-                    placeholder="Anotações internas sobre o cliente..."
+                    placeholder={canEditProfile ? 'Anotações internas sobre o cliente...' : 'Sem observações.'}
                     aria-label="Observações do cliente"
+                    readOnly={!canEditProfile}
                     value={notes}
                     onChange={e => handleNotesChange(e.target.value)}
                 />
+                {!canEditProfile && (
+                    <div style={{ marginTop: '6px', fontSize: '0.6875rem', color: 'var(--text-muted)' }}>
+                        Somente leitura: editar exige a permissão “Editar o cadastro do cliente”.
+                    </div>
+                )}
             </div>
             )}
 

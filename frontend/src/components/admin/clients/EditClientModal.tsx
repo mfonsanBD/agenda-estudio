@@ -12,6 +12,7 @@ import { parseSocialLinks, serializeSocialLinks, SOCIAL_NETWORKS } from './Socia
 import {
     CLIENT_WIZARD_STEPS, CLIENT_WIZARD_TOTAL, EMPTY_CLIENT_FORM, ADDRESS_KEYS,
     ClientWizardStepFields, findFirstInvalidClientStep, mapClientApiError, useClientForm, useStepViewReset, isSocialLinksJson,
+    useClientWizardAccess,
 } from './ClientWizardFields';
 
 interface EditClientModalProps {
@@ -33,7 +34,7 @@ export default function EditClientModal({ user, onClose, onSaved }: EditClientMo
     const { step, back, goTo, isLast } = useWizardStep(CLIENT_WIZARD_TOTAL);
     const form = useClientForm({
         ...EMPTY_CLIENT_FORM,
-        name: user.name, email: user.email || '', phone: maskPhone(user.phone || ''), role: user.role,
+        name: user.name, email: user.email || '', phone: maskPhone(user.phone || ''),
         clientStatus: user.clientStatus || 'ACTIVE',
     }, 'edit');
     const { values, setValues } = form;
@@ -53,14 +54,19 @@ export default function EditClientModal({ user, onClose, onSaved }: EditClientMo
     // D3: mudar o status para "Bloqueado" é ação de perigo → confirmação antes de salvar.
     // Base = status que está salvo no banco (atualizado quando o GET /users/:id chega).
     const savedStatusRef = useRef<string>(user.clientStatus || 'ACTIVE');
+    const [savedStatus, setSavedStatus] = useState<string>(user.clientStatus || 'ACTIVE');
     const [confirmBlock, setConfirmBlock] = useState(false);
+    // D9 (Fase 1): cadastro = clientes.editar; e-mail de login, bloquear e desbloquear = clientes.acesso;
+    // senha = só o ADMIN. Os campos que o acesso não permite ficam travados (com o motivo), e o servidor
+    // recusa o resto com 403 (regra por valor alterado: reenviar o mesmo valor não exige nada).
+    const access = useClientWizardAccess('edit', savedStatus);
 
     useEffect(() => {
         let cancelled = false;
         // Semente com os dados do resumo (lista); o restante chega do GET /users/:id.
         setValues({
             ...EMPTY_CLIENT_FORM,
-            name: user.name, email: user.email || '', phone: maskPhone(user.phone || ''), role: user.role,
+            name: user.name, email: user.email || '', phone: maskPhone(user.phone || ''),
             clientStatus: user.clientStatus || 'ACTIVE',
         });
         setEditError('');
@@ -75,6 +81,7 @@ export default function EditClientModal({ user, onClose, onSaved }: EditClientMo
                 setSocialRaw(d.socialLinks || null);
                 setSocialTouched(false);
                 savedStatusRef.current = d.clientStatus || 'ACTIVE';
+                setSavedStatus(d.clientStatus || 'ACTIVE');
                 setValues(prev => ({
                     ...prev,
                     notes: d.notes || '',
@@ -134,21 +141,25 @@ export default function EditClientModal({ user, onClose, onSaved }: EditClientMo
             const data: Parameters<typeof usersApi.update>[1] = {};
             const name = values.name.trim();
             const email = values.email.trim();
-            if (name && name !== user.name) data.name = name;
-            if (email && email !== user.email) data.email = email;
-            const phone = values.phone.replace(/\D/g, '');
-            if (phone !== (user.phone || '')) data.phone = phone;
-            if (values.role && values.role !== user.role) data.role = values.role;
-            if (values.password) data.password = values.password;
+            // E-mail de login só com clientes.acesso (o campo fica travado sem ela).
+            if (access.canEditLoginEmail && email && email !== user.email) data.email = email;
+            // Sem `role` (D9). Senha de cliente: só o ADMIN.
+            if (access.canSetPassword && values.password) data.password = values.password;
             if (values.clientStatus) data.clientStatus = values.clientStatus;
-            // Notas: SEMPRE string ('' limpa). O backend não aceita null aqui (z.string().optional()).
-            data.notes = values.notes;
-            data.cpfCnpj = values.cpfCnpj.replace(/\D/g, '') || null;
-            ADDRESS_KEYS.forEach(k => { data[k] = values[k].trim() || null; });
-            if (socialTouched) {
-                const base = parseSocialLinks(socialRaw);
-                const edited = Object.fromEntries(Object.entries(values.social).map(([k, v]) => [k, v.trim()]));
-                data.socialLinks = serializeSocialLinks({ ...base, ...edited });
+            // Campos do cadastro só com clientes.editar (travados sem ela — nem vão no corpo).
+            if (access.canEditProfile) {
+                if (name && name !== user.name) data.name = name;
+                const phone = values.phone.replace(/\D/g, '');
+                if (phone !== (user.phone || '')) data.phone = phone;
+                // Notas: SEMPRE string ('' limpa). O backend não aceita null aqui (z.string().optional()).
+                data.notes = values.notes;
+                data.cpfCnpj = values.cpfCnpj.replace(/\D/g, '') || null;
+                ADDRESS_KEYS.forEach(k => { data[k] = values[k].trim() || null; });
+                if (socialTouched) {
+                    const base = parseSocialLinks(socialRaw);
+                    const edited = Object.fromEntries(Object.entries(values.social).map(([k, v]) => [k, v.trim()]));
+                    data.socialLinks = serializeSocialLinks({ ...base, ...edited });
+                }
             }
             await usersApi.update(user.id, data);
             showToast('Dados do cliente atualizados.');
@@ -214,6 +225,7 @@ export default function EditClientModal({ user, onClose, onSaved }: EditClientMo
                                 onPatch={patch}
                                 onTouch={form.touch}
                                 legacySocialText={legacySocialText}
+                                access={access}
                             />
                         </div>
 

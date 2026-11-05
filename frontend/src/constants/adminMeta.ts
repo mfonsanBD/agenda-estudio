@@ -7,7 +7,7 @@ import {
     Building2, Mic, Star,
     Clock, CheckCircle, CheckCircle2, Ban, XCircle, AlertCircle,
     Lock, Pause, Undo2, ShieldCheck, Pin, RefreshCw, Ticket, Circle, Hourglass,
-    Sparkles, Wand2, CalendarClock, CalendarCheck, CalendarX,
+    Sparkles, Wand2, CalendarClock, CalendarCheck, CalendarX, UserCog,
     type LucideIcon,
 } from 'lucide-react';
 
@@ -81,6 +81,19 @@ export const USER_TYPE_META: Record<string, MetaEntry> = {
  *  Alias of USER_TYPE_META minus ADMIN — use for contract-type badges so AVULSO
  *  is never collapsed into "Flex". */
 export const CONTRACT_TYPE_META = USER_TYPE_META;
+
+/** Equipe (tela `/admin/equipe`): tipo de acesso do membro (StaffMember.role).
+ *  Administrador = âmbar (mesmo tom do antigo selo "Admin"); Colaborador = teal da marca (--accent-text). */
+export const STAFF_ROLE_META: Record<string, MetaEntry> = {
+    ADMIN:       { label: 'Administrador', color: '#f59e0b', bg: 'rgba(245,158,11,0.12)', icon: ShieldCheck },
+    COLABORADOR: { label: 'Colaborador',   color: '#2FA8C2', bg: 'rgba(47,168,194,0.12)', icon: UserCog },
+};
+
+/** Equipe: situação do acesso (StaffMember.active → 'ACTIVE' | 'INACTIVE'). Desativado = cinza neutro. */
+export const STAFF_STATUS_META: Record<string, MetaEntry> = {
+    ACTIVE:   { label: 'Ativo',      color: '#10b981', bg: 'rgba(16,185,129,0.12)',  icon: CheckCircle2 },
+    INACTIVE: { label: 'Desativado', color: '#6b7280', bg: 'rgba(107,114,128,0.12)', icon: Ban },
+};
 
 const FALLBACK: MetaEntry = { label: '—', color: 'var(--text-muted)', bg: 'rgba(148,163,184,0.12)', icon: Circle };
 

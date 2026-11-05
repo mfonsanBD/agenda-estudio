@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middleware/auth.js';
+import { actorOrReply, can, canAny, denyPermission } from '../../middleware/permissions.js';
 import { resolvePixProvider, isPixProvider, type PixProvider } from '../../lib/pixGateway.js';
 import { sicoobAllowedEnvironment } from '../../lib/sicoobService.js';
 
@@ -61,14 +62,23 @@ export function registerPaymentClientRoutes(router: Router) {
         }
     });
 
+    // Rota MISTA: o cliente consulta só as próprias cobranças; a equipe consulta qualquer uma com
+    // cobrancas.cobrar, financeiro.ver ou cobrancas.baixa (o checkout do balcão faz polling aqui). Equipe
+    // sem nenhuma delas → 403 explícito (nunca cai no ramo do cliente).
     router.get('/:id/status', authenticate, async (req: Request, res: Response) => {
         try {
             const id = req.params.id as string;
             const userId = req.user!.userId;
-            const isAdmin = req.user!.role === 'ADMIN';
+            const actor = await actorOrReply(req, res);
+            if (!actor) return;
+            const staffOk = actor.isStaff;
+            if (staffOk && !canAny(actor, 'cobrancas.cobrar', 'financeiro.ver', 'cobrancas.baixa')) {
+                denyPermission(res, 'cobrancas.cobrar');
+                return;
+            }
 
             const payment = await prisma.payment.findFirst({
-                where: isAdmin ? { id } : { id, userId },
+                where: staffOk ? { id } : { id, userId },
                 select: { id: true, status: true, provider: true, providerRef: true, pixString: true, boletoUrl: true },
             });
 
@@ -125,14 +135,21 @@ export function registerPaymentClientRoutes(router: Router) {
     // real production payment. Runs the exact same effects as a real confirmation.
     // O `provider` gravado na linha pode ser só um placeholder (ex.: 'CORA' na criação do avulso, com a
     // Cora desligada): quem decide é o provedor efetivo (effectiveProviderFor) + isProviderSandbox.
+    // Rota MISTA: cliente só as próprias; equipe qualquer cobrança com cobrancas.cobrar (sem ela → 403).
     router.post('/:id/simulate', authenticate, async (req: Request, res: Response) => {
         try {
             const id = req.params.id as string;
             const userId = req.user!.userId;
-            const isAdmin = req.user!.role === 'ADMIN';
+            const actor = await actorOrReply(req, res);
+            if (!actor) return;
+            const staffOk = actor.isStaff;
+            if (staffOk && !can(actor, 'cobrancas.cobrar')) {
+                denyPermission(res, 'cobrancas.cobrar');
+                return;
+            }
 
             const payment = await prisma.payment.findFirst({
-                where: isAdmin ? { id } : { id, userId },
+                where: staffOk ? { id } : { id, userId },
             });
             if (!payment) {
                 res.status(404).json({ error: 'Pagamento não encontrado.' });

@@ -23,8 +23,12 @@ import { onPaymentConfirmed, voidContractPendingPayments } from './paymentEffect
 import { releaseCouponForPayments } from './couponService.js';
 import { isPixProvider, retirePixCharge, paidChargedAmount } from './pixGateway.js';
 import { settleContractCharges, type ChargeSettlement } from '../jobs/cleanExpiredHolds.js';
-import { revokeUserSessions, clearUserSessionRevocation, userDeletionLockKey } from '../middleware/auth.js';
+import {
+    revokeUserSessions, clearUserSessionRevocation, readUserSessionRevocation, userDeletionLockKey,
+    type SessionRevocationSnapshot,
+} from '../middleware/auth.js';
 import { getPackageSlots } from '../utils/pricing.js';
+import { isCancellationFine } from './cancellationFine.js';
 import type { BookingStatus, ContractStatus, Prisma } from '../generated/prisma/client.js';
 
 /**
@@ -39,12 +43,83 @@ const CANCELLABLE_CONTRACT_STATUSES: ContractStatus[] = ['ACTIVE', 'PAUSED', 'AW
 /** Gravações ainda não realizadas (as que ocupam agenda). */
 const OPEN_BOOKING_STATUSES: BookingStatus[] = ['RESERVED', 'HELD', 'CONFIRMED'];
 
-/** Erro de regra da exclusão, com o status HTTP que a rota deve devolver. */
+/** Erro de regra da exclusão, com o status HTTP que a rota deve devolver (e campos extras do corpo, ex.: o 403). */
 export class UserDeletionError extends Error {
-    constructor(public httpStatus: number, message: string) {
+    constructor(public httpStatus: number, message: string, public extra?: Record<string, unknown>) {
         super(message);
         this.name = 'UserDeletionError';
     }
+}
+
+// ─── Quem pode excluir o quê (AUDFIN-04) ─────────────────────────────────────
+// Excluir o cliente (clientes.excluir) cancela e anula o que ele tem em aberto. Cada coisa dessas tem, fora da
+// exclusão, a sua chave — e a exclusão não pode ser o atalho para ela (R5: anular cobrança em aberto é da baixa;
+// F3: cancelar com pedido em análise isenta a multa, decisão de contratos.multa). Então a equipe só exclui se tiver
+// também a chave de tudo que a exclusão anularia:
+//   • contrato em andamento (ACTIVE/PAUSED/AWAITING_PAYMENT/PENDING_CANCELLATION) → contratos.cancelar — a chave que
+//     já anula as parcelas no DELETE /contracts/:id (a baixa não é necessária para essa parte, desenho D2);
+//   • pedido de cancelamento em análise, ou multa de cancelamento em aberto → contratos.multa;
+//   • cobrança em aberto de SESSÃO (bookingId), avulsa (sem contrato) ou parcela de contrato já encerrado (nenhuma
+//     rota de contrato a anula) → cobrancas.baixa.
+// O ADMIN (e os jobs) não passam `can`: nada muda para eles. Cliente sem nada em aberto: só clientes.excluir.
+
+/** Chaves que a exclusão pode pedir além de clientes.excluir, na ordem em que o 403 as cita. */
+export const DELETION_SETTLE_KEYS = ['contratos.cancelar', 'contratos.multa', 'cobrancas.baixa'] as const;
+export type DeletionSettleKey = (typeof DELETION_SETTLE_KEYS)[number];
+
+/** O que exige cada chave (frase do 403 e da prévia) — rótulos iguais aos do catálogo (staffPermissions). */
+const DELETION_SETTLE_REASON: Readonly<Record<DeletionSettleKey, string>> = {
+    'contratos.cancelar': '“Cancelar contrato” (há contrato em andamento)',
+    'contratos.multa': '“Decidir pedido de cancelamento (cobrar ou isentar multa)” (há pedido de cancelamento em análise ou multa em aberto)',
+    'cobrancas.baixa': '“Marcar como pago, anular ou estornar” (há cobrança em aberto de sessão, avulsa ou de contrato encerrado)',
+};
+
+/**
+ * Chaves que a exclusão de `userId` exige hoje (além de clientes.excluir), pelo que ela cancelaria/anularia — a MESMA
+ * conta de cancelUserPendencies: os contratos em andamento (todas as cobranças PENDING/FAILED deles, multa inclusive),
+ * os contratos encerrados que ainda têm alguma PENDING (idem) e as PENDING sem contrato.
+ */
+export async function deletionSettleRequirements(userId: string): Promise<DeletionSettleKey[]> {
+    const [running, open] = await Promise.all([
+        prisma.contract.findMany({ where: { userId, status: { in: CANCELLABLE_CONTRACT_STATUSES } }, select: { id: true, status: true } }),
+        prisma.payment.findMany({
+            where: { userId, status: { in: ['PENDING', 'FAILED'] } },
+            select: { contractId: true, bookingId: true, metadata: true, status: true },
+        }),
+    ]);
+    const runningIds = new Set(running.map(c => c.id));
+    const leftoverIds = new Set(open.filter(p => p.contractId && !runningIds.has(p.contractId) && p.status === 'PENDING').map(p => p.contractId!));
+    const voided = open.filter(p => (p.contractId ? runningIds.has(p.contractId) || leftoverIds.has(p.contractId) : p.status === 'PENDING'));
+    const keys = new Set<DeletionSettleKey>();
+    if (running.length > 0) keys.add('contratos.cancelar');
+    if (running.some(c => c.status === 'PENDING_CANCELLATION') || voided.some(p => isCancellationFine(p))) keys.add('contratos.multa');
+    if (voided.some(p => !isCancellationFine(p) && (!p.contractId || !!p.bookingId || !runningIds.has(p.contractId)))) {
+        keys.add('cobrancas.baixa');
+    }
+    return DELETION_SETTLE_KEYS.filter(k => keys.has(k));
+}
+
+/** Texto do 403 (e da prévia) para as chaves que faltam. */
+export function deletionMissingPermissionsMessage(missing: readonly DeletionSettleKey[]): string {
+    const list = missing.map(k => DELETION_SETTLE_REASON[k]).join('; ');
+    return `Excluir este cliente anula o que ele tem em aberto, e isso exige também ${list}. Nada foi excluído: peça a quem tem ${missing.length === 1 ? 'essa permissão' : 'essas permissões'}.`;
+}
+
+/** Chaves da exclusão que o ator NÃO tem (`can` ausente = ADMIN/jobs → nenhuma). */
+export async function deletionMissingPermissions(userId: string, can?: (key: DeletionSettleKey) => boolean): Promise<DeletionSettleKey[]> {
+    if (!can) return [];
+    return (await deletionSettleRequirements(userId)).filter(k => !can(k));
+}
+
+/** Lança o 403 da exclusão quando falta alguma chave (antes de qualquer cancelamento/anulação). */
+async function assertActorCanSettle(userId: string, can?: (key: DeletionSettleKey) => boolean): Promise<void> {
+    const missing = await deletionMissingPermissions(userId, can);
+    if (missing.length === 0) return;
+    throw new UserDeletionError(403, deletionMissingPermissionsMessage(missing), {
+        code: 'PERMISSION_DENIED',
+        permission: missing[0],
+        missingPermissions: missing,
+    });
 }
 
 export interface DeletionPreview {
@@ -108,8 +183,9 @@ function futureBookingsWhere(userId: string, now: Date): Prisma.BookingWhereInpu
 }
 
 /**
- * Valida se `userId` pode ser excluído por `actorId` (admin). Lança UserDeletionError:
- * 400 auto-exclusão / conta ADMIN, 404 inexistente, 409 já excluído.
+ * Valida se `userId` pode ser excluído por `actorId` (equipe com clientes.excluir). Lança UserDeletionError:
+ * 400 auto-exclusão / conta da EQUIPE (ADMIN ou COLABORADOR — gerenciadas na tela Equipe, que não exclui
+ * na v1), 404 inexistente, 409 já excluído.
  */
 export async function assertUserDeletable(userId: string, actorId: string): Promise<{ id: string; name: string }> {
     if (userId === actorId) throw new UserDeletionError(400, 'Você não pode excluir sua própria conta.');
@@ -118,7 +194,7 @@ export async function assertUserDeletable(userId: string, actorId: string): Prom
         select: { id: true, name: true, role: true, deletedAt: true },
     });
     if (!user) throw new UserDeletionError(404, 'Usuário não encontrado.');
-    if (user.role === 'ADMIN') throw new UserDeletionError(400, 'Contas de administrador não podem ser excluídas por aqui.');
+    if (user.role !== 'CLIENTE') throw new UserDeletionError(400, 'Contas da equipe não são excluídas por aqui. Elas são gerenciadas na tela Equipe.');
     if (user.deletedAt) throw new UserDeletionError(409, 'Este cliente já foi excluído.');
     return { id: user.id, name: user.name };
 }
@@ -561,11 +637,31 @@ function isForeignKeyViolation(err: unknown): boolean {
     return !!err && typeof err === 'object' && (err as { code?: string }).code === 'P2003';
 }
 
-/** A exclusão não aconteceu: a sessão do cliente volta a valer (a menos que ele esteja bloqueado). */
-async function undoRevocationIfNotDeleted(userId: string): Promise<void> {
+/**
+ * A exclusão não aconteceu: desfaz a revogação PROVISÓRIA dela (a menos que o cliente esteja bloqueado),
+ * voltando a marca de revogação ao que era antes — não a apaga. Uma revogação anterior (troca de senha ou
+ * e-mail pelo admin, F8: 30 dias) continua valendo, e o refresh token anterior a ela segue recusado; só as
+ * sessões que a exclusão derrubou voltam a valer.
+ *  - `previous` null: o Redis falhou ao ler o estado anterior → a revogação é MANTIDA (o cliente entra de
+ *    novo), em vez de arriscar apagar uma revogação anterior;
+ *  - `provisional` null: a revogação provisória nem foi gravada → nada a desfazer;
+ *  - uma revogação feita durante a exclusão (chave com outro valor) é mantida (onlyIfValue).
+ */
+async function undoRevocationIfNotDeleted(
+    userId: string,
+    previous: SessionRevocationSnapshot | null,
+    provisional: string | null,
+): Promise<void> {
     try {
+        if (provisional === null) return;
+        if (previous === null) {
+            console.warn(`[UserDeletion] Estado anterior da revogação de ${userId} desconhecido — a sessão do cliente continua encerrada.`);
+            return;
+        }
         const u = await prisma.user.findUnique({ where: { id: userId }, select: { deletedAt: true, clientStatus: true } });
-        if (u && !u.deletedAt && u.clientStatus !== 'BLOCKED') await clearUserSessionRevocation(userId);
+        if (u && !u.deletedAt && u.clientStatus !== 'BLOCKED') {
+            await clearUserSessionRevocation(userId, previous, { onlyIfValue: provisional });
+        }
     } catch (err) {
         console.error(`[UserDeletion] Falha ao restaurar a sessão de ${userId}:`, err instanceof Error ? err.message : err);
     }
@@ -575,17 +671,35 @@ async function undoRevocationIfNotDeleted(userId: string): Promise<void> {
  * Ponto único usado pela rota DELETE /api/users/:id: valida, encerra a sessão do cliente na hora,
  * decide hard × soft pelos vínculos reais e executa. Serializado por usuário (mutex Redis) para um
  * duplo clique não rodar duas vezes.
+ * `opts.can` (AUDFIN-04): a conferência das chaves do que a exclusão anularia, para a EQUIPE. Ausente (ADMIN, jobs):
+ * como antes. Faltando alguma → 403 sem cancelar nada.
+ * ATU6-03: as recusas que só LEEM — a validação do alvo (400/404/409) e as chaves (403, com missingPermissions) — saem
+ * ANTES de qualquer efeito: sem o mutex (que faz o login do cliente responder 409) e sem a revogação provisória (que
+ * derruba a sessão dele). Quem não pode excluir este cliente não mexe na sessão nem no login dele. As duas conferências
+ * se repetem abaixo, sob o mutex e depois da revogação (algo novo em aberto no meio do caminho → 403, revogação desfeita).
  */
-export async function deleteUser(userId: string, adminId: string, now: Date = new Date()): Promise<DeleteUserResult> {
+export async function deleteUser(
+    userId: string,
+    adminId: string,
+    now: Date = new Date(),
+    opts: { can?: (key: DeletionSettleKey) => boolean } = {},
+): Promise<DeleteUserResult> {
+    await assertUserDeletable(userId, adminId);
+    await assertActorCanSettle(userId, opts.can);
     const lockKey = userDeletionLockKey(userId); // o login recusa enquanto ela existe
     if (!(await acquireMutex(lockKey, 120))) {
         throw new UserDeletionError(409, 'A exclusão deste cliente já está em andamento.');
     }
     try {
         await assertUserDeletable(userId, adminId);
+        // Guarda a revogação que já existia (valor + validade), para a falha da exclusão voltar a ela em vez
+        // de apagá-la (ver undoRevocationIfNotDeleted).
+        const previousRevocation = await readUserSessionRevocation(userId);
         // Revoga ANTES de cancelar: o cliente não cria reserva/cobrança nova enquanto a exclusão roda.
-        await revokeUserSessions(userId);
+        const provisionalRevocation = await revokeUserSessions(userId);
         try {
+            // Reconferência (corrida): algo em aberto criado entre a conferência lá de cima e a revogação.
+            await assertActorCanSettle(userId, opts.can);
             const preview = await getDeletionPreview(userId, now);
             if (preview.mode === 'hard') {
                 try {
@@ -594,11 +708,13 @@ export async function deleteUser(userId: string, adminId: string, now: Date = ne
                 } catch (err) {
                     if (!isForeignKeyViolation(err)) throw err;
                     console.warn(`[UserDeletion] Vínculo criado durante a exclusão de ${userId} — seguindo com o soft delete.`);
+                    // O vínculo novo pode ser algo em aberto: confere de novo antes de anular (AUDFIN-04).
+                    await assertActorCanSettle(userId, opts.can);
                 }
             }
             return await softDeleteUser(userId, adminId, now);
         } catch (err) {
-            await undoRevocationIfNotDeleted(userId);
+            await undoRevocationIfNotDeleted(userId, previousRevocation, provisionalRevocation);
             throw err;
         }
     } finally {

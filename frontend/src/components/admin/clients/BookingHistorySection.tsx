@@ -4,6 +4,7 @@ import StatusBadge from '../../ui/StatusBadge';
 import { TIER_META, BOOKING_STATUS_META, getMeta } from '../../../constants/adminMeta';
 import { formatBRL } from '../../../utils/format';
 import { ChevronRight, NotebookPen, Lock, Eye, BarChart3, Save, CheckCircle2, Music } from 'lucide-react';
+import { useBookingPermissions } from '../bookings/bookingPermissions';
 
 export interface BookingNotesPatch {
     adminNotes: string;
@@ -23,6 +24,9 @@ interface BookingHistorySectionProps {
 /** Histórico de agendamentos com notas/métricas por sessão (expansão inline). */
 export default function BookingHistorySection({ bookings, onBookingUpdated }: BookingHistorySectionProps) {
     const uid = useId();
+    // Notas e métricas da sessão (PATCH /bookings/:id): hoje.gravacao OU agendamentos.editar. Sem elas,
+    // a sessão abre só para leitura.
+    const { canEditNotes } = useBookingPermissions();
     const [expandedBookingId, setExpandedBookingId] = useState<string | null>(null);
     const [bookingAdminNotes, setBookingAdminNotes] = useState('');
     const [bookingClientNotes, setBookingClientNotes] = useState('');
@@ -108,6 +112,7 @@ export default function BookingHistorySection({ bookings, onBookingUpdated }: Bo
                                         className="form-input"
                                         style={{ minHeight: 80, resize: 'vertical', fontFamily: 'inherit', fontSize: '0.8125rem' }}
                                         placeholder="Anotações internas sobre esta sessão..."
+                                        readOnly={!canEditNotes}
                                         value={bookingAdminNotes}
                                         onChange={e => { setBookingAdminNotes(e.target.value); setBookingNotesSaved(false); }}
                                     />
@@ -121,6 +126,7 @@ export default function BookingHistorySection({ bookings, onBookingUpdated }: Bo
                                         className="form-input"
                                         style={{ minHeight: 80, resize: 'vertical', fontFamily: 'inherit', fontSize: '0.8125rem' }}
                                         placeholder="Feedback ou observações para o cliente ver..."
+                                        readOnly={!canEditNotes}
                                         value={bookingClientNotes}
                                         onChange={e => { setBookingClientNotes(e.target.value); setBookingNotesSaved(false); }}
                                     />
@@ -135,30 +141,32 @@ export default function BookingHistorySection({ bookings, onBookingUpdated }: Bo
                                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '12px' }}>
                                         <div className="form-group" style={{ marginBottom: 0 }}>
                                             <label className="form-label" htmlFor={`${uid}-duration`} style={{ fontSize: '0.75rem' }}>Duração (minutos)</label>
-                                            <input id={`${uid}-duration`} type="number" className="form-input" placeholder="Ex: 120" value={bookingDuration} onChange={e => { setBookingDuration(e.target.value === '' ? '' : Number(e.target.value)); setBookingNotesSaved(false); }} />
+                                            <input id={`${uid}-duration`} type="number" className="form-input" placeholder="Ex: 120" readOnly={!canEditNotes} value={bookingDuration} onChange={e => { setBookingDuration(e.target.value === '' ? '' : Number(e.target.value)); setBookingNotesSaved(false); }} />
                                         </div>
                                         <div className="form-group" style={{ marginBottom: 0 }}>
                                             <label className="form-label" htmlFor={`${uid}-peak`} style={{ fontSize: '0.75rem' }}>Pico Simultâneo</label>
-                                            <input id={`${uid}-peak`} type="number" className="form-input" placeholder="Ex: 1530" value={bookingPeak} onChange={e => { setBookingPeak(e.target.value === '' ? '' : Number(e.target.value)); setBookingNotesSaved(false); }} />
+                                            <input id={`${uid}-peak`} type="number" className="form-input" placeholder="Ex: 1530" readOnly={!canEditNotes} value={bookingPeak} onChange={e => { setBookingPeak(e.target.value === '' ? '' : Number(e.target.value)); setBookingNotesSaved(false); }} />
                                         </div>
                                         <div className="form-group" style={{ marginBottom: 0 }}>
                                             <label className="form-label" htmlFor={`${uid}-chat`} style={{ fontSize: '0.75rem' }}>Mensagens no Chat</label>
-                                            <input id={`${uid}-chat`} type="number" className="form-input" placeholder="Ex: 2400" value={bookingChat} onChange={e => { setBookingChat(e.target.value === '' ? '' : Number(e.target.value)); setBookingNotesSaved(false); }} />
+                                            <input id={`${uid}-chat`} type="number" className="form-input" placeholder="Ex: 2400" readOnly={!canEditNotes} value={bookingChat} onChange={e => { setBookingChat(e.target.value === '' ? '' : Number(e.target.value)); setBookingNotesSaved(false); }} />
                                         </div>
                                         <div className="form-group" style={{ marginBottom: 0 }}>
                                             <label className="form-label" htmlFor={`${uid}-origin`} style={{ fontSize: '0.75rem' }}>Origem de Audiência</label>
-                                            <input id={`${uid}-origin`} type="text" className="form-input" placeholder="Ex: Tráfego Pago SP" value={bookingOrigin} onChange={e => { setBookingOrigin(e.target.value); setBookingNotesSaved(false); }} />
+                                            <input id={`${uid}-origin`} type="text" className="form-input" placeholder="Ex: Tráfego Pago SP" readOnly={!canEditNotes} value={bookingOrigin} onChange={e => { setBookingOrigin(e.target.value); setBookingNotesSaved(false); }} />
                                         </div>
                                     </div>
                                 </div>
                             )}
 
-                            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '16px', alignItems: 'center' }}>
-                                {bookingNotesSaved && <span style={{ fontSize: '0.75rem', color: 'var(--success)', display: 'inline-flex', alignItems: 'center', gap: 3 }}><CheckCircle2 size={13} aria-hidden="true" /> Salvo</span>}
-                                <button className="btn-admin-go" style={{ minHeight: 36, padding: '8px 16px', fontSize: '0.8125rem' }} onClick={() => saveBookingNotes(b.id)} disabled={bookingNotesSaving}>
-                                    {bookingNotesSaving ? 'Salvando…' : <><Save size={14} aria-hidden="true" /> Salvar Observações</>}
-                                </button>
-                            </div>
+                            {canEditNotes && (
+                                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '16px', alignItems: 'center' }}>
+                                    {bookingNotesSaved && <span style={{ fontSize: '0.75rem', color: 'var(--success)', display: 'inline-flex', alignItems: 'center', gap: 3 }}><CheckCircle2 size={13} aria-hidden="true" /> Salvo</span>}
+                                    <button className="btn-admin-go" style={{ minHeight: 36, padding: '8px 16px', fontSize: '0.8125rem' }} onClick={() => saveBookingNotes(b.id)} disabled={bookingNotesSaving}>
+                                        {bookingNotesSaving ? 'Salvando…' : <><Save size={14} aria-hidden="true" /> Salvar Observações</>}
+                                    </button>
+                                </div>
+                            )}
                         </div>
                     </td>
                 </tr>
@@ -172,7 +180,9 @@ export default function BookingHistorySection({ bookings, onBookingUpdated }: Bo
                 <Music size={17} aria-hidden="true" /> Histórico de Agendamentos ({bookings.length} total)
             </h2>
             <p style={{ fontSize: '0.8125rem', color: 'var(--text-muted)', marginBottom: '12px' }}>
-                Clique em uma sessão para adicionar observações do admin ou para o cliente.
+                {canEditNotes
+                    ? 'Clique em uma sessão para adicionar observações do admin ou para o cliente.'
+                    : 'Clique em uma sessão para ver as observações e métricas.'}
             </p>
 
             {contractBookings.length > 0 && (

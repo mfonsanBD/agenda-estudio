@@ -5,6 +5,7 @@ import { onPaymentConfirmed } from '../lib/paymentEffects.js';
 import { isPixProvider, retirePixCharge, pixMetadataAfterDiscard, cardIntentInFlight, cardIntentAwaitingCustomer, cardChargeBaseAmount } from '../lib/pixGateway.js';
 import { autoChargeCardFor } from '../lib/savedCards.js';
 import { isCancellationFine } from '../lib/cancellationFine.js';
+import { getStaffRecipientIds } from '../lib/staffRecipients.js';
 
 /** Marca de auditoria (entidade PAYMENT) do aviso de cobrança em dobro — 1 por PaymentIntent excedente. */
 export const AUDIT_DOUBLE_CARD_CHARGE = 'DOUBLE_CARD_CHARGE';
@@ -49,17 +50,17 @@ export async function alertDoubleCardCharge(
                 changes: JSON.stringify({ extraPaymentIntentId: info.extraPi, paidByPaymentIntentId: paidByPi, amount }),
             },
         });
-        const admins = await prisma.user.findMany({ where: { role: 'ADMIN', deletedAt: null }, select: { id: true } });
-        for (const admin of admins) {
+        // Equipe: ADMIN + COLABORADOR com a permissão do evento (financeiro.ver); nunca desativado/excluído.
+        for (const staffId of await getStaffRecipientIds('admin_card_double_charge')) {
             await notifyEvent('admin_card_double_charge', {
-                userId: admin.id,
+                userId: staffId,
                 vars: {
                     cliente: payment.user?.name ?? 'Cliente', valor: fmtBRL(amount),
                     contrato: payment.contract?.name ?? 'sem contrato', piPago: paidByPi, piExtra: info.extraPi,
                 },
                 entityType: 'PAYMENT',
                 entityId: paymentId,
-                dedupKey: `double-card-charge:${info.extraPi}:${admin.id}`,
+                dedupKey: `double-card-charge:${info.extraPi}:${staffId}`,
             }).catch(() => '');
         }
         return true;

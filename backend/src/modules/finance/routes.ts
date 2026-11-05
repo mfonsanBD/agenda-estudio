@@ -1,15 +1,18 @@
 import { Router } from 'express';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize } from '../../middleware/auth.js';
+import { authenticate } from '../../middleware/auth.js';
+import { requirePermission, requireStaff } from '../../middleware/permissions.js';
 import { getConfig } from '../../lib/businessConfig.js';
 import { resolveFeeAt, computeGatewayFee, type FeeRate } from '../../lib/gatewayFees.js';
 import { paidChargedAmount } from '../../lib/pixGateway.js';
 
 const router = Router();
 
+// Router 100% administrativo (crítica E4): toda rota exige login de EQUIPE; a permissão fina vem por rota.
+router.use(authenticate, requireStaff());
 
-// GET /api/finance/closing/:year/:month
-router.get('/closing/:year/:month', authenticate, authorize('ADMIN'), async (req, res) => {
+// GET /api/finance/closing/:year/:month (equipe: financeiro.ver)
+router.get('/closing/:year/:month', requirePermission('financeiro.ver'), async (req, res) => {
     try {
         const year = parseInt(String(req.params.year), 10);
         const month = parseInt(String(req.params.month), 10);

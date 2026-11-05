@@ -23,6 +23,13 @@ export * from './enums.js';
  */
 export type User = Prisma.UserModel
 /**
+ * Model StaffProfile
+ * Dados exclusivos de quem é da EQUIPE (1:1 com users). Cliente nunca tem linha aqui.
+ * `permissions` = chaves do catálogo (src/config/staffPermissions.ts), normalizadas ao salvar;
+ * só valem para COLABORADOR — o ADMIN tem acesso total e a lista é ignorada.
+ */
+export type StaffProfile = Prisma.StaffProfileModel
+/**
  * Model PushSubscription
  * 
  */

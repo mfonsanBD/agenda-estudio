@@ -219,21 +219,104 @@ export function buildReasonUpdate(
     };
 }
 
-/** Toast de sucesso coerente com o que o backend fez (D4/D5). */
-export function reasonToastMessage(
+/**
+ * Resposta do PATCH /bookings/:id que decide o retorno da tela depois do modal de motivo. O servidor é a fonte:
+ *  • `booking.makeupStatus`/`makeupDeadline` = a janela GRAVADA depois da troca (null = sem janela);
+ *  • `makeupOpened`/`makeupDeadline`/`makeupBlockReason` (R7a) = se a troca abriu a janela e, se não abriu, o motivo;
+ *  • `reopenedWithoutCharge` (AUDFIN-01) = a sessão saiu de Cancelado com a cobrança anulada e ficou sem cobrança.
+ * Campo ausente = a tela não sabe → não afirma nada sobre a remarcação.
+ */
+export interface ReasonSaveResponse {
+    message?: string;
+    reopenedWithoutCharge?: boolean;
+    makeupOpened?: boolean;
+    makeupDeadline?: string | null;
+    makeupBlockReason?: string | null;
+    booking?: { makeupStatus?: MakeupStatus | string | null; makeupDeadline?: string | null } | null;
+}
+
+/** Janela de remarcação do avulso segundo a resposta do servidor (nunca pela prévia local). */
+export type ServerMakeupWindow =
+    | { state: 'OPEN'; lastDdmm: string }
+    | { state: 'EXPIRED' }
+    | { state: 'NONE'; reason: string | null }
+    | { state: 'UNKNOWN' };
+
+export function serverMakeupWindow(res: ReasonSaveResponse | null | undefined, now: Date = new Date()): ServerMakeupWindow {
+    if (!res) return { state: 'UNKNOWN' };
+    const recorded = res.booking ? (res.booking.makeupStatus ?? null) : undefined;
+    const deadline = res.makeupDeadline ?? res.booking?.makeupDeadline ?? null;
+    if (res.makeupOpened === true || recorded === 'OPEN') {
+        if (!deadline) return { state: 'UNKNOWN' };
+        return new Date(deadline).getTime() > now.getTime()
+            ? { state: 'OPEN', lastDdmm: makeupDeadlineDdmm(deadline) }
+            : { state: 'EXPIRED' };
+    }
+    if (recorded === 'EXPIRED') return { state: 'EXPIRED' };
+    const reason = typeof res.makeupBlockReason === 'string' && res.makeupBlockReason.trim() ? res.makeupBlockReason.trim() : null;
+    // Sem janela gravada (null ou a remarcação única já usada) ou o servidor disse que não abriu.
+    if (res.makeupOpened === false || recorded === null || recorded === 'USED') return { state: 'NONE', reason };
+    return { state: 'UNKNOWN' };
+}
+
+/** Retorno da tela ao salvar Falta / Não Realizado: toast (sucesso simples) ou alerta (o que a pessoa precisa ler). */
+export type ReasonSaveFeedback =
+    | { kind: 'toast'; message: string }
+    | { kind: 'alert'; type: 'info' | 'warning'; title: string; message: string };
+
+export const REOPENED_WITHOUT_CHARGE_TITLE = 'Sessão reaberta sem cobrança';
+export const MAKEUP_NOT_OPENED = 'A remarcação sem custo não foi liberada ao cliente.';
+
+/**
+ * AUDFIN6-03/TELA6-01 — o que a tela diz depois do PATCH de Falta / Não Realizado (Hoje, Painel, lista e Editar).
+ * A promessa de remarcação sem custo ("liberada até DD/MM") só sai quando o SERVIDOR diz que a janela está aberta;
+ * a data é a do prazo gravado. Sem a informação, não promete. A sessão reaberta sem cobrança mostra o aviso do
+ * servidor (e nenhuma promessa).
+ */
+export function reasonSaveFeedback(
     kind: 'FALTA' | 'NAO_REALIZADO',
-    opts: { isAvulso: boolean; justified: boolean; bookingDate?: string; makeupDays: number },
-): string {
-    const preview = opts.isAvulso && opts.bookingDate ? previewMakeupWindow(opts.bookingDate, opts.makeupDays) : null;
+    opts: { isAvulso: boolean; justified: boolean; now?: Date },
+    res: ReasonSaveResponse | null | undefined,
+): ReasonSaveFeedback {
+    if (res?.reopenedWithoutCharge) {
+        return { kind: 'alert', type: 'warning', title: REOPENED_WITHOUT_CHARGE_TITLE, message: res.message || 'A sessão fica sem cobrança.' };
+    }
     if (kind === 'FALTA') {
-        return opts.justified && preview
-            ? `Falta justificada — o cliente pode remarcar sem novo pagamento até ${preview.ddmm}.`
-            : 'Falta registrada.';
+        if (!(opts.isAvulso && opts.justified)) return { kind: 'toast', message: 'Falta registrada.' };
+        const w = serverMakeupWindow(res, opts.now);
+        return w.state === 'OPEN'
+            ? { kind: 'toast', message: `Falta justificada — o cliente pode remarcar sem novo pagamento até ${w.lastDdmm}.` }
+            : { kind: 'toast', message: 'Falta registrada.' };
     }
-    if (preview) {
-        return preview.expired
-            ? 'Marcado como não realizado — o prazo de remarcação já passou; use "Remarcar" para combinar a nova data.'
-            : `Marcado como não realizado — remarcação sem custo liberada ao cliente até ${preview.ddmm}.`;
+    if (!opts.isAvulso) return { kind: 'toast', message: 'Marcado como não realizado — crédito liberado.' };
+    const w = serverMakeupWindow(res, opts.now);
+    switch (w.state) {
+        case 'OPEN':
+            return { kind: 'toast', message: `Marcado como não realizado — remarcação sem custo liberada ao cliente até ${w.lastDdmm}.` };
+        case 'EXPIRED':
+            return { kind: 'toast', message: 'Marcado como não realizado — o prazo de remarcação já passou; use "Remarcar" para combinar a nova data.' };
+        case 'NONE':
+            return { kind: 'alert', type: 'info', title: 'Marcado como não realizado', message: w.reason ? `${MAKEUP_NOT_OPENED} ${w.reason}` : MAKEUP_NOT_OPENED };
+        default:
+            return { kind: 'toast', message: 'Marcado como não realizado.' };
     }
-    return 'Marcado como não realizado — crédito liberado.';
+}
+
+/** Mostra o retorno de reasonSaveFeedback com o toast/alerta da página (useUI). */
+export function showReasonFeedback(
+    fb: ReasonSaveFeedback,
+    ui: { showToast: (message: string) => void; showAlert: (o: { type: 'info' | 'warning'; title: string; message: string }) => void },
+): void {
+    if (fb.kind === 'toast') ui.showToast(fb.message);
+    else ui.showAlert({ type: fb.type, title: fb.title, message: fb.message });
+}
+
+/**
+ * Dica do modal de motivo para o Não Realizado do avulso (antes de salvar): a janela só abre para gravação paga
+ * (makeupBlockReason no servidor), então a tela não promete a remarcação sem saber do pagamento.
+ */
+export function naoRealizadoAvulsoHint(preview: { ddmm: string; expired: boolean }, makeupDays: number): string {
+    return preview.expired
+        ? 'A gravação não aconteceu por um motivo do estúdio. O prazo de remarcação automática já passou: se a gravação estiver paga, combine a nova data com o cliente e use "Remarcar" nesta gravação. Descreva o motivo.'
+        : `A gravação não aconteceu por um motivo do estúdio. Se a gravação estiver paga, o cliente NÃO perde o valor: a remarcação sem custo abre automaticamente até ${preview.ddmm} (${makeupDays} dias); se ele não remarcar, o contrato continua ativo e você é avisado para combinar a nova data. Sem o pagamento confirmado, a remarcação sem custo não é liberada. Descreva o motivo.`;
 }

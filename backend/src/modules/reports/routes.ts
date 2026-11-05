@@ -1,15 +1,31 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize } from '../../middleware/auth.js';
+import { authenticate } from '../../middleware/auth.js';
+import { actorOrReply, can, requirePermission, requireStaff } from '../../middleware/permissions.js';
 import { generateTimeSlots } from '../../utils/pricing.js';
 
 const router = Router();
 
+// Router 100% administrativo (crítica E4): toda rota exige login de EQUIPE; cada rota exige relatorios.ver.
+// A RECEITA (summary.totalRevenue, tierBreakdown[].revenue e a receita/ordem do ranking) só sai para quem
+// tem financeiro.ver (DECISOES, resposta 3) — sem ela o campo NÃO é enviado (esconder no front não protege:
+// o CSV é gerado no navegador) e o ranking vem ordenado por sessões.
+router.use(authenticate, requireStaff());
+
+/** O ator vê a receita consolidada? (memo do getActor: nenhuma consulta extra). null = já respondeu 401/503. */
+async function revenueVisible(req: Request, res: Response): Promise<boolean | null> {
+    const actor = await actorOrReply(req, res);
+    if (!actor) return null;
+    return can(actor, 'financeiro.ver');
+}
+
 // ─── GET /api/reports/summary ───────────────────────────
 // KPIs: total sessions, completed, faltas, cancelled, revenue, rates
 
-router.get('/summary', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.get('/summary', requirePermission('relatorios.ver'), async (req: Request, res: Response) => {
     try {
+        const showRevenue = await revenueVisible(req, res);
+        if (showRevenue === null) return;
         const { from, to } = req.query;
         const dateFilter = buildDateFilter(from as string | undefined, to as string | undefined);
 
@@ -21,10 +37,12 @@ router.get('/summary', authenticate, authorize('ADMIN'), async (req: Request, re
             prisma.booking.count({ where: { date: dateFilter, status: 'NAO_REALIZADO' } }),
         ]);
 
-        const revenueAgg = await prisma.booking.aggregate({
-            where: { date: dateFilter, status: { not: 'CANCELLED' } },
-            _sum: { price: true },
-        });
+        const revenueAgg = showRevenue
+            ? await prisma.booking.aggregate({
+                where: { date: dateFilter, status: { not: 'CANCELLED' } },
+                _sum: { price: true },
+            })
+            : null;
 
         const totalFalta = falta + naoRealizado;
         const attendanceDenominator = completed + totalFalta || 1;
@@ -35,7 +53,7 @@ router.get('/summary', authenticate, authorize('ADMIN'), async (req: Request, re
                 completedBookings: completed,
                 faltaBookings: totalFalta,
                 cancelledBookings: cancelled,
-                totalRevenue: revenueAgg._sum.price || 0,
+                ...(revenueAgg ? { totalRevenue: revenueAgg._sum.price || 0 } : {}),
                 attendanceRate: Math.round((completed / attendanceDenominator) * 100),
                 cancellationRate: total > 0 ? Math.round((cancelled / total) * 100) : 0,
             },
@@ -49,7 +67,7 @@ router.get('/summary', authenticate, authorize('ADMIN'), async (req: Request, re
 // ─── GET /api/reports/occupancy ─────────────────────────
 // Occupancy by slot and by day of week
 
-router.get('/occupancy', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.get('/occupancy', requirePermission('relatorios.ver'), async (req: Request, res: Response) => {
     try {
         const { from, to } = req.query;
         const dateFilter = buildDateFilter(from as string | undefined, to as string | undefined);
@@ -109,8 +127,10 @@ router.get('/occupancy', authenticate, authorize('ADMIN'), async (req: Request, 
 // ─── GET /api/reports/tiers ─────────────────────────────
 // Distribution by tier (count + revenue)
 
-router.get('/tiers', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.get('/tiers', requirePermission('relatorios.ver'), async (req: Request, res: Response) => {
     try {
+        const showRevenue = await revenueVisible(req, res);
+        if (showRevenue === null) return;
         const { from, to } = req.query;
         const dateFilter = buildDateFilter(from as string | undefined, to as string | undefined);
 
@@ -124,8 +144,10 @@ router.get('/tiers', authenticate, authorize('ADMIN'), async (req: Request, res:
         const tierBreakdown = TIERS.map(t => {
             const items = active.filter(b => b.tierApplied === t);
             const count = items.length;
+            const pct = Math.round((count / total) * 100);
+            if (!showRevenue) return { tier: t, count, pct };
             const revenue = items.reduce((s, b) => s + b.price, 0);
-            return { tier: t, count, revenue, pct: Math.round((count / total) * 100) };
+            return { tier: t, count, revenue, pct };
         });
 
         res.json({ tierBreakdown });
@@ -138,7 +160,7 @@ router.get('/tiers', authenticate, authorize('ADMIN'), async (req: Request, res:
 // ─── GET /api/reports/audience ──────────────────────────
 // Audience metrics (avg viewers, max, chat, duration)
 
-router.get('/audience', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.get('/audience', requirePermission('relatorios.ver'), async (req: Request, res: Response) => {
     try {
         const { from, to } = req.query;
         const dateFilter = buildDateFilter(from as string | undefined, to as string | undefined);
@@ -168,10 +190,12 @@ router.get('/audience', authenticate, authorize('ADMIN'), async (req: Request, r
 });
 
 // ─── GET /api/reports/ranking ───────────────────────────
-// Top clients by revenue
+// Top clients by revenue (com financeiro.ver); sem ela, por sessões e SEM o campo `revenue`.
 
-router.get('/ranking', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.get('/ranking', requirePermission('relatorios.ver'), async (req: Request, res: Response) => {
     try {
+        const showRevenue = await revenueVisible(req, res);
+        if (showRevenue === null) return;
         const { from, to, limit } = req.query;
         const dateFilter = buildDateFilter(from as string | undefined, to as string | undefined);
         const maxResults = parseInt(limit as string) || 10;
@@ -197,8 +221,21 @@ router.get('/ranking', authenticate, authorize('ADMIN'), async (req: Request, re
             map.set(b.userId, existing);
         });
 
-        const ranking = Array.from(map.values())
-            .map(c => ({ ...c, avgViewers: c.viewerCount > 0 ? Math.round(c.avgViewers / c.viewerCount) : 0 }))
+        const rows = Array.from(map.values())
+            .map(c => ({ ...c, avgViewers: c.viewerCount > 0 ? Math.round(c.avgViewers / c.viewerCount) : 0 }));
+
+        if (!showRevenue) {
+            // Sem financeiro.ver: nem o valor nem a ORDEM por receita (a posição revelaria quem paga mais).
+            // Desempate estável: mais sessões, mais concluídas, nome.
+            const ranking = rows
+                .sort((a, b) => b.sessions - a.sessions || b.completed - a.completed || a.name.localeCompare(b.name, 'pt-BR'))
+                .slice(0, maxResults)
+                .map(({ revenue: _revenue, ...rest }) => rest);
+            res.json({ ranking });
+            return;
+        }
+
+        const ranking = rows
             .sort((a, b) => b.revenue - a.revenue)
             .slice(0, maxResults);
 

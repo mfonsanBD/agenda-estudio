@@ -1,7 +1,8 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize } from '../../middleware/auth.js';
+import { authenticate } from '../../middleware/auth.js';
+import { requirePermission } from '../../middleware/permissions.js';
 
 export function registerTiersRoutes(router: Router) {
     // ─── GET /api/pricing ───────────────────────────────────
@@ -26,7 +27,7 @@ export function registerTiersRoutes(router: Router) {
         res.json({ pricing: configs });
     });
 
-    // ─── PUT /api/pricing (ADMIN) ───────────────────────────
+    // ─── PUT /api/pricing (equipe: config.precos) ───────────
 
     const updatePricingSchema = z.object({
         pricing: z.array(
@@ -39,7 +40,7 @@ export function registerTiersRoutes(router: Router) {
         ),
     });
 
-    router.put('/', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+    router.put('/', authenticate, requirePermission('config.precos'), async (req: Request, res: Response) => {
         try {
             const { pricing } = updatePricingSchema.parse(req.body);
 

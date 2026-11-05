@@ -21,6 +21,7 @@ import {
     spYmd, calendarYmd, addDaysYmd, ddmmOfYmd, dowOfYmd, makeupLastYmd, allowedDaysForTier,
     describeMakeupForAdmin, previewMakeupWindow, type MakeupTone,
 } from '../../../utils/avulsoMakeup';
+import { useBookingPermissions } from './bookingPermissions';
 import '../../../styles/makeup.css';
 
 /** Campos da reserva que o sheet usa (Booking, BookingWithUser e o item de ContractDetail servem). */
@@ -399,10 +400,17 @@ export function MakeupStatusPanel({ booking, contractType, clientName, layout = 
     const { get: getRule } = useBusinessConfig();
     const { showConfirm, showToast } = useUI();
     const [rescheduling, setRescheduling] = useState(false);
+    // Justificar falta e remarcar o avulso perdido exigem agendamentos.faltas (PATCH noShowJustified e
+    // PATCH /makeup). Sem a permissão, o status da remarcação continua visível, mas sem as ações.
+    const { canFaltas } = useBookingPermissions();
 
     const makeupDays = getRule('avulso_makeup_days');
-    const view = describeMakeupForAdmin(booking, { contractType: contractType ?? booking.contract?.type, makeupDays });
-    if (!view) return null;
+    const described = describeMakeupForAdmin(booking, { contractType: contractType ?? booking.contract?.type, makeupDays });
+    if (!described) return null;
+    // Sem a permissão, o chip mostra a descrição ("Falta sem justificativa"), não o verbo da ação.
+    const hadAction = described.canJustify || described.canReschedule;
+    const view = canFaltas ? described
+        : { ...described, canJustify: false, canReschedule: false, short: hadAction ? described.label : described.short };
 
     const who = clientName || 'O cliente';
     const justify = () => {

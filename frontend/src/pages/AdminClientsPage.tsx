@@ -13,11 +13,12 @@ import Tooltip from '../components/ui/Tooltip';
 import { USER_TYPE_META, getMeta } from '../constants/adminMeta';
 import { maskPhone } from '../utils/mask';
 import { isPlanInForce } from '../utils/clientHealth';
+import { usePermission } from '../hooks/usePermission';
 
 import { formatBRL } from '../utils/format';
 
+/** Selo do tipo de cliente (plano mais recente). A equipe não aparece aqui: /api/users só lista CLIENTE (D1). */
 function getUserType(u: UserSummary): string {
-    if (u.role === 'ADMIN') return 'ADMIN';
     if (u.contracts && u.contracts.length > 0) {
         return u.contracts[0].type; // FIXO | FLEX | AVULSO | SERVICO | CUSTOM
     }
@@ -28,6 +29,12 @@ export default function AdminClientsPage() {
     const navigate = useNavigate();
     const { users, setUsers, loading, search, setSearch, typeFilter, setTypeFilter, reload } = useAdminClients();
     const { requestDelete, previewingId } = useDeleteClient();
+    // Botões por permissão (o servidor recusa o resto com 403). "Editar" abre com o cadastro OU o acesso
+    // ao app (o wizard trava o que o acesso não permite).
+    const { can, canAny } = usePermission();
+    const canCreate = can('clientes.criar');
+    const canEdit = canAny('clientes.editar', 'clientes.acesso');
+    const canDelete = can('clientes.excluir');
 
     const [showCreate, setShowCreate] = useState(false);
     const [editUser, setEditUser] = useState<UserSummary | null>(null);
@@ -40,8 +47,8 @@ export default function AdminClientsPage() {
         });
     };
 
-    // --- Computed ---
-    const clientUsers = users.filter(u => u.role !== 'ADMIN');
+    // --- Computed --- (filtro positivo: só CLIENTE, nunca a equipe — a API já filtra; esta é a 2ª trava)
+    const clientUsers = useMemo(() => users.filter(u => u.role === 'CLIENTE'), [users]);
     // Plano "Concluído" (D6) recente continua contando como ativo (não vira Ex-cliente) — isPlanInForce.
     const hasActiveContract = (u: UserSummary) => u.contracts?.some(c => isPlanInForce(c)) ?? false;
     const hadAnyContract = (u: UserSummary) => (u._count?.contracts ?? 0) > 0;
@@ -53,11 +60,11 @@ export default function AdminClientsPage() {
     const noAddonCount = clientUsers.filter(u => hasActiveContract(u) && !hasActiveAddon(u)).length;
 
     const filtered = useMemo(() => {
-        let result = users;
-        if (typeFilter === 'ACTIVE') result = result.filter(u => u.role !== 'ADMIN' && hasActiveContract(u));
-        else if (typeFilter === 'EX_CLIENT') result = result.filter(u => u.role !== 'ADMIN' && hadAnyContract(u) && !hasActiveContract(u));
-        else if (typeFilter === 'NO_CONTRACT') result = result.filter(u => u.role !== 'ADMIN' && !hadAnyContract(u));
-        else if (typeFilter === 'NO_ADDON') result = result.filter(u => u.role !== 'ADMIN' && hasActiveContract(u) && !hasActiveAddon(u));
+        let result = clientUsers;
+        if (typeFilter === 'ACTIVE') result = result.filter(u => hasActiveContract(u));
+        else if (typeFilter === 'EX_CLIENT') result = result.filter(u => hadAnyContract(u) && !hasActiveContract(u));
+        else if (typeFilter === 'NO_CONTRACT') result = result.filter(u => !hadAnyContract(u));
+        else if (typeFilter === 'NO_ADDON') result = result.filter(u => hasActiveContract(u) && !hasActiveAddon(u));
         const q = search.trim().toLowerCase();
         if (q.length >= 3) {
             const digits = q.replace(/\D/g, '');
@@ -68,7 +75,7 @@ export default function AdminClientsPage() {
             );
         }
         return result;
-    }, [users, typeFilter, search]);
+    }, [clientUsers, typeFilter, search]);
 
     if (loading) return <div><HeroSkeleton /><TableSkeleton rows={6} cols={7} /></div>;
 
@@ -79,11 +86,11 @@ export default function AdminClientsPage() {
                 icon={Users}
                 title="Clientes"
                 subtitle="Diretório de clientes e contratos"
-                actions={
+                actions={canCreate ? (
                     <button className="btn-admin-go" onClick={() => { setShowCreate(true); }}>
                         <span style={{ fontSize: '1.1rem' }} aria-hidden="true">+</span> Novo Cliente
                     </button>
-                }
+                ) : undefined}
             />
 
             {/* --- KPI CARDS (clicáveis = filtro) --- */}
@@ -188,14 +195,14 @@ export default function AdminClientsPage() {
                                     <th style={{ textAlign: 'right' }}>Valor Pago</th>
                                     <th style={{ textAlign: 'right' }}>A Receber</th>
                                     <th>Desde</th>
-                                    <th style={{ textAlign: 'center' }}>Ações</th>
+                                    {(canEdit || canDelete) && <th style={{ textAlign: 'center' }}>Ações</th>}
                                 </tr>
                             </thead>
                             <tbody>
                                 {filtered.map((u) => {
                                     const hasActive = u.contracts?.some(c => c.status === 'ACTIVE');
-                                    const avatarColor = hasActive ? '#10b981' : u.role === 'ADMIN' ? '#f59e0b' : '#64748b';
-                                    const avatarBg = hasActive ? 'rgba(16,185,129,0.12)' : u.role === 'ADMIN' ? 'rgba(245,158,11,0.12)' : 'rgba(100,116,139,0.12)';
+                                    const avatarColor = hasActive ? '#10b981' : '#64748b';
+                                    const avatarBg = hasActive ? 'rgba(16,185,129,0.12)' : 'rgba(100,116,139,0.12)';
                                     return (
                                         <tr key={u.id} className="admin-zebra-row">
                                             {/* Client info merged: Name + Email + Phone */}
@@ -277,16 +284,19 @@ export default function AdminClientsPage() {
                                                 </div>
                                             </td>
 
-                                            {/* Actions */}
+                                            {/* Actions (coluna some quando o acesso não tem nenhuma) */}
+                                            {(canEdit || canDelete) && (
                                             <td data-label="" style={{ textAlign: 'center' }}>
                                                 <div style={{ display: 'flex', gap: '4px', justifyContent: 'center' }}>
-                                                    <Tooltip content={u.role === 'ADMIN' ? 'Editar administrador' : 'Editar cliente'} describe={false}>
-                                                        <button type="button" className="admin-icon-btn admin-icon-btn--success"
-                                                            aria-label={`Editar ${u.name}`}
-                                                            onClick={() => setEditUser(u)}><Pencil size={16} aria-hidden="true" /></button>
-                                                    </Tooltip>
+                                                    {canEdit && (
+                                                        <Tooltip content="Editar cliente" describe={false}>
+                                                            <button type="button" className="admin-icon-btn admin-icon-btn--success"
+                                                                aria-label={`Editar ${u.name}`}
+                                                                onClick={() => setEditUser(u)}><Pencil size={16} aria-hidden="true" /></button>
+                                                        </Tooltip>
+                                                    )}
 
-                                                    {u.role !== 'ADMIN' && (
+                                                    {canDelete && (
                                                         // O botão fica disabled durante a prévia da exclusão (e botão disabled não
                                                         // dispara eventos de ponteiro): a dica vai no span para continuar aparecendo.
                                                         <Tooltip content="Excluir cliente" describe={false}>
@@ -305,6 +315,7 @@ export default function AdminClientsPage() {
                                                     )}
                                                 </div>
                                             </td>
+                                            )}
                                         </tr>
                                     );
                                 })}
@@ -320,7 +331,7 @@ export default function AdminClientsPage() {
             ------------------------------------------------------- */}
 
             {/* Create Modal */}
-            {showCreate && (
+            {showCreate && canCreate && (
                 <CreateClientModal
                     isOpen={showCreate}
                     onClose={() => setShowCreate(false)}
@@ -329,7 +340,7 @@ export default function AdminClientsPage() {
             )}
 
             {/* Edit Modal */}
-            {editUser && (
+            {editUser && canEdit && (
                 <EditClientModal
                     user={editUser}
                     onClose={() => setEditUser(null)}

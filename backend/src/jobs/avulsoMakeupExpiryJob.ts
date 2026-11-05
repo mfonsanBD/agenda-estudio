@@ -8,6 +8,7 @@ import {
     MAKEUP_CONTRACT_STATUSES, MAKEUP_ELIGIBILITY_SELECT, makeupBlockReasonOf,
 } from '../lib/avulsoMakeup.js';
 import { notifyEvent } from '../modules/notifications/notificationService.js';
+import { getStaffRecipientIds } from '../lib/staffRecipients.js';
 
 /** Avisos da remarcação (lembretes e "prazo encerrado") só saem entre 09:00 e 19:59 de São Paulo. */
 export const MAKEUP_NOTICE_START_HOUR = 9;
@@ -40,8 +41,26 @@ const EXPIRED_BOOKING_SELECT = {
     user: { select: { name: true } },
 } as const;
 
-/** Avisos de "prazo de remarcação encerrado": cliente (FALTA: valor perdido / NAO_REALIZADO: valor garantido) + admins (NAO_REALIZADO). */
-async function sendExpiryNotices(b: ExpiredBooking, getAdmins: () => Promise<{ id: string }[]>): Promise<void> {
+/**
+ * Equipe avisada quando a janela de uma NAO_REALIZADO expira: ADMIN + COLABORADOR com a permissão do
+ * evento (agendamentos.faltas), nunca desativado/excluído. O link é uma tela que a pessoa abre (crítica
+ * I3): quem vê contratos vai ao detalhe do contrato (onde remarca); quem só registra faltas, à lista de
+ * Agendamentos (que também remarca).
+ */
+interface ExpiryStaffRecipients {
+    ids: string[];
+    /** Quem abre o detalhe do contrato (ADMIN + COLABORADOR com contratos.ver). */
+    contractViewers: ReadonlySet<string>;
+}
+
+async function loadExpiryStaffRecipients(): Promise<ExpiryStaffRecipients> {
+    const ids = await getStaffRecipientIds('admin_makeup_expired_studio');
+    const contractViewers = new Set(ids.length > 0 ? await getStaffRecipientIds('contratos.ver') : []);
+    return { ids, contractViewers };
+}
+
+/** Avisos de "prazo de remarcação encerrado": cliente (FALTA: valor perdido / NAO_REALIZADO: valor garantido) + equipe (NAO_REALIZADO). */
+async function sendExpiryNotices(b: ExpiredBooking, getStaff: () => Promise<ExpiryStaffRecipients>): Promise<void> {
     const vars = {
         data: ddmmOfYmd(ymdOfDbDate(b.missedDate ?? b.date)),
         prazo: b.makeupDeadline ? ddmmOfYmd(deadlineYmd(b.makeupDeadline)) : '',
@@ -55,15 +74,16 @@ async function sendExpiryNotices(b: ExpiredBooking, getAdmins: () => Promise<{ i
         dedupKey: `makeup:expired:${b.id}`,
     }).catch(err => console.error(`[MAKEUP-EXPIRY] notify client ${b.id}:`, err));
     if (!byStudio) return;
-    for (const admin of await getAdmins()) {
+    const staff = await getStaff();
+    for (const staffId of staff.ids) {
         await notifyEvent('admin_makeup_expired_studio', {
-            userId: admin.id,
+            userId: staffId,
             vars: { ...vars, cliente: b.user?.name || 'Cliente' },
             entityType: 'BOOKING',
             entityId: b.id,
-            actionUrl: `/admin/contracts/${b.contractId}`,
-            dedupKey: `makeup:expired-admin:${b.id}:${admin.id}`,
-        }).catch(err => console.error(`[MAKEUP-EXPIRY] notify admin ${b.id}:`, err));
+            actionUrl: staff.contractViewers.has(staffId) ? `/admin/contracts/${b.contractId}` : '/admin/bookings',
+            dedupKey: `makeup:expired-admin:${b.id}:${staffId}`,
+        }).catch(err => console.error(`[MAKEUP-EXPIRY] notify staff ${b.id}:`, err));
     }
 }
 
@@ -77,7 +97,7 @@ async function sendExpiryNotices(b: ExpiredBooking, getAdmins: () => Promise<{ i
  *      estado (e o contrato avulso da FALTA virar COMPLETED) acontece na 1ª rodada depois do prazo.
  *      - FALTA justificada → EXPIRED, o valor é perdido (sem estorno) e o contrato avulso vira COMPLETED.
  *      - NAO_REALIZADO (culpa do estúdio) → EXPIRED, o contrato continua ACTIVE; o cliente é avisado de
- *        que o estúdio vai entrar em contato e os admins recebem o aviso para resolver.
+ *        que o estúdio vai entrar em contato e a equipe (ADMIN + quem registra faltas) recebe o aviso.
  *      O AVISO só sai entre 09:00 e 19:59 (SP): fora disso fica pendente (auditoria
  *      MAKEUP_EXPIRY_NOTICE_PENDING) e sai na 1ª rodada dentro do horário (MAKEUP_EXPIRY_NOTICE_SENT
  *      garante uma vez só). Reserva sem direito à remarcação (makeupBlockReason: contrato fora de
@@ -95,11 +115,9 @@ export async function runAvulsoMakeupExpiryJob(
     let notified = 0;
     const noticeHour = isMakeupNoticeHour(now);
 
-    let admins: { id: string }[] | null = null;
-    const getAdmins = async () => (admins ??= await prisma.user.findMany({
-        where: { role: 'ADMIN', deletedAt: null },
-        select: { id: true },
-    }));
+    // Destinatários da equipe: lidos uma vez por rodada, só se houver aviso a entregar.
+    let staffRecipients: ExpiryStaffRecipients | null = null;
+    const getStaff = async () => (staffRecipients ??= await loadExpiryStaffRecipients());
 
     // ── 0. Contrato encerrado / valor estornado → janela some (sem aviso) ──
     const orphaned = await prisma.booking.findMany({
@@ -148,7 +166,7 @@ export async function runAvulsoMakeupExpiryJob(
             const elig = await prisma.booking.findUnique({ where: { id: b.id }, select: MAKEUP_ELIGIBILITY_SELECT });
             if (!elig || makeupBlockReasonOf(elig)) continue;
             if (noticeHour) {
-                await sendExpiryNotices(b, getAdmins);
+                await sendExpiryNotices(b, getStaff);
                 await logAudit('BOOKING', b.id, NOTICE_SENT, 'SYSTEM', { deferred: false });
                 notified++;
             } else {
@@ -186,7 +204,7 @@ export async function runAvulsoMakeupExpiryJob(
                 const block = makeupBlockReasonOf(b);
                 const deliver = !block;
                 if (deliver) {
-                    await sendExpiryNotices(b, getAdmins);
+                    await sendExpiryNotices(b, getStaff);
                     notified++;
                 }
                 await logAudit('BOOKING', b.id, NOTICE_SENT, 'SYSTEM', deliver ? { deferred: true } : { skipped: block });

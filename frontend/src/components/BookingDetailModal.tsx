@@ -669,7 +669,8 @@ function BookingDetailModalInner({
                                 );
                             }) : <div className="bdm-service bdm-service--empty">Nenhum serviço ativo</div>}
 
-                            {(availableForPurchase.length > 0 || contractAvailable.length > 0) && ['RESERVED', 'CONFIRMED', 'COMPLETED'].includes(src.status) && (
+                            {/* FIN-08: reserva avulsa ainda no prazo de pagamento — os extras vão no checkout dela (o servidor recusa 409). */}
+                            {(availableForPurchase.length > 0 || contractAvailable.length > 0) && ['RESERVED', 'CONFIRMED', 'COMPLETED'].includes(src.status) && !src.holdExpiresAt && (
                                 <button type="button" className="bdm-service-add" onClick={() => { setShowServicesSheet(true); setServicesStep(1); setSelectedNewAddons([]); }}>
                                     <Plus size={15} /> Adicionar serviço
                                 </button>

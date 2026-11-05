@@ -9,6 +9,7 @@ import { useBusinessConfig } from '../../../hooks/useBusinessConfig';
 import { isBoletoAvailable, loadPaymentMethods, usePaymentMethodsVersion } from '../../../constants/paymentMethods';
 import { useWizardStep, ignoreMultiClick, wizardStepBodyStyle as stepBodyStyle, wizardStepContentStyle as stepContentStyle } from '../../../hooks/useWizardStep';
 import { useContractSlotGrid } from '../../../hooks/useContractSlotGrid';
+import { usePermission } from '../../../hooks/usePermission';
 import { useUI } from '../../../context/UIContext';
 import BottomSheetModal from '../../BottomSheetModal';
 import WizardSteps from '../WizardSteps';
@@ -159,6 +160,13 @@ const stepHintStyle: CSSProperties = { margin: '16px 0 0', fontSize: '0.75rem', 
 export default function CreateContractModal({ isOpen, onClose, onCreated, users, pricing }: CreateContractModalProps) {
     const uid = useId();
     const { showToast } = useUI();
+    // Equipe (D7): o contrato nasce ATIVO com as parcelas em aberto; "Cobrar agora" a 1ª parcela só com
+    // "Cobrar o cliente" (cobrancas.cobrar). Sem ela, a cobrança fica pendente e o cliente paga pelo app.
+    const { can } = usePermission();
+    const canChargeNow = can('cobrancas.cobrar');
+    // FE-2: parcela zerada por cupom nasce PAGA — sem a baixa manual o servidor recusa (403); aqui o
+    // "Criar Contrato" fica desabilitado com a explicação, em vez do 403 genérico.
+    const canMarkPaid = can('cobrancas.baixa');
     const { get: getRule } = useBusinessConfig();
     const ep3 = getRule('episodes_3months');
     const ep6 = getRule('episodes_6months');
@@ -353,14 +361,17 @@ export default function CreateContractModal({ isOpen, onClose, onCreated, users,
             // using the SAME InlineCheckout + unified policy as the client. Otherwise it stays
             // PENDING and the client pays later (or via auto-charge).
             // onCreated() (recarregar a lista) só quando o sheet de cobrança FECHAR — ou já, se não há cobrança.
-            if (res.firstPaymentId) {
+            // Sem "Cobrar o cliente" o sheet não abre (as rotas de cobrança dariam 403): fica pendente.
+            if (res.firstPaymentId && canChargeNow) {
                 // O 1º payment retornado JÁ vem com o cupom descontado pelo backend.
                 setChargeAmountApi(res.payments?.[0]?.amount ?? null);
                 setChargePaymentId(res.firstPaymentId);
             } else {
                 onCreated();
                 onClose();
-                showToast(res.message || 'Contrato criado com sucesso!');
+                showToast(res.firstPaymentId
+                    ? 'Contrato criado. A 1ª cobrança ficou pendente: o cliente paga pelo app (ou quem tem permissão de cobrança cobra depois).'
+                    : (res.message || 'Contrato criado com sucesso!'));
             }
         } catch (err: unknown) {
             // E3: o boleto foi desligado (ou a Cora desativada) depois que o wizard abriu — nada foi criado.
@@ -383,6 +394,9 @@ export default function CreateContractModal({ isOpen, onClose, onCreated, users,
         || (!!grid && createForm.fixedDayOfWeek != null && isValidSlot(createForm.fixedDayOfWeek, createForm.fixedTime));
     const canStep2 = startDateOk && linkOk && scheduleOk;
     const canCreate = canStep1 && canStep2;
+    // FE-2: o servidor recusa qualquer parcela zerada sem a baixa manual; aqui cobre o caso do cupom
+    // (que age na 1ª cobrança): finalAmount ≤ 0 = 1ª parcela zerada.
+    const zeroCouponNeedsBaixa = !canMarkPaid && !!appliedCoupon && appliedCoupon.finalAmount <= 0;
 
     const handleCreate = async () => {
         if (step !== LAST_STEP) return; // rede de segurança: só cria na última etapa
@@ -461,7 +475,8 @@ export default function CreateContractModal({ isOpen, onClose, onCreated, users,
         ? (paymentMethod === 'PIX' ? (quote?.fullPix ?? total) : (quote?.fullCard ?? total))
         : (quote?.monthlyAmount ?? monthly);
 
-    const clientUsers = users.filter(u => u.role !== 'ADMIN' && !u.deletedAt);
+    // Só clientes (a equipe nunca é alvo de contrato — o servidor responde 404 "Cliente não encontrado").
+    const clientUsers = users.filter(u => u.role === 'CLIENTE' && !u.deletedAt);
     const selectedUser = clientUsers.find(u => u.id === createForm.userId);
     const tierMeta = TIER_META[createForm.tier] ?? TIER_META.COMERCIAL;
     const selectedSlot = createForm.fixedDayOfWeek != null
@@ -1060,14 +1075,29 @@ export default function CreateContractModal({ isOpen, onClose, onCreated, users,
                                     onRemove={() => setAppliedCoupon(null)}
                                     disabled={!createForm.userId || creating || checking}
                                 />
+                                {zeroCouponNeedsBaixa && (
+                                    <div id={`${uid}-zero-coupon`} className="admin-alert admin-alert--warning" role="status" style={{ marginTop: 8, marginBottom: 0, fontSize: '0.75rem', lineHeight: 1.45 }}>
+                                        <AlertCircle size={13} aria-hidden="true" style={{ verticalAlign: '-2px', marginRight: 4 }} />
+                                        Cupom que zera a 1ª cobrança registra a parcela como paga e exige a permissão “Marcar como pago, anular ou estornar”. Remova o cupom ou use um de valor menor.
+                                    </div>
+                                )}
                             </div>
+
+                            {/* Equipe sem "Cobrar o cliente": avisa ANTES de criar que a 1ª cobrança fica pendente. */}
+                            {!canChargeNow && (
+                                <div className="admin-info-banner" role="note" style={{ marginTop: 14 }}>
+                                    <AlertCircle size={16} className="admin-info-banner__icon" aria-hidden="true" />
+                                    <span>O contrato nasce ativo e a 1ª cobrança fica <strong>pendente</strong>: o cliente paga pelo app. Cobrar na hora (PIX ou cartão) exige a permissão “Cobrar o cliente”.</span>
+                                </div>
+                            )}
 
                             </div>
                             <div className="admin-actions-row admin-actions-row--between">
                                 <button key="back" type="button" onClick={back} disabled={creating || checking} className="btn-admin-ghost">
                                     ← Voltar
                                 </button>
-                                <button key="submit" type="button" onClick={ignoreMultiClick(handleCreate)} disabled={!canCreate || creating || checking} className="btn-admin-go">
+                                <button key="submit" type="button" onClick={ignoreMultiClick(handleCreate)} disabled={!canCreate || creating || checking || zeroCouponNeedsBaixa}
+                                    aria-describedby={zeroCouponNeedsBaixa ? `${uid}-zero-coupon` : undefined} className="btn-admin-go">
                                     {checking ? 'Verificando agenda…' : creating ? 'Criando…' : <><FileText size={15} aria-hidden="true" /> Criar Contrato</>}
                                 </button>
                             </div>

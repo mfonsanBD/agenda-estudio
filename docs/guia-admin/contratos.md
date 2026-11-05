@@ -1,6 +1,6 @@
 # Contratos
 
-> Rotas: **`/admin/contracts`** (lista) e **`/admin/contracts/:id`** (detalhe) · Menu: **Contratos** · Acesso: Admin
+> Rotas: **`/admin/contracts`** (lista) e **`/admin/contracts/:id`** (detalhe) · Menu: **Contratos** · Acesso: administrador e colaborador com **Ver contratos** (os botões seguem as permissões — ver [Colaboradores](#colaboradores))
 
 Gestão dos contratos: criar, editar, cobrar parcelas, editar serviços e resolver cancelamentos.
 
@@ -20,7 +20,7 @@ Gestão dos contratos: criar, editar, cobrar parcelas, editar serviços e resolv
 - **Criar contrato** → assistente em 4 etapas (ver [Novo contrato Fixo/Flex](#novo-contrato-fixoflex-em-4-etapas)).
 - **Editar** → status (Ativo, Expirado, Concluído, Cancelado), data de fim, créditos Flex restantes, link do contrato e forma de pagamento. **Boleto** só aparece como forma quando "Aceitar pagamento por boleto" está ligado em Configurações e a Cora está ativa; não existe mais liberação de boleto por contrato. "Aguardando cancelamento" não é escolhido aqui: ele vem do pedido do cliente. Num contrato pausado, aguardando pagamento ou em cancelamento, o status atual aparece como "(atual)" e só muda se você escolher outro. Escolher **Cancelado** pede a mesma confirmação vermelha do botão **Cancelar**, faz o mesmo cancelamento e mostra o **mesmo aviso do banco/cartão** (cobrança que já estava paga ou que não pôde ser cancelada), que fica na tela até você fechar.
 - **Ver detalhe** → `/admin/contracts/:id`.
-- **Cancelar** → cancela e devolve créditos quando aplicável.
+- **Cancelar** → cancela e devolve créditos quando aplicável. Com o cadeado, falta ao seu acesso a permissão de baixa para a cobrança de gravação em aberto (veja [Dicas](#dicas-e-erros-comuns)).
 - **Renovar (+3 meses)** → só aparece quando faz sentido renovar: plano ativo ou concluído a **30 dias ou menos** do fim da vigência (ou já encerrada), ou plano expirado — e só se o contrato **ainda não foi renovado** (cada contrato renova uma única vez). Nunca aparece no avulso, em serviços nem para cliente excluído. O mesmo botão existe no detalhe do contrato. Contrato **já renovado** mostra o atalho **abrir contrato novo** (lista e detalhe).
 - **Cobrar multa agora** → aparece no contrato cancelado com multa pendente; abre a folha de cobrança (PIX ou cartão do cliente presente). Ver [Resolver cancelamento](#resolver-cancelamento).
 
@@ -68,14 +68,14 @@ Adicione/remova serviços do contrato pelo seletor. As mudanças valem **para o 
 O contrato vira **Concluído** automaticamente quando não resta nada a fazer nele, e volta a **Ativo** sozinho se isso mudar (por exemplo, ao reabrir uma gravação finalizada ou devolver um crédito):
 
 - **Avulso:** quando a gravação é finalizada, ou quando fica em **falta sem direito a remarcar** (sem justificativa, prazo de remarcação vencido ou nova falta depois de remarcar). Enquanto houver remarcação liberada, ou se a gravação foi marcada como **Não realizado**, ele continua **Ativo**.
-- **Fixo, Flex e Personalizado:** quando a última gravação é finalizada e não sobra sessão agendada nem crédito.
+- **Fixo, Flex e Personalizado:** quando a última gravação é finalizada e não sobra sessão agendada nem crédito. No **Fixo**, a sessão **extra** (cobrada à parte) não conta entre as sessões do plano: ela não conclui o contrato antes da hora.
 - Um plano concluído **continua renovável** quando está a **30 dias ou menos** do fim da vigência (ou com ela já encerrada) e **ainda não foi renovado** — é quando o botão **Renovar** aparece (ver [Ações na lista](#ações-na-lista)). O aviso de "contrato expirando" e a cobrança das parcelas pendentes continuam normalmente.
 - Contratos **pausados, aguardando pagamento, em cancelamento, cancelados ou expirados** nunca mudam sozinhos. **Serviços** não entram nessa regra.
 - O **avulso** tem vigência de um dia (a data da gravação), é pagamento único e **não** aparece no aviso de "contrato expirando".
 
 ## Resolver cancelamento
 
-Quando um cliente solicita cancelamento, o contrato fica em **Cancelamento pendente** e as gravações dele que **ainda não aconteceram** são canceladas na hora (os horários ficam livres). Gravações já feitas — inclusive as de hoje, concluídas ou com falta — e a que estiver em andamento **não** são alteradas. As cobranças em aberto de **serviços extras** dessas gravações canceladas são canceladas junto (a cobrança emitida é cancelada no banco/cartão antes; se já estava paga, fica **Paga**); extras de gravações já realizadas continuam a pagar. Você recebe o aviso na hora (notificação e push), já com o valor da multa prevista.
+Quando um cliente solicita cancelamento, o contrato fica em **Cancelamento pendente** e as gravações dele que **ainda não aconteceram** são canceladas na hora (os horários ficam livres). Gravações já feitas — inclusive as de hoje, concluídas ou com falta — e a que estiver em andamento **não** são alteradas. As cobranças em aberto de **serviços extras** dessas gravações canceladas são canceladas junto (a cobrança emitida é cancelada no banco/cartão antes; se já estava paga, fica **Paga**); extras de gravações já realizadas continuam a pagar. Os administradores e quem tem **Decidir pedido de cancelamento** recebem o aviso na hora (notificação e push), já com o valor da multa prevista.
 
 **Como a multa é calculada**
 
@@ -88,11 +88,11 @@ Quando um cliente solicita cancelamento, o contrato fica em **Cancelamento pende
 
 - **Cobrar multa** — a confirmação mostra o valor em reais antes de você decidir. É criada uma cobrança **"Multa de cancelamento"**, que fica **pendente**:
   - o cliente é avisado (notificação e push) e paga em **Meus Pagamentos**, por PIX ou cartão;
-  - você pode usar **Cobrar agora** (PIX ou cartão, com o cliente presente);
+  - quem tem **Cobrar o cliente** pode usar **Cobrar agora** (PIX ou cartão, com o cliente presente); sem essa permissão, a confirmação avisa: "A multa fica pendente para o cliente pagar pelo app (cobrar no balcão exige “Cobrar o cliente”). …";
   - ela **não** é cobrada sozinha no cartão salvo, mesmo com a cobrança automática ligada;
   - se o cliente não pagar, ela entra nos avisos de fatura vencida a partir do dia seguinte. Pagamento por fora → dê baixa manual no Financeiro.
 - **Isentar** — cancela sem multa; o cliente é avisado de que o contrato foi cancelado sem multa.
-- Nos dois casos o contrato vira **Cancelado** (o card passa a mostrar a **data do cancelamento**) e as parcelas pendentes são anuladas.
+- Nos dois casos o contrato vira **Cancelado** (o card passa a mostrar a **data do cancelamento**) e as cobranças pendentes do contrato são anuladas: as parcelas e, se houver, a cobrança ainda em aberto de uma gravação dele (por exemplo, a de uma gravação já feita). Com cobrança de gravação em aberto, decidir exige também **Marcar como pago, anular ou estornar** (veja [Dicas](#dicas-e-erros-comuns)).
 - **Contrato reaberto e cancelado de novo:** a multa em aberto de um cancelamento anterior **não é apagada** ao cancelar de novo — ela continua devida e a mensagem da ação avisa, com o valor. Só quando a nova decisão gera multa (**Cobrar multa**) a anterior é anulada e **substituída** pela nova: nunca ficam duas multas em aberto.
 
 **O que acontece com as cobranças já emitidas**
@@ -107,10 +107,10 @@ Toda ação que muda o contrato abre uma confirmação que lista o que vai acont
 
 | Ação | Tom | O que acontece |
 |---|---|---|
-| **Cancelar contrato** (ícone 🚫) | vermelho | Contrato → Cancelado; gravações que ainda não aconteceram canceladas (horários liberados; as já feitas ou em andamento ficam como estão); parcelas pendentes anuladas (a cobrança emitida é cancelada no banco antes); o cliente é avisado; **sem multa e sem estorno** do que já foi pago. |
+| **Cancelar contrato** (ícone 🚫) | vermelho | Contrato → Cancelado; gravações que ainda não aconteceram canceladas (horários liberados; as já feitas ou em andamento ficam como estão; no **serviço**, as gravações vinculadas a ele); parcelas pendentes anuladas (a cobrança emitida é cancelada no banco antes) e, com a permissão de baixa, também a cobrança própria em aberto das gravações cobradas à parte, mesmo de gravação já feita; o cliente é avisado; **sem multa e sem estorno** do que já foi pago. |
 | **Cobrar multa** | vermelho | Ver "Resolver cancelamento". |
 | **Isentar multa** | âmbar | Ver "Resolver cancelamento". |
-| **Pausar** | âmbar | **Fixo:** gravações futuras canceladas; ao **Retomar**, a vigência é estendida pelos dias em pausa e as gravações do dia/horário fixos são recriadas. **Flex/Personalizado:** as gravações agendadas são mantidas. Parcelas pendentes não são cobradas automaticamente durante a pausa. |
+| **Pausar** | âmbar | **Fixo:** gravações do plano daqui em diante canceladas, inclusive as cobradas à parte criadas enquanto o plano ainda tinha vaga (o que já foi pago por elas não é estornado); a **sessão extra** (criada com o plano já cheio) é mantida. A cobrança em aberto das gravações canceladas (a da própria sessão, quando cobrada à parte, ou a de serviços extras contratados nelas) é anulada, e por isso pausar com cobrança em aberto exige **Marcar como pago, anular ou estornar** (sem ela, a pausa é recusada e nada muda). Ao **Retomar**, a vigência é estendida pelos dias em pausa e só as gravações do dia/horário fixos são recriadas (uma gravação cancelada em outra data ou horário não volta). **Flex/Personalizado:** as gravações agendadas são mantidas. Parcelas pendentes não são cobradas automaticamente durante a pausa. |
 | **Marcar pago** (detalhe do contrato) | âmbar | Parcela → Pago com a data de hoje; o sistema confirma gravação/contrato, o cupom e avisa o cliente, como num pagamento online. Depois disso ela só pode virar "Estornado". Se já havia PIX/boleto emitido, oriente o cliente a não pagá-lo. |
 | **Renovar / Retomar** | neutro | Confirmação simples. |
 
@@ -152,6 +152,32 @@ Ao clicar em **Criar contrato**, a agenda é verificada: se houver horários ocu
 - Se, ao cancelar (pelo botão **Cancelar contrato**, por **Editar → Cancelado** ou ao decidir a multa), o banco informar que uma cobrança **já estava paga** ou **não pôde ser cancelada**, o aviso fica na tela até você fechar (não é só um aviso rápido).
 - Cobrança de parcela usa o mesmo fluxo de pagamento do cliente (ver [Pagamentos técnico](../tecnico/pagamentos.md)).
 - O ciclo de vida completo (estados) está em [modelo-de-dados.md](../tecnico/modelo-de-dados.md#ciclo-de-vida-do-contrato).
+- **"O contrato mudou em outra tela…"** ao salvar o **Editar**: o status mudou enquanto o formulário estava aberto (por exemplo, o cliente pediu o cancelamento). Nada foi gravado; o formulário fecha e a lista recarrega.
+- **Reabrir um contrato cancelado** (Editar → outro status) devolve o uso das sessões e dos créditos sem parcela em aberto: para quem não é administrador, exige **Cancelar contrato** e **Mudar créditos, serviços e condições de pagamento**.
+- **Agendar uma sessão num contrato** (em [Agendamentos](agendamentos.md#criar-um-agendamento)) só vale em contrato **ativo** ou **concluído**; nos outros status o sistema recusa, inclusive para o administrador. Criada por quem não tem **Marcar como pago, anular ou estornar**, a sessão de um **Fixo que já usou todas as sessões** (sessão extra) e a de um **contrato de serviço** são cobradas; nos planos, só vale a faixa do plano. Como o Fixo nasce com todas as sessões geradas, a sessão a mais nele quase sempre é extra, e o Novo agendamento avisa antes de agendar. A sessão extra (criada quando o plano já tinha usado todas as sessões, por qualquer pessoa da equipe) não ocupa vaga do plano. A sessão do Fixo que quem tem essa permissão cria enquanto ainda há vaga continua cobrada, mas ocupa uma vaga do plano.
+- **Cancelar um contrato com cobrança de gravação em aberto** anula essa cobrança. Isso vale para o **avulso** (o contrato é a própria sessão: qualquer cobrança em aberto) e, nos outros tipos, para a cobrança própria de uma gravação cobrada à parte (gravação vinculada a um serviço, sessão extra do Fixo, sessão cobrada dentro do plano), mesmo de gravação já feita. Por isso, para quem não é administrador, cancelar o contrato e **decidir o pedido de cancelamento** (Cobrar multa ou Isentar) exigem também **Marcar como pago, anular ou estornar**. Sem ela, os botões **Cancelar contrato** e de decisão aparecem com um cadeado (passar o mouse ou clicar mostra o motivo), o status **Cancelado** some do **Editar** e o Editar explica. As parcelas do plano e os serviços extras das sessões continuam anulados só com **Cancelar contrato** (ou **Decidir pedido de cancelamento**).
+- **Sessão cancelada por engano:** no **Flex**, volte-a para **Concluído** em Agendamentos (o saldo de créditos se acerta sozinho); reabrir uma sessão cancelada exige **Marcar como pago, anular ou estornar**. No **Personalizado** ela não volta, e o **Editar** só tem os créditos Flex: se precisar acertar o saldo do Personalizado, peça ao suporte técnico.
+
+## Colaboradores
+
+| Na tela | Permissão |
+|---|---|
+| Abrir Contratos e o detalhe (parcelas e valores) | **Ver contratos** |
+| **Novo Contrato** e **Contrato Personalizado** | **Criar e renovar contratos** |
+| **Renovar** | **Criar e renovar contratos** e **Marcar como pago, anular ou estornar** (a renovação cria o plano ativo sem nenhuma parcela) |
+| **Editar**: término, link e forma de pagamento; status Ativo, Concluído ou Expirado; **Pausar** e **Retomar** | **Editar, pausar e retomar contratos** (pausar um Fixo com cobrança em aberto numa gravação a cancelar: também **Marcar como pago, anular ou estornar**) |
+| **Editar**: créditos Flex; **Editar serviços** no detalhe | **Mudar créditos, serviços e condições de pagamento** |
+| **Cancelar contrato** e **Editar → Cancelado** | **Cancelar contrato** (com cobrança de gravação em aberto: também **Marcar como pago, anular ou estornar**) |
+| Reabrir um contrato cancelado | **Cancelar contrato** e **Mudar créditos, serviços e condições de pagamento** |
+| **Cobrar multa** / **Isentar** (e qualquer mudança de status de um contrato em cancelamento pendente) | **Decidir pedido de cancelamento** (cobrar ou isentar com cobrança de gravação em aberto: também **Marcar como pago, anular ou estornar**) |
+| **Cobrar**, **Cobrar agora** (parcela e multa) e **Cobrar 1ª parcela** | **Cobrar o cliente** (cartão salvo do cliente: **Debitar o cartão salvo do cliente**) |
+| **Marcar pago** | **Marcar como pago, anular ou estornar** |
+| Confirmar presença, iniciar/finalizar gravação no detalhe | as mesmas de [Hoje](hoje.md#colaboradores) |
+| Nome do cliente como link para o perfil | **Ver clientes** |
+
+- O **Editar** mostra só os status e campos que a pessoa pode mudar (os outros ficam em cinza, com um aviso no topo) e envia só o que mudou.
+- Contrato criado por quem não tem **Cobrar o cliente** termina com "1ª cobrança pendente: o cliente paga pelo app" (a folha de cobrança não abre). Com cupom de 100%, quem não tem **Marcar como pago, anular ou estornar** recebe a recusa do sistema (a parcela de R$ 0 seria registrada como paga).
+- Sem **Decidir pedido de cancelamento**, um contrato em cancelamento pendente mostra "pedido em análise" e o status fica travado no Editar.
 
 ## Ver também
 

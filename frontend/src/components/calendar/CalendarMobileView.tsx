@@ -11,7 +11,13 @@ import BrandLoader from '../ui/BrandLoader';
  * estado; aqui vive só o DOM da view e a mecânica de drag do carrossel de pills.
  */
 interface CalendarMobileViewProps {
+    /** Modo equipe (ADMIN ou COLABORADOR): grade do estúdio, sem antecedência mínima. */
     isAdmin: boolean;
+    /**
+     * Tocar num horário livre agenda (cliente: autoatendimento; equipe: "Novo agendamento", só com
+     * agendamentos.criar). false → os horários livres aparecem, mas não são clicáveis. Padrão true.
+     */
+    canCreate?: boolean;
     minAdvanceHours: number;
     loading: boolean;
     weekDates: Date[];
@@ -34,7 +40,7 @@ interface CalendarMobileViewProps {
 }
 
 export default function CalendarMobileView({
-    isAdmin, minAdvanceHours, loading,
+    isAdmin, canCreate = true, minAdvanceHours, loading,
     weekDates, prevWeekDates, nextWeekDates,
     selectedDayIndex, onSelectDay, navigateWeek, goToday,
     today, displayMonth, slotsPhase, displayDateStr, selectedDateStr,
@@ -290,7 +296,7 @@ export default function CalendarMobileView({
                             statusColor = tierMeta?.color || 'var(--accent-primary)';
                             cardBg = tierMeta?.bg || 'var(--bg-card)';
                             borderColor = tierMeta?.color || 'var(--accent-primary)';
-                            clickable = true;
+                            clickable = canCreate;
                         }
 
                         return (
@@ -305,7 +311,7 @@ export default function CalendarMobileView({
                                         onOpenDetail(info.myBooking, selectedDateStr);
                                     } else if (clickable && slot && isAvailable && !isPast) {
                                         onSlotClick(selectedDateStr, row.time, slot);
-                                    } else if (isPast) {
+                                    } else if (isPast && canCreate) {
                                         onPastSlot();
                                     }
                                 }}

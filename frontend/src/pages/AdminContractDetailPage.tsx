@@ -22,6 +22,8 @@ import { getErrorMessage } from '../utils/errors';
 import { todayStrSaoPaulo } from '../utils/time';
 import { bookingSummary } from '../components/admin/bookings/bookingDanger';
 import { ArrowLeft, Mic, CreditCard, Receipt, Sparkles, ExternalLink, CheckCircle2, Zap, Eye, MessageCircle, Radio, ClipboardCheck, UserX, RefreshCw, FolderSymlink, Scale, Undo2 } from 'lucide-react';
+import { usePermission } from '../hooks/usePermission';
+import { useBookingPermissions } from '../components/admin/bookings/bookingPermissions';
 
 const fmtDate = (iso: string) => new Date(iso).toLocaleDateString('pt-BR', { timeZone: 'UTC', day: '2-digit', month: 'short', year: 'numeric' });
 /** Instante (ISO) → data no fuso do estúdio. Para carimbos de data/hora (pedido/cancelamento), não para datas @db.Date. */
@@ -34,6 +36,19 @@ export default function AdminContractDetailPage() {
     const { id } = useParams<{ id: string }>();
     const navigate = useNavigate();
     const { showToast, showConfirm } = useUI();
+    // Equipe (D2): cada ação segue a sua chave; a página em si abre com contratos.ver (rota).
+    const { can } = usePermission();
+    // Confirmar presença (FE-3): check-in (hoje.presenca) OU PATCH RESERVED→CONFIRMED (agendamentos.editar),
+    // a mesma regra do Painel e da tela Hoje (bp.canConfirmPresence).
+    const bp = useBookingPermissions();
+    // MAT-01: Renovar = criar contrato E baixa manual — a renovação não gera parcelas (o servidor exige as duas).
+    const canRenewPerm = can('contratos.criar') && can('cobrancas.baixa');
+    const canConditions = can('contratos.condicoes');      // Editar serviços (reprecifica parcelas)
+    const canRecord = can('hoje.gravacao');                // Iniciar / desfazer / finalizar / dados da gravação
+    const canCharge = can('cobrancas.cobrar');             // Cobrar parcela/multa (e simular no sandbox)
+    const canMarkPaid = can('cobrancas.baixa');            // Marcar pago (baixa manual)
+    const canDecideFine = can('contratos.multa');          // Pedido de cancelamento
+    const canOpenClient = can('clientes.ver');             // link para o perfil do cliente
     const { get: getRule } = useBusinessConfig();
     const sessionsPerMonth = getRule('sessions_per_month');
 
@@ -173,7 +188,11 @@ export default function AdminContractDetailPage() {
     // (400 RECORDING_START_FUTURE), a mensagem dele aparece no aviso de erro.
     const bookingStep = async (bookingId: string, action: 'checkin' | 'start') => {
         try {
-            const res = action === 'checkin' ? await bookingsApi.checkIn(bookingId) : await bookingsApi.startRecording(bookingId);
+            // Confirmar presença: o check-in exige hoje.presenca; quem só tem agendamentos.editar confirma
+            // pelo PATCH (RESERVED → CONFIRMED, mesma tabela de transições do servidor) — como no Painel.
+            const res = action === 'checkin'
+                ? (bp.canCheckIn ? await bookingsApi.checkIn(bookingId) : await bookingsApi.update(bookingId, { status: 'CONFIRMED' }))
+                : await bookingsApi.startRecording(bookingId);
             showToast(res.message);
             load();
         } catch (e) { showToast({ message: getErrorMessage(e) || 'Erro ao atualizar a gravação.', type: 'error' }); }
@@ -206,7 +225,8 @@ export default function AdminContractDetailPage() {
 
 
     // Editing recurring services is allowed only for FIXO/FLEX active contracts (recompute future).
-    const canEditServices = contract.status === 'ACTIVE' && (contract.type === 'FIXO' || contract.type === 'FLEX');
+    // Equipe: "Mudar créditos, serviços e condições de pagamento" (contratos.condicoes).
+    const canEditServices = canConditions && contract.status === 'ACTIVE' && (contract.type === 'FIXO' || contract.type === 'FLEX');
     const episodeCatalog = addons.filter(a => !a.monthly);
     const startEditServices = () => { setServiceDraft(episodeServices.map(s => s.key)); setEditingServices(true); };
     const saveServices = async () => {
@@ -237,12 +257,15 @@ export default function AdminContractDetailPage() {
                     </div>
                     <div style={{ flex: 1, minWidth: 0 }}>
                         <h1 style={{ fontSize: '1.25rem', fontWeight: 800, margin: 0 }}>{contract.name}</h1>
-                        {contract.user && (
+                        {/* O perfil do cliente só abre com "Ver clientes": sem ela, o nome é só texto. */}
+                        {contract.user && (canOpenClient ? (
                             <button onClick={() => navigate(`/admin/clients/${contract.user!.id}`)}
                                 style={{ marginTop: 4, background: 'none', border: 'none', padding: 0, cursor: 'pointer', color: 'var(--accent-primary)', fontSize: '0.8125rem', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                                 {contract.user.name} <ExternalLink size={12} />
                             </button>
-                        )}
+                        ) : (
+                            <div style={{ marginTop: 4, color: 'var(--text-secondary)', fontSize: '0.8125rem', fontWeight: 600 }}>{contract.user.name}</div>
+                        ))}
                         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 10 }}>
                             <StatusBadge meta={tMeta} />
                             <StatusBadge meta={tierMeta} label={tierMeta.label.toLocaleUpperCase('pt-BR')} />
@@ -259,10 +282,11 @@ export default function AdminContractDetailPage() {
                     </div>
                     {/* E4 — Renovar: só quando o backend libera (`canRenew`: plano Ativo/Concluído a ≤ 30 dias do fim
                         ou Expirado, ainda não renovado, nunca avulso/serviço nem cliente excluído). Já renovado →
-                        atalho para o contrato novo. */}
-                    {(contract.canRenew || (contract.alreadyRenewed && contract.renewedToId)) && (
+                        atalho para o contrato novo. Equipe: Renovar exige "Criar e renovar contratos" E "Marcar como
+                        pago, anular ou estornar" — a renovação não gera parcelas (MAT-01). */}
+                    {((canRenewPerm && contract.canRenew) || (contract.alreadyRenewed && contract.renewedToId)) && (
                         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-                            {contract.canRenew && (
+                            {canRenewPerm && contract.canRenew && (
                                 <button type="button" className="btn btn-secondary btn-sm" onClick={renew}
                                     style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                                     <RefreshCw size={14} aria-hidden="true" /> Renovar (+3 meses)
@@ -307,7 +331,9 @@ export default function AdminContractDetailPage() {
                 </div>
                 {contract.status === 'PENDING_CANCELLATION' && (
                     <div className="admin-alert admin-alert--warning" role="note" style={{ margin: '14px 0 0' }}>
-                        O cliente pediu o cancelamento. Resolva na lista de Contratos: <strong>Cobrar multa</strong> ou <strong>Isentar multa</strong>.
+                        {canDecideFine
+                            ? <>O cliente pediu o cancelamento. Resolva na lista de Contratos: <strong>Cobrar multa</strong> ou <strong>Isentar multa</strong>.</>
+                            : 'O cliente pediu o cancelamento e o pedido está em análise. Cobrar ou isentar a multa é decidido por quem tem a permissão “Decidir pedido de cancelamento”.'}
                     </div>
                 )}
             </div>
@@ -366,7 +392,7 @@ export default function AdminContractDetailPage() {
                             ))}
                         </div>
                     ) : (
-                        <Empty>Nenhum serviço recorrente. Use "Editar serviços" para incluir.</Empty>
+                        <Empty>{canEditServices ? 'Nenhum serviço recorrente. Use "Editar serviços" para incluir.' : 'Nenhum serviço recorrente.'}</Empty>
                     )}
                 </div>
             )}
@@ -420,8 +446,10 @@ export default function AdminContractDetailPage() {
                                             {b.chatMessages != null && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}><MessageCircle size={12} aria-hidden="true" /> {b.chatMessages}</span>}
                                         </div>
                                     )}
-                                    {/* Fluxo em etapas: Confirmar presença → Iniciar Gravação (registra o operador) → Finalizar. */}
-                                    {b.status === 'RESERVED' && (
+                                    {/* Fluxo em etapas: Confirmar presença → Iniciar Gravação (registra o operador) → Finalizar.
+                                        Equipe: presença = hoje.presenca (check-in) ou agendamentos.editar (PATCH);
+                                        iniciar/desfazer/finalizar/dados = hoje.gravacao (PUT start-recording / undo / complete). */}
+                                    {bp.canConfirmPresence && b.status === 'RESERVED' && (
                                         <div style={{ marginTop: 8 }}>
                                             <button className="btn btn-ghost btn-sm" onClick={() => bookingStep(b.id, 'checkin')}>
                                                 <ClipboardCheck size={14} /> Confirmar presença
@@ -429,7 +457,7 @@ export default function AdminContractDetailPage() {
                                         </div>
                                     )}
                                     {/* Sessão FUTURA não mostra "Iniciar": o backend recusa e o cliente veria "AO VIVO" falso. */}
-                                    {b.status === 'CONFIRMED' && !b.recordingStartedAt && b.date.split('T')[0] <= todaySP && (
+                                    {canRecord && b.status === 'CONFIRMED' && !b.recordingStartedAt && b.date.split('T')[0] <= todaySP && (
                                         <div style={{ marginTop: 8 }}>
                                             <button type="button" className="btn btn-ghost btn-sm" onClick={() => bookingStep(b.id, 'start')}>
                                                 <Radio size={14} /> Iniciar gravação
@@ -438,20 +466,24 @@ export default function AdminContractDetailPage() {
                                     )}
                                     {b.status === 'CONFIRMED' && b.recordingStartedAt && (
                                         <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-                                            <button type="button" className="btn btn-ghost btn-sm" onClick={() => setFinalizeBooking(b)}>
-                                                <CheckCircle2 size={14} /> Finalizar gravação
-                                            </button>
-                                            <Tooltip content="Clicou em “Iniciar gravação” por engano? Desfaz o início: o cliente deixa de ver “AO VIVO”.">
-                                                <button type="button" className="btn btn-ghost btn-sm" onClick={() => undoStartRecording(b)}>
-                                                    <Undo2 size={14} aria-hidden="true" /> Desfazer início
-                                                </button>
-                                            </Tooltip>
+                                            {canRecord && (
+                                                <>
+                                                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => setFinalizeBooking(b)}>
+                                                        <CheckCircle2 size={14} /> Finalizar gravação
+                                                    </button>
+                                                    <Tooltip content="Clicou em “Iniciar gravação” por engano? Desfaz o início: o cliente deixa de ver “AO VIVO”.">
+                                                        <button type="button" className="btn btn-ghost btn-sm" onClick={() => undoStartRecording(b)}>
+                                                            <Undo2 size={14} aria-hidden="true" /> Desfazer início
+                                                        </button>
+                                                    </Tooltip>
+                                                </>
+                                            )}
                                             <span style={{ fontSize: '0.6875rem', fontWeight: 600, color: 'var(--danger)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                                                 <Radio size={12} /> Em gravação{b.recordingStartedByName ? ` — ${b.recordingStartedByName}` : ''}
                                             </span>
                                         </div>
                                     )}
-                                    {b.status === 'COMPLETED' && (
+                                    {canRecord && b.status === 'COMPLETED' && (
                                         <div style={{ marginTop: 8 }}>
                                             <button className="btn btn-ghost btn-sm" onClick={() => setFinalizeBooking(b)}>
                                                 <CheckCircle2 size={14} /> Editar dados da gravação
@@ -520,18 +552,21 @@ export default function AdminContractDetailPage() {
                                         <StatusBadge meta={pMeta} />
                                         {isOpen && (
                                             <>
-                                                {/* D3: cliente excluído (anonimizado) não é cobrado — mesmo critério da lista de contratos. */}
-                                                {!clientDeleted && (
+                                                {/* D3: cliente excluído (anonimizado) não é cobrado — mesmo critério da lista de contratos.
+                                                    Equipe: Cobrar e Simular = cobrancas.cobrar; Marcar pago = cobrancas.baixa. */}
+                                                {canCharge && !clientDeleted && (
                                                     <button type="button" className="btn btn-sm" style={{ background: 'var(--accent-primary)', color: '#fff', border: 'none', borderRadius: 8, fontWeight: 700, padding: '5px 12px', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 4 }} onClick={() => openCharge(p)}>
                                                         <CreditCard size={13} aria-hidden="true" /> {isFine ? 'Cobrar agora' : 'Cobrar'}
                                                     </button>
                                                 )}
-                                                {sandbox && (
+                                                {canCharge && sandbox && (
                                                     <Tooltip content="Simular pagamento (sandbox)" describe={false}>
                                                         <button type="button" className="btn btn-ghost btn-sm" aria-label="Simular pagamento (sandbox)" onClick={() => simulate(p)}><Zap size={13} aria-hidden="true" /></button>
                                                     </Tooltip>
                                                 )}
-                                                <button type="button" className="btn btn-ghost btn-sm" onClick={() => markPaid(p)}>Marcar pago</button>
+                                                {canMarkPaid && (
+                                                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => markPaid(p)}>Marcar pago</button>
+                                                )}
                                             </>
                                         )}
                                     </div>

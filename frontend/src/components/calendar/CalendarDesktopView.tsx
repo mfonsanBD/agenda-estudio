@@ -12,7 +12,13 @@ import { DAYS, GRID_ROWS, TIER_COLORS, formatDate, formatDateShort, BookingLooku
  * Extraída verbatim de CalendarPage.tsx (R4 L2) — o pai continua dono do estado.
  */
 interface CalendarDesktopViewProps {
+    /** Modo equipe (ADMIN ou COLABORADOR): grade do estúdio, sem antecedência mínima. */
     isAdmin: boolean;
+    /**
+     * Clicar num horário livre agenda (cliente: autoatendimento; equipe: "Novo agendamento", só com
+     * agendamentos.criar). false → os horários livres aparecem, mas não são clicáveis. Padrão true.
+     */
+    canCreate?: boolean;
     userFirstName: string;
     minAdvanceHours: number;
     loading: boolean;
@@ -29,7 +35,7 @@ interface CalendarDesktopViewProps {
 }
 
 export default function CalendarDesktopView({
-    isAdmin, userFirstName, minAdvanceHours, loading,
+    isAdmin, canCreate = true, userFirstName, minAdvanceHours, loading,
     weekDates, displayMonth, today, slotsMap,
     buildBookingLookup, onSlotClick, onPastSlot, onHoldExpire,
     goToday, navigateWeek,
@@ -151,6 +157,7 @@ export default function CalendarDesktopView({
                                         key={`${dateStr}-${row.id}`}
                                         className={`calendar-cell ${(slotNotAvailable || isPast) ? 'occupied' : ''}${isPast ? ' calendar-cell--past' : ''}${!slot?.tier ? ' calendar-cell--void' : ''}`}
                                         onClick={() => {
+                                            if (!canCreate) return;
                                             if (isPast) {
                                                 onPastSlot();
                                                 return;
@@ -166,7 +173,7 @@ export default function CalendarDesktopView({
                                             borderLeft: (isAvailable && !isPast && tierMeta)
                                                 ? `3px solid ${tierMeta.color}`
                                                 : undefined,
-                                            cursor: (isAvailable && !isPast) ? 'pointer' : isPast ? 'not-allowed' : 'default',
+                                            cursor: !canCreate ? 'default' : (isAvailable && !isPast) ? 'pointer' : isPast ? 'not-allowed' : 'default',
                                             transition: 'background 0.2s',
                                         }}
                                     >

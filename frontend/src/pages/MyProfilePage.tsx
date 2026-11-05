@@ -10,11 +10,21 @@ import ToggleSwitch from '../components/ui/ToggleSwitch';
 import AddressFields, { type AddressValues } from '../components/admin/clients/AddressFields';
 import { parseSocialLinks, serializeSocialLinks } from '../components/admin/clients/SocialLinksEditor';
 import { ArrowLeft, UserRound, Camera, Save, Loader2, CheckCircle2 } from 'lucide-react';
+import { usePermission } from '../hooks/usePermission';
+
+/** Senha mínima: equipe 8 (o servidor recusa menos — PASSWORD_TOO_SHORT); cliente 6. */
+const STAFF_MIN_PASSWORD = 8;
+const CLIENT_MIN_PASSWORD = 6;
 
 export default function MyProfilePage() {
     const navigate = useNavigate();
     const { user, updateUser } = useAuth();
     const uid = useId();
+    // Equipe (ADMIN/COLABORADOR): o perfil próprio é só nome, telefone, foto, senha e notificações — CPF,
+    // endereço e redes são da ficha de CLIENTE (proposta §4.8). Senha da equipe: mínimo 8, e trocar
+    // encerra as outras sessões (o servidor reemite os cookies desta).
+    const { isStaff, roleLabel } = usePermission();
+    const minPassword = isStaff ? STAFF_MIN_PASSWORD : CLIENT_MIN_PASSWORD;
 
     const [name, setName] = useState(user?.name || '');
     const [phone, setPhone] = useState(user?.phone || '');
@@ -46,14 +56,19 @@ export default function MyProfilePage() {
     };
 
     const handleSave = async () => {
-        setSaving(true); setError(''); setSuccess('');
+        setError(''); setSuccess('');
+        if (password && password.length < minPassword) {
+            setError(`A nova senha precisa de pelo menos ${minPassword} caracteres.`);
+            return;
+        }
+        setSaving(true);
         try {
             const data: Parameters<typeof authApi.updateProfile>[0] = {};
             if (name && name !== user?.name) data.name = name;
             if (phone !== (user?.phone || '')) data.phone = phone;
             if (password) data.password = password;
             const cpfDigits = cpfCnpj.replace(/\D/g, '');
-            if (cpfDigits !== (user?.cpfCnpj || '').replace(/\D/g, '')) {
+            if (!isStaff && cpfDigits !== (user?.cpfCnpj || '').replace(/\D/g, '')) {
                 if (cpfDigits && !isValidCpfCnpj(cpfDigits)) {
                     setError('CPF/CNPJ inválido. Confira os números.');
                     setSaving(false);
@@ -61,10 +76,10 @@ export default function MyProfilePage() {
                 }
                 data.cpfCnpj = cpfDigits;
             }
-            (['zipCode', 'address', 'addressNumber', 'complement', 'neighborhood', 'city', 'state'] as const).forEach(f => {
+            if (!isStaff) (['zipCode', 'address', 'addressNumber', 'complement', 'neighborhood', 'city', 'state'] as const).forEach(f => {
                 if (addr[f] !== (user?.[f] || '')) data[f] = addr[f];
             });
-            if (instagram !== initialInsta || linkedin !== initialLink) {
+            if (!isStaff && (instagram !== initialInsta || linkedin !== initialLink)) {
                 // MERGE com o JSON salvo: só Instagram/LinkedIn mudam aqui; YouTube, Spotify, Site
                 // (e outras chaves) definidos pelo admin são preservados. Vazio remove a chave.
                 const merged = { ...parseSocialLinks(user?.socialLinks), instagram: instagram.trim(), linkedin: linkedin.trim() };
@@ -79,7 +94,9 @@ export default function MyProfilePage() {
                 updateUser(res.user);
             }
             setPassword('');
-            flashSuccess('Perfil atualizado com sucesso!');
+            flashSuccess(isStaff && data.password
+                ? 'Perfil atualizado. A nova senha vale a partir de agora; as suas outras sessões foram encerradas.'
+                : 'Perfil atualizado com sucesso!');
         } catch (err: unknown) {
             setError(err instanceof Error ? err.message : 'Erro ao salvar o perfil.');
         } finally {
@@ -125,7 +142,7 @@ export default function MyProfilePage() {
                     </div>
                     <div>
                         <h2 className="client-hero__greeting">Meu Perfil</h2>
-                        <p className="client-hero__message">Gerencie seus dados e preferências</p>
+                        <p className="client-hero__message">{isStaff ? `${roleLabel} · Gerencie seus dados de acesso e preferências` : 'Gerencie seus dados e preferências'}</p>
                     </div>
                 </div>
             </div>
@@ -179,31 +196,44 @@ export default function MyProfilePage() {
                     </div>
                     <div className="form-group">
                         <label className="form-label" htmlFor={`${uid}-password`}>Nova senha (deixe vazio para manter)</label>
-                        <input id={`${uid}-password`} className="form-input" type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Mínimo 6 caracteres" autoComplete="new-password" />
+                        <input id={`${uid}-password`} className="form-input" type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder={`Mínimo ${minPassword} caracteres`} autoComplete="new-password"
+                            aria-describedby={isStaff ? `${uid}-password-hint` : undefined} />
+                        {isStaff && (
+                            <div id={`${uid}-password-hint`} className="profile-hint">
+                                Ao trocar a senha, as suas sessões em outros aparelhos são encerradas.
+                            </div>
+                        )}
                     </div>
-                    <div className="form-group">
-                        <label className="form-label" htmlFor={`${uid}-cpfcnpj`}>CPF / CNPJ</label>
-                        <input id={`${uid}-cpfcnpj`} className="form-input" value={cpfCnpj} onChange={e => setCpfCnpj(maskCpfCnpj(e.target.value))} inputMode="numeric" placeholder="000.000.000-00" />
-                    </div>
-                    <div className="form-group">
-                        <AddressFields values={addr} onChange={patch => setAddr(a => ({ ...a, ...patch }))} />
-                    </div>
-                    <div className="form-group">
-                        <label className="form-label" htmlFor={`${uid}-instagram`}>Instagram</label>
-                        <div className="profile-input-adorned">
-                            <span className="profile-input-adorned__prefix">@</span>
-                            <input id={`${uid}-instagram`} className="form-input" value={instagram} onChange={e => setInstagram(e.target.value)} placeholder="usuario" />
-                        </div>
-                    </div>
-                    <div className="form-group">
-                        <label className="form-label" htmlFor={`${uid}-linkedin`}>LinkedIn (URL)</label>
-                        <input id={`${uid}-linkedin`} className="form-input" value={linkedin} onChange={e => setLinkedin(e.target.value)} placeholder="https://linkedin.com/in/..." />
-                    </div>
+                    {/* Ficha de cliente (CPF, endereço e redes): só para o CLIENTE. */}
+                    {!isStaff && (
+                        <>
+                            <div className="form-group">
+                                <label className="form-label" htmlFor={`${uid}-cpfcnpj`}>CPF / CNPJ</label>
+                                <input id={`${uid}-cpfcnpj`} className="form-input" value={cpfCnpj} onChange={e => setCpfCnpj(maskCpfCnpj(e.target.value))} inputMode="numeric" placeholder="000.000.000-00" />
+                            </div>
+                            <div className="form-group">
+                                <AddressFields values={addr} onChange={patch => setAddr(a => ({ ...a, ...patch }))} />
+                            </div>
+                            <div className="form-group">
+                                <label className="form-label" htmlFor={`${uid}-instagram`}>Instagram</label>
+                                <div className="profile-input-adorned">
+                                    <span className="profile-input-adorned__prefix">@</span>
+                                    <input id={`${uid}-instagram`} className="form-input" value={instagram} onChange={e => setInstagram(e.target.value)} placeholder="usuario" />
+                                </div>
+                            </div>
+                            <div className="form-group">
+                                <label className="form-label" htmlFor={`${uid}-linkedin`}>LinkedIn (URL)</label>
+                                <input id={`${uid}-linkedin`} className="form-input" value={linkedin} onChange={e => setLinkedin(e.target.value)} placeholder="https://linkedin.com/in/..." />
+                            </div>
+                        </>
+                    )}
                     <div className="form-group">
                         <label className="form-label">Notificações</label>
                         <ToggleSwitch checked={essentialOnly} onChange={setEssentialOnly} label="Apenas notificações essenciais" disabled={saving} />
                         <div className="profile-hint">
-                            Receba só avisos importantes (pagamentos e perda de crédito). Lembretes e dicas ficam silenciados.
+                            {isStaff
+                                ? 'Receba só os avisos importantes. Lembretes e dicas ficam silenciados.'
+                                : 'Receba só avisos importantes (pagamentos e perda de crédito). Lembretes e dicas ficam silenciados.'}
                         </div>
                     </div>
 

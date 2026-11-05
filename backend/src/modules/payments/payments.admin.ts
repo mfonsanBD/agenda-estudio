@@ -1,11 +1,18 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize } from '../../middleware/auth.js';
+import { authenticate } from '../../middleware/auth.js';
+import { requirePermission, enforceRuleResult } from '../../middleware/permissions.js';
+import { requiredForPaymentPatch } from '../../lib/permissionRules.js';
 import { PaymentStatus, PaymentMethod } from '../../generated/prisma/client.js';
 import { paidChargedAmount } from '../../lib/pixGateway.js';
 
-// ─── PATCH /api/payments/:id (ADMIN) ────────────────────
+// Permissões (equipe — config/staffPermissions.ts):
+//   GET /payments e /summary → financeiro.ver (receita consolidada);
+//   PATCH /payments/:id      → cobrancas.baixa (toda transição manual é baixa: marcar pago, anular,
+//                              estornar) + requiredForPaymentPatch (campo sem regra → só ADMIN).
+
+// ─── PATCH /api/payments/:id (equipe: cobrancas.baixa) ──
 // Update payment status (mark as paid, refunded, etc.)
 
 const updatePaymentSchema = z.object({
@@ -25,10 +32,10 @@ const VALID_STATUS_TRANSITIONS: Record<string, string[]> = {
 };
 
 export function registerPaymentAdminRoutes(router: Router) {
-    // ─── GET /api/payments (ADMIN) ──────────────────────────
+    // ─── GET /api/payments (equipe: financeiro.ver) ─────────
     // Lists all payments with filters and includes user + contract
 
-    router.get('/', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+    router.get('/', authenticate, requirePermission('financeiro.ver'), async (req: Request, res: Response) => {
         try {
             const { status, userId, contractId, from, to, search } = req.query;
 
@@ -85,10 +92,10 @@ export function registerPaymentAdminRoutes(router: Router) {
         }
     });
 
-    // ─── GET /api/payments/summary (ADMIN) ──────────────────
+    // ─── GET /api/payments/summary (equipe: financeiro.ver) ─
     // Financial KPIs for the current period
 
-    router.get('/summary', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+    router.get('/summary', authenticate, requirePermission('financeiro.ver'), async (req: Request, res: Response) => {
         try {
             const { from, to } = req.query;
 
@@ -166,10 +173,12 @@ export function registerPaymentAdminRoutes(router: Router) {
         }
     });
 
-    router.patch('/:id', authenticate, authorize('ADMIN'), async (req: Request<{ id: string }>, res: Response) => {
+    router.patch('/:id', authenticate, requirePermission('cobrancas.baixa'), async (req: Request<{ id: string }>, res: Response) => {
         try {
             const { id } = req.params;
             const data = updatePaymentSchema.parse(req.body);
+            // Nega por padrão: campo do schema sem regra em lib/permissionRules.ts exige o ADMIN.
+            if (!(await enforceRuleResult(req, res, requiredForPaymentPatch(data)))) return;
 
             const existing = await prisma.payment.findUnique({ where: { id } });
             if (!existing) {

@@ -255,12 +255,15 @@ export const NOTIFICATION_EVENT_CATALOG: NotificationEventDef[] = [
         defaultMessage: 'O contrato "{contrato}" foi cancelado, sem multa. As parcelas que estavam pendentes foram anuladas.',
         variables: [V.contrato],
     },
-    // ── Admin (persisted) ─────────────────────────────────
+    // ── Equipe (audiência "admin", persisted) ─────────────
+    // Avisos da EQUIPE: vão para os administradores e para o colaborador que tem a permissão do evento
+    // (STAFF_EVENT_PERMISSIONS em config/staffPermissions.ts). Por isso o rótulo é "Equipe — …" e a
+    // descrição diz quem da equipe recebe, sem citar a chave (NS-5). Só o ADMIN edita estes modelos.
     {
         // Mesmo tipo + entidade do alerta computado "Cancelamento pendente": no sino aparece uma vez só
         // (a computada sombreia esta enquanto o pedido está em análise); esta existe para o PUSH imediato.
-        eventKey: 'admin_cancellation_requested', label: 'Admin — pedido de cancelamento (push)',
-        description: 'Avisa os admins, na hora e com push, que um cliente pediu o cancelamento de um contrato, com a multa prevista. É removida quando o pedido é resolvido.',
+        eventKey: 'admin_cancellation_requested', label: 'Equipe — pedido de cancelamento (push)',
+        description: 'Avisa os administradores e quem da equipe decide pedidos de cancelamento, na hora e com push, que um cliente pediu o cancelamento de um contrato, com a multa prevista. É removida quando o pedido é resolvido.',
         group: 'admin', audience: 'admin', kind: 'persisted',
         type: 'CANCELLATION_PENDING', severity: 'warning', pushDefault: true, actionUrl: '/admin/contracts',
         defaultTitle: 'Pedido de cancelamento',
@@ -268,8 +271,8 @@ export const NOTIFICATION_EVENT_CATALOG: NotificationEventDef[] = [
         variables: [V.cliente, V.contrato, V.valor],
     },
     {
-        eventKey: 'admin_payment_on_cancelled_charge', label: 'Admin — pagamento em cobrança cancelada',
-        description: 'Avisa os admins quando o banco/cartão confirma um pagamento de uma cobrança que já estava cancelada (parcela anulada de contrato cancelado): o dinheiro entrou e precisa de estorno ou baixa manual.',
+        eventKey: 'admin_payment_on_cancelled_charge', label: 'Equipe — pagamento em cobrança cancelada',
+        description: 'Avisa os administradores e quem da equipe vê o Financeiro quando o banco/cartão confirma um pagamento de uma cobrança que já estava cancelada (parcela anulada de contrato cancelado): o dinheiro entrou e precisa de estorno ou baixa manual.',
         group: 'admin', audience: 'admin', kind: 'persisted',
         type: 'SYSTEM', severity: 'critical', pushDefault: true, actionUrl: '/admin/finance',
         defaultTitle: 'Pagamento recebido em cobrança cancelada',
@@ -278,8 +281,8 @@ export const NOTIFICATION_EVENT_CATALOG: NotificationEventDef[] = [
     },
     {
         // Z1-c: rede de segurança da cobrança em dobro (cobrança automática + checkout de cartão aberto).
-        eventKey: 'admin_card_double_charge', label: 'Admin — cobrança em dobro no cartão',
-        description: 'Avisa os admins quando um segundo pagamento no cartão (PaymentIntent) é aprovado para uma cobrança que já estava paga por outro — por exemplo, a cobrança automática quitou a parcela e o cliente confirmou um checkout de cartão que tinha ficado aberto. O cliente foi debitado duas vezes: o pagamento excedente precisa ser estornado no painel do Stripe.',
+        eventKey: 'admin_card_double_charge', label: 'Equipe — cobrança em dobro no cartão',
+        description: 'Avisa os administradores e quem da equipe vê o Financeiro quando um segundo pagamento no cartão (PaymentIntent) é aprovado para uma cobrança que já estava paga por outro — por exemplo, a cobrança automática quitou a parcela e o cliente confirmou um checkout de cartão que tinha ficado aberto. O cliente foi debitado duas vezes: o pagamento excedente precisa ser estornado no painel do Stripe.',
         group: 'admin', audience: 'admin', kind: 'persisted',
         type: 'SYSTEM', severity: 'critical', pushDefault: true, actionUrl: '/admin/finance',
         defaultTitle: 'Cobrança em dobro no cartão',
@@ -287,8 +290,8 @@ export const NOTIFICATION_EVENT_CATALOG: NotificationEventDef[] = [
         variables: [V.cliente, V.valor, V.contrato, V.piPago, V.piExtra],
     },
     {
-        eventKey: 'admin_booking_confirmed', label: 'Admin — sessão confirmada',
-        description: 'Notifica o admin quando um cliente confirma uma sessão.',
+        eventKey: 'admin_booking_confirmed', label: 'Equipe — sessão confirmada',
+        description: 'Avisa os administradores e quem da equipe vê a operação do dia quando um cliente confirma uma sessão.',
         group: 'admin', audience: 'admin', kind: 'persisted',
         type: 'BOOKING_CONFIRMED', severity: 'info', pushDefault: false, actionUrl: '/admin/today',
         defaultTitle: 'Sessão confirmada',
@@ -296,8 +299,8 @@ export const NOTIFICATION_EVENT_CATALOG: NotificationEventDef[] = [
         variables: [V.cliente, V.data, V.hora],
     },
     {
-        eventKey: 'admin_booking_cancelled', label: 'Admin — sessão cancelada',
-        description: 'Notifica o admin quando um cliente cancela uma sessão.',
+        eventKey: 'admin_booking_cancelled', label: 'Equipe — sessão cancelada',
+        description: 'Avisa os administradores e quem da equipe vê a operação do dia quando um cliente cancela uma sessão.',
         group: 'admin', audience: 'admin', kind: 'persisted',
         type: 'BOOKING_CANCELLED', severity: 'warning', pushDefault: false, actionUrl: '/admin/today',
         defaultTitle: 'Sessão cancelada',
@@ -305,8 +308,8 @@ export const NOTIFICATION_EVENT_CATALOG: NotificationEventDef[] = [
         variables: [V.cliente, V.data, V.hora],
     },
     {
-        eventKey: 'admin_makeup_rescheduled', label: 'Admin — gravação avulsa remarcada',
-        description: 'Notifica os admins quando uma gravação avulsa perdida (falta justificada ou não realizada) é remarcada sem novo pagamento (quem remarcou não é notificado).',
+        eventKey: 'admin_makeup_rescheduled', label: 'Equipe — gravação avulsa remarcada',
+        description: 'Avisa os administradores e quem da equipe vê a operação do dia quando uma gravação avulsa perdida (falta justificada ou não realizada) é remarcada sem novo pagamento (quem remarcou não é avisado).',
         group: 'admin', audience: 'admin', kind: 'persisted',
         type: 'SYSTEM', severity: 'info', pushDefault: false, actionUrl: '/admin/today',
         defaultTitle: 'Gravação remarcada',
@@ -314,10 +317,12 @@ export const NOTIFICATION_EVENT_CATALOG: NotificationEventDef[] = [
         variables: [V.cliente, V.data, V.novaData, V.hora],
     },
     {
-        eventKey: 'admin_makeup_expired_studio', label: 'Admin — não realizada sem remarcação',
-        description: 'Avisa o admin quando termina a janela de uma gravação avulsa que o estúdio não realizou e o cliente não remarcou: resolver com o cliente (o admin ainda pode remarcar).',
+        // Link padrão = lista de Agendamentos (abre com agendamentos.faltas, a permissão do evento — I3).
+        // O job manda o detalhe do contrato (/admin/contracts/:id) para quem também vê contratos.
+        eventKey: 'admin_makeup_expired_studio', label: 'Equipe — não realizada sem remarcação',
+        description: 'Avisa os administradores e quem da equipe registra faltas quando termina a janela de uma gravação avulsa que o estúdio não realizou e o cliente não remarcou: resolver com o cliente (a equipe ainda pode remarcar).',
         group: 'admin', audience: 'admin', kind: 'persisted',
-        type: 'BOOKING_CANCELLED', severity: 'critical', pushDefault: true, actionUrl: '/admin/contracts',
+        type: 'BOOKING_CANCELLED', severity: 'critical', pushDefault: true, actionUrl: '/admin/bookings',
         defaultTitle: 'Gravação não realizada sem remarcação',
         defaultMessage: '{cliente} não remarcou a gravação de {data} (não realizada pelo estúdio) até {prazo}. Entre em contato para combinar a nova data.',
         variables: [V.cliente, V.data, V.prazo],
@@ -368,10 +373,10 @@ export const NOTIFICATION_EVENT_CATALOG: NotificationEventDef[] = [
         defaultMessage: 'Seu contrato "{contrato}" aguarda o pagamento para ser ativado.',
         variables: [V.contrato],
     },
-    // ── Computed (admin) ──────────────────────────────────
+    // ── Equipe (audiência "admin", computed) ──────────────
     {
-        eventKey: 'computed_contract_expiring_admin', label: 'Admin — contrato de cliente expirando',
-        description: 'Alerta para o admin sobre contratos de clientes perto do fim.',
+        eventKey: 'computed_contract_expiring_admin', label: 'Equipe — contrato de cliente expirando',
+        description: 'Alerta para os administradores e quem da equipe vê os Contratos sobre contratos de clientes perto do fim.',
         group: 'admin', audience: 'admin', kind: 'computed',
         type: 'CONTRACT_EXPIRING', severity: 'dynamic', pushDefault: false, actionUrl: '/admin/contracts',
         defaultTitle: 'Contrato expirando',
@@ -379,8 +384,8 @@ export const NOTIFICATION_EVENT_CATALOG: NotificationEventDef[] = [
         variables: [V.cliente, V.contrato, V.dias],
     },
     {
-        eventKey: 'computed_payment_overdue_admin', label: 'Admin — cliente com faturas vencidas',
-        description: 'Resumo por cliente das faturas vencidas (uma por cliente).',
+        eventKey: 'computed_payment_overdue_admin', label: 'Equipe — cliente com faturas vencidas',
+        description: 'Resumo por cliente das faturas vencidas (uma por cliente), para os administradores e quem da equipe vê o Financeiro.',
         group: 'admin', audience: 'admin', kind: 'computed',
         type: 'PAYMENT_OVERDUE', severity: 'dynamic', pushDefault: false, actionUrl: '/admin/finance',
         defaultTitle: 'Cliente com faturas vencidas',
@@ -388,8 +393,8 @@ export const NOTIFICATION_EVENT_CATALOG: NotificationEventDef[] = [
         variables: [V.cliente, V.quantidade, V.total, V.diasMax],
     },
     {
-        eventKey: 'computed_payment_failed_admin', label: 'Admin — pagamento de cliente falhou',
-        description: 'Alerta para o admin sobre pagamento com cartão de cliente em falha.',
+        eventKey: 'computed_payment_failed_admin', label: 'Equipe — pagamento de cliente falhou',
+        description: 'Alerta para os administradores e quem da equipe vê o Financeiro sobre pagamento com cartão de cliente em falha.',
         group: 'admin', audience: 'admin', kind: 'computed',
         type: 'PAYMENT_OVERDUE', severity: 'critical', pushDefault: false, actionUrl: '/admin/finance',
         defaultTitle: 'Pagamento de cliente falhou',
@@ -397,8 +402,8 @@ export const NOTIFICATION_EVENT_CATALOG: NotificationEventDef[] = [
         variables: [V.cliente, V.valor],
     },
     {
-        eventKey: 'computed_booking_unconfirmed_admin', label: 'Admin — sessão não confirmada',
-        description: 'Alerta para o admin sobre sessão do dia ainda não confirmada.',
+        eventKey: 'computed_booking_unconfirmed_admin', label: 'Equipe — sessão não confirmada',
+        description: 'Alerta para os administradores e quem da equipe confirma presença sobre sessão do dia ainda não confirmada.',
         group: 'admin', audience: 'admin', kind: 'computed',
         type: 'BOOKING_UNCONFIRMED', severity: 'critical', pushDefault: false, actionUrl: '/admin/today',
         defaultTitle: 'Sessão não confirmada',
@@ -406,8 +411,8 @@ export const NOTIFICATION_EVENT_CATALOG: NotificationEventDef[] = [
         variables: [V.cliente, V.hora, { ...V.diaLabel, example: 'hoje' }], // em runtime recebe 'hoje'
     },
     {
-        eventKey: 'computed_cancellation_pending_admin', label: 'Admin — cancelamento pendente',
-        description: 'Alerta para o admin sobre pedido de cancelamento a resolver.',
+        eventKey: 'computed_cancellation_pending_admin', label: 'Equipe — cancelamento pendente',
+        description: 'Alerta para os administradores e quem da equipe decide pedidos de cancelamento sobre pedido de cancelamento a resolver.',
         group: 'admin', audience: 'admin', kind: 'computed',
         type: 'CANCELLATION_PENDING', severity: 'warning', pushDefault: false, actionUrl: '/admin/contracts',
         defaultTitle: 'Cancelamento pendente',
@@ -415,8 +420,8 @@ export const NOTIFICATION_EVENT_CATALOG: NotificationEventDef[] = [
         variables: [V.cliente, V.contrato],
     },
     {
-        eventKey: 'computed_contract_awaiting_admin', label: 'Admin — contrato aguardando pagamento',
-        description: 'Alerta para o admin sobre contrato de cliente aguardando pagamento.',
+        eventKey: 'computed_contract_awaiting_admin', label: 'Equipe — contrato aguardando pagamento',
+        description: 'Alerta para os administradores e quem da equipe vê os Contratos sobre contrato de cliente aguardando pagamento.',
         group: 'admin', audience: 'admin', kind: 'computed',
         type: 'CONTRACT_AWAITING_PAYMENT', severity: 'dynamic', pushDefault: false, actionUrl: '/admin/contracts',
         defaultTitle: 'Contrato aguardando pagamento',

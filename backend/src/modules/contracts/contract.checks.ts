@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { authenticate } from '../../middleware/auth.js';
+import { requirePermissionIfStaff, routeActor } from '../bookings/permissionGuards.js';
 import {
     getContractSlotGrid, checkSlotInGrid, checkCustomScheduleInGrid, slotAllowedForContract,
     planCustomOccurrences, getPackageSlots, weekdayOfDateStr,
@@ -14,7 +15,7 @@ import {
 } from './contract.creation.js';
 import { acquireMutex, releaseMutex } from '../../lib/redis.js';
 
-/** `userId` opcional do /custom/check do ADMIN (cliente-alvo), fora do customCheckSchema. */
+/** `userId` opcional do /custom/check da equipe (cliente-alvo), fora do customCheckSchema. */
 const checkTargetUserSchema = z.string().uuid().optional();
 
 export function registerCheckRoutes(router: Router) {
@@ -184,11 +185,15 @@ router.post('/check-fixo', authenticate, async (req: Request, res: Response) => 
 // Devolve TODOS os conflitos: o POST /custom recusa (409) qualquer ocorrência sem resolução, então
 // a tela precisa ver cada uma para decidir (aceitar só quando todas têm sugestão).
 
-router.post('/custom/check', authenticate, async (req: Request, res: Response) => {
+// Rota MISTA: a equipe precisa de `contratos.criar` (sem ela, 403 — nunca o ramo do cliente).
+router.post('/custom/check', authenticate, requirePermissionIfStaff('contratos.criar'), async (req: Request, res: Response) => {
     try {
+        const actor = await routeActor(req, res);
+        if (!actor) return;
         const data = customCheckSchema.parse(req.body);
         const frequency = data.frequency ?? 'WEEKLY';
-        const isAdmin = req.user!.role === 'ADMIN';
+        // Equipe com contratos.criar (conferido pela guarda): início livre e só descarta tentativas VENCIDAS.
+        const isStaff = actor.isStaff;
 
         // D8: cada item precisa estar na grade de contrato da faixa → 400 "Horário inválido".
         const grid = await getContractSlotGrid(data.tier);
@@ -199,7 +204,7 @@ router.post('/custom/check', authenticate, async (req: Request, res: Response) =
         }
 
         // D7: o CLIENTE simula com o mesmo início fixo que a criação exige (amanhã, SP).
-        if (!isAdmin) {
+        if (!isStaff) {
             const tomorrowSp = tomorrowInSaoPaulo();
             if (data.startDate !== tomorrowSp) {
                 res.status(400).json(clientStartDateError(tomorrowSp));
@@ -211,8 +216,8 @@ router.post('/custom/check', authenticate, async (req: Request, res: Response) =
         // RESERVED delas não aparecerem como conflito:
         //  - CLIENTE: o check vem logo antes da criação ("Ir para pagamento") → a nova tentativa substitui a
         //    anterior, viva ou vencida. Paga / pagamento em andamento → 409 (igual ao POST /custom).
-        //  - ADMIN: só as VENCIDAS do cliente-alvo (`userId`, se informado; sem ele, nada é descartado).
-        if (!isAdmin) {
+        //  - EQUIPE: só as VENCIDAS do cliente-alvo (`userId`, se informado; sem ele, nada é descartado).
+        if (!isStaff) {
             const userId = req.user!.userId;
             const lockKey = customUserLockKey(userId);
             // Nunca descartar a tentativa que um POST /custom deste cliente está gravando agora.

@@ -1,21 +1,24 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize } from '../../middleware/auth.js';
+import { authenticate } from '../../middleware/auth.js';
+import { requirePermission, requireStaff } from '../../middleware/permissions.js';
 import { logAudit } from '../../lib/audit.js';
 import { normalizeCouponCode } from '../../lib/couponService.js';
 import { createCouponSchema, updateCouponSchema } from './validators.js';
 
 const router = Router();
 
-// All admin CRUD — every route below requires ADMIN.
-router.use(authenticate, authorize('ADMIN'));
+// CRUD da equipe — router 100% administrativo (crítica E4): login de EQUIPE em tudo que chega aqui
+// (inclusive rota futura sem guarda própria) + a permissão por rota: ler → cupons.ver; criar, editar,
+// ativar/desativar e excluir → cupons.editar.
+router.use(authenticate, requireStaff());
 
 /** "YYYY-MM-DD" → 00:00Z (repo convention: @db.Date columns hold the SP calendar date). */
 const spDate = (s: string) => new Date(s + 'T00:00:00Z');
 
-// ─── GET /api/coupons ───────────────────────────────────
-router.get('/', async (_req: Request, res: Response) => {
+// ─── GET /api/coupons (cupons.ver) ──────────────────────
+router.get('/', requirePermission('cupons.ver'), async (_req: Request, res: Response) => {
     const coupons = await prisma.coupon.findMany({
         orderBy: { createdAt: 'desc' },
         include: { eligibleUsers: { include: { user: { select: { id: true, name: true, email: true } } } } },
@@ -44,8 +47,8 @@ router.get('/', async (_req: Request, res: Response) => {
     });
 });
 
-// ─── POST /api/coupons ──────────────────────────────────
-router.post('/', async (req: Request, res: Response) => {
+// ─── POST /api/coupons (cupons.editar) ──────────────────
+router.post('/', requirePermission('cupons.editar'), async (req: Request, res: Response) => {
     try {
         const data = createCouponSchema.parse(req.body);
         const code = normalizeCouponCode(data.code);
@@ -91,8 +94,8 @@ router.post('/', async (req: Request, res: Response) => {
     }
 });
 
-// ─── GET /api/coupons/:id ───────────────────────────────
-router.get('/:id', async (req: Request, res: Response) => {
+// ─── GET /api/coupons/:id (cupons.ver) ──────────────────
+router.get('/:id', requirePermission('cupons.ver'), async (req: Request, res: Response) => {
     const coupon = await prisma.coupon.findUnique({
         where: { id: req.params.id as string },
         include: {
@@ -114,8 +117,8 @@ router.get('/:id', async (req: Request, res: Response) => {
     res.json({ coupon: { ...coupon, eligibleUsers: coupon.eligibleUsers.map(e => e.user) } });
 });
 
-// ─── PATCH /api/coupons/:id ─────────────────────────────
-router.patch('/:id', async (req: Request, res: Response) => {
+// ─── PATCH /api/coupons/:id (cupons.editar) ─────────────
+router.patch('/:id', requirePermission('cupons.editar'), async (req: Request, res: Response) => {
     try {
         const id = req.params.id as string;
         const data = updateCouponSchema.parse(req.body);
@@ -189,8 +192,8 @@ router.patch('/:id', async (req: Request, res: Response) => {
     }
 });
 
-// ─── DELETE /api/coupons/:id ────────────────────────────
-router.delete('/:id', async (req: Request, res: Response) => {
+// ─── DELETE /api/coupons/:id (cupons.editar — excluir está incluso, crítica C1) ─
+router.delete('/:id', requirePermission('cupons.editar'), async (req: Request, res: Response) => {
     const id = req.params.id as string;
     // Block only when a use was actually consumed (RESERVED = in flight, CONFIRMED = paid).
     // RELEASED redemptions gave the use back and only exist as dead rows, so they must not

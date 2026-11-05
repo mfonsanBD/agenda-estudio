@@ -10,6 +10,7 @@ import {
 import { PrismaPg } from "@prisma/adapter-pg";
 import { Pool } from "pg";
 import bcrypt from "bcryptjs";
+import { STAFF_PRESETS } from "../src/config/staffPermissions";
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const adapter = new PrismaPg(pool);
@@ -40,6 +41,28 @@ async function main() {
     },
   });
   console.log(`  ✅ Admin: ${admin.email} / admin123`);
+
+  // ─── 1b. Colaborador de exemplo (equipe com o perfil Recepção) ─
+  // Mesma convenção de senha do admin do seed. As permissões são as do perfil modelo (só as chaves
+  // vão para o banco; o staff_profiles some junto com o usuário — FK CASCADE).
+  const recepcao = STAFF_PRESETS.find((p) => p.key === "recepcao");
+  const colabPassword = await bcrypt.hash("colab123", 12);
+  const colab = await prisma.user.create({
+    data: {
+      email: "colab@studio.com",
+      passwordHash: colabPassword,
+      name: "Colaborador Recepção",
+      phone: "(21) 99999-0001",
+      role: Role.COLABORADOR,
+      staffProfile: {
+        create: {
+          title: "Recepção",
+          permissions: [...(recepcao?.permissions ?? [])],
+        },
+      },
+    },
+  });
+  console.log(`  ✅ Colaborador: ${colab.email} / colab123 (perfil Recepção)`);
 
   const now = new Date();
   const oneMonthAgo = new Date(now);
@@ -423,6 +446,7 @@ async function main() {
   console.log("\n✨ Database Reset completed successfully!");
   console.log("\nCredenciais limitadas prontas para teste:");
   console.log("  🛡️ Admin:     admin@studio.com (admin123)");
+  console.log("  🧑‍💼 Colab:     colab@studio.com (colab123) — perfil Recepção");
   console.log("  👤 Cliente:   cliente@teste.com (cliente123)");
 }
 

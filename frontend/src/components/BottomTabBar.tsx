@@ -1,7 +1,7 @@
-import { useId, useState } from 'react';
+import { useId, useMemo, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import { LayoutGrid } from 'lucide-react';
-import { useAuth } from '../context/AuthContext';
+import { usePermission } from '../hooks/usePermission';
 import { useNavigation } from '../context/NavigationContext';
 import BottomSheetModal from './BottomSheetModal';
 // Nav items come from a single shared source so desktop (Sidebar) and mobile
@@ -9,7 +9,8 @@ import BottomSheetModal from './BottomSheetModal';
 // never scrolls: a list that fits shows every item; a longer one (admin) keeps
 // the `mobilePrimary` items on the bar and moves the rest to the "Mais" sheet,
 // grouped by `section`. Labels/icons use the mobile-specific overrides.
-import { CLIENT_NAV, ADMIN_NAV, isNavItemActive, splitMobileNav, type NavItem } from '../config/nav';
+// Equipe: o menu administrativo vem filtrado pelas permissões (filterNav), igual ao da Sidebar.
+import { CLIENT_NAV, ADMIN_NAV, filterNav, isNavItemActive, splitMobileNav, type NavItem } from '../config/nav';
 
 interface NavGroup {
     section: string | null;
@@ -29,12 +30,14 @@ function groupBySection(items: NavItem[]): NavGroup[] {
 }
 
 export default function BottomTabBar() {
-    const { user } = useAuth();
+    const { isAdmin, isStaff, can } = usePermission();
     const { navigateTo, isTransitioning, pendingPath } = useNavigation();
     const { pathname } = useLocation();
     const uid = useId();
-    const items = user?.role === 'ADMIN' ? ADMIN_NAV : CLIENT_NAV;
-    const { primary, overflow } = splitMobileNav(items);
+    const { primary, overflow } = useMemo(
+        () => splitMobileNav(isStaff ? filterNav(ADMIN_NAV, can, isAdmin) : CLIENT_NAV),
+        [isStaff, isAdmin, can],
+    );
 
     // O sheet "Mais" lembra a rota em que foi aberto: se a rota muda (por ele, pela
     // barra ou por qualquer outro link), ele fecha sozinho — sem efeito extra.

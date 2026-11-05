@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { authenticate } from '../../middleware/auth.js';
+import { actorOrReply, canAny, denyPermission } from '../../middleware/permissions.js';
 import { CouponError, validateCoupon } from '../../lib/couponService.js';
 import { validateCouponSchema } from './validators.js';
 
@@ -15,10 +16,22 @@ router.post('/validate', authenticate, async (req: Request, res: Response) => {
     try {
         const data = validateCouponSchema.parse(req.body);
 
-        // Eligibility is evaluated for the CLIENT the charge is for: admins may
-        // pass the target client's id (their own modals); clients always get
-        // their own token identity — a client cannot probe other users.
-        const targetUserId = (data.userId && req.user!.role === 'ADMIN') ? data.userId : req.user!.userId;
+        // Eligibility is evaluated for the CLIENT the charge is for: staff may pass the target
+        // client's id (their own modals) only with agendamentos.criar, contratos.criar or
+        // cobrancas.cobrar — staff without any of them get an explicit 403 (rota mista). Clients
+        // always get their own token identity — a client cannot probe other users (userId ignored).
+        let targetUserId = req.user!.userId;
+        if (data.userId) {
+            const actor = await actorOrReply(req, res);
+            if (!actor) return;
+            if (actor.isStaff) {
+                if (!canAny(actor, 'agendamentos.criar', 'contratos.criar', 'cobrancas.cobrar')) {
+                    denyPermission(res, 'agendamentos.criar');
+                    return;
+                }
+                targetUserId = data.userId;
+            }
+        }
 
         const quote = await validateCoupon({ code: data.code, userId: targetUserId, baseAmount: data.amount });
         res.json({

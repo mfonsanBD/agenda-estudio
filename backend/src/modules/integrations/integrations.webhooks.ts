@@ -3,14 +3,14 @@
 
 import { Router, Request, Response } from 'express';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize } from '../../middleware/auth.js';
+import { requireAdmin } from '../../middleware/permissions.js';
 import { coraListWebhookEndpoints, coraRegisterWebhookEndpoint, coraDeleteWebhookEndpoint } from '../../lib/coraService.js';
 import { sicoobRegisterWebhook, sicoobGetWebhook, sicoobDeleteWebhook, sicoobAllowedEnvironment } from '../../lib/sicoobService.js';
 
 export function registerIntegrationWebhookRoutes(router: Router) {
 
 /** GET /api/integrations/cora/webhooks — list registered webhooks */
-router.get('/cora/webhooks', authenticate, authorize('ADMIN'), async (_req: Request, res: Response) => {
+router.get('/cora/webhooks', requireAdmin(), async (_req: Request, res: Response) => {
     try {
         const endpoints = await coraListWebhookEndpoints();
         res.json({ endpoints });
@@ -21,7 +21,7 @@ router.get('/cora/webhooks', authenticate, authorize('ADMIN'), async (_req: Requ
 });
 
 /** POST /api/integrations/cora/webhooks — register a webhook */
-router.post('/cora/webhooks', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.post('/cora/webhooks', requireAdmin(), async (req: Request, res: Response) => {
     try {
         const { url } = req.body;
         if (!url || typeof url !== 'string') {
@@ -37,7 +37,7 @@ router.post('/cora/webhooks', authenticate, authorize('ADMIN'), async (req: Requ
 });
 
 /** DELETE /api/integrations/cora/webhooks/:id — delete a webhook */
-router.delete('/cora/webhooks/:id', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.delete('/cora/webhooks/:id', requireAdmin(), async (req: Request, res: Response) => {
     try {
         await coraDeleteWebhookEndpoint(req.params.id as string);
         res.json({ message: 'Webhook removido da Cora.' });
@@ -68,7 +68,7 @@ async function sicoobWebhookBlockedByEnv(res: Response): Promise<boolean> {
 }
 
 /** GET /api/integrations/sicoob/webhook — consulta o webhook registrado na chave PIX */
-router.get('/sicoob/webhook', authenticate, authorize('ADMIN'), async (_req: Request, res: Response) => {
+router.get('/sicoob/webhook', requireAdmin(), async (_req: Request, res: Response) => {
     if (await sicoobWebhookBlockedByEnv(res)) return;
     try {
         const webhook = await sicoobGetWebhook();
@@ -79,7 +79,7 @@ router.get('/sicoob/webhook', authenticate, authorize('ADMIN'), async (_req: Req
 });
 
 /** POST /api/integrations/sicoob/webhook — registra a URL (a origem pública, sem /pix) enviada pelo painel */
-router.post('/sicoob/webhook', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.post('/sicoob/webhook', requireAdmin(), async (req: Request, res: Response) => {
     if (await sicoobWebhookBlockedByEnv(res)) return;
     const { url } = req.body ?? {};
     let parsed: URL;
@@ -99,7 +99,7 @@ router.post('/sicoob/webhook', authenticate, authorize('ADMIN'), async (req: Req
 });
 
 /** DELETE /api/integrations/sicoob/webhook — remove o webhook da chave PIX */
-router.delete('/sicoob/webhook', authenticate, authorize('ADMIN'), async (_req: Request, res: Response) => {
+router.delete('/sicoob/webhook', requireAdmin(), async (_req: Request, res: Response) => {
     if (await sicoobWebhookBlockedByEnv(res)) return;
     try {
         await sicoobDeleteWebhook();

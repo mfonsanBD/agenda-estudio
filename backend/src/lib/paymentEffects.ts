@@ -13,6 +13,7 @@ import { notifyEvent } from '../modules/notifications/notificationService.js';
 import { fulfillContractFromPayment } from './contractFulfillment.js';
 import { confirmCouponRedemption, releaseCouponForPayments } from './couponService.js';
 import { isCancellationFine } from './cancellationFine.js';
+import { openSessionChargeWhere } from './sessionCharge.js';
 
 /** audit_logs.action (entityType PAYMENT) que marca o aviso "pago depois de cancelado" — 1 aviso por cobrança. */
 export const AUDIT_PAID_AFTER_CANCELLED = 'PAID_AFTER_CANCELLED';
@@ -218,12 +219,21 @@ export async function activateAwaitingContract(contractId: string): Promise<Cont
  */
 export async function confirmBookingAndActivateContract(payment: PaymentLike): Promise<ContractActivation> {
     if (payment.bookingId) {
-        const bookingUpdated = await prisma.booking.updateMany({
-            where: { id: payment.bookingId, status: { in: ['RESERVED', 'HELD'] } },
-            data: { status: 'CONFIRMED', holdExpiresAt: null },
-        });
-        if (bookingUpdated.count > 0) {
-            console.log(`[PaymentEffects] Confirmed booking ${payment.bookingId} (cleared hold timer)`);
+        // ATU-02/FIN-08: pagar OUTRA cobrança da reserva (um serviço extra) não confirma a sessão enquanto a
+        // cobrança da PRÓPRIA sessão (marca sessionCharge — SERVIÇO, FIXO extra, avulso da equipe) estiver em
+        // aberto: é a mesma regra do /confirm do cliente (402). A sessão de plano só com extras continua
+        // confirmando ao pagá-los. O Payment pago já é PAID, então nunca conta como "em aberto".
+        const openSessionCharge = await prisma.payment.count({ where: openSessionChargeWhere(payment.bookingId, payment.id) });
+        if (openSessionCharge > 0) {
+            console.log(`[PaymentEffects] Booking ${payment.bookingId} segue RESERVED: cobrança da sessão em aberto`);
+        } else {
+            const bookingUpdated = await prisma.booking.updateMany({
+                where: { id: payment.bookingId, status: { in: ['RESERVED', 'HELD'] } },
+                data: { status: 'CONFIRMED', holdExpiresAt: null },
+            });
+            if (bookingUpdated.count > 0) {
+                console.log(`[PaymentEffects] Confirmed booking ${payment.bookingId} (cleared hold timer)`);
+            }
         }
     }
 
@@ -786,14 +796,15 @@ export async function alertPaymentOnCancelledCharge(
                 changes: JSON.stringify({ provider: info.provider, providerRef: info.providerRef ?? null, amount }),
             },
         });
-        const admins = await prisma.user.findMany({ where: { role: 'ADMIN', deletedAt: null }, select: { id: true } });
-        for (const admin of admins) {
+        // Equipe: ADMIN + COLABORADOR com a permissão do evento (financeiro.ver); nunca desativado/excluído.
+        const { getStaffRecipientIds } = await import('./staffRecipients.js');
+        for (const staffId of await getStaffRecipientIds('admin_payment_on_cancelled_charge')) {
             await notifyEvent('admin_payment_on_cancelled_charge', {
-                userId: admin.id,
+                userId: staffId,
                 vars: { cliente: payment.user?.name ?? 'Cliente', valor: fmtBRL(amount), contrato: payment.contract?.name ?? 'sem contrato' },
                 entityType: 'PAYMENT',
                 entityId: paymentId,
-                dedupKey: `paid-on-cancelled:${paymentId}:${admin.id}`,
+                dedupKey: `paid-on-cancelled:${paymentId}:${staffId}`,
             }).catch(() => '');
         }
         return true;

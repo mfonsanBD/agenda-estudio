@@ -7,16 +7,20 @@ import { TIER_META, BOOKING_STATUS_META, getMeta } from '../../../constants/admi
 import { Pencil, CalendarDays, Clock, Wallet, Ban } from 'lucide-react';
 import StatusReasonModal, { type ReasonConfirmOptions } from './StatusReasonModal';
 import { useBusinessConfig } from '../../../hooks/useBusinessConfig';
-import { buildReasonUpdate, reasonToastMessage } from '../../../utils/avulsoMakeup';
+import { buildReasonUpdate, reasonSaveFeedback, showReasonFeedback } from '../../../utils/avulsoMakeup';
 import { useUI } from '../../../context/UIContext';
 import DangerConfirmDialog, { type DangerCloseReason } from '../../ui/DangerConfirmDialog';
 import { bookingSummary, cancelBookingConsequences, cancelBookingRequest } from './bookingDanger';
+import { useBookingPermissions, isCancelledPlanReopenBlocked, cancelledPlanReopenHint, cancelledReopenNeedsBaixaHint, isVoidedChargeReopenBlocked, CANCEL_OPEN_CHARGE_NEEDS_BAIXA, VOIDED_CHARGE_REOPEN_HINT } from './bookingPermissions';
+import { accessibleTierLabels, planContractOf, tierChangeBlockedFor } from './tierAccess';
+import { usePermission } from '../../../hooks/usePermission';
+
+/** DIN-03: o servidor recusa (403 cobrancas.baixa) mover a sessão para outra faixa de preço sem a baixa manual. */
+const TIER_CHANGE_NEEDS_BAIXA = 'Mudar a sessão para um horário de outra faixa de preço muda o valor cobrado e exige a permissão “Marcar como pago, anular ou estornar”.';
 
 // Statuses selecionáveis neste modal — cores/labels/ícones vêm do adminMeta
 // (source of truth); HELD é interno do fluxo de pagamento e fica de fora.
-const EDITABLE_STATUSES = Object.fromEntries(
-    Object.entries(BOOKING_STATUS_META).filter(([key]) => key !== 'HELD')
-);
+const EDITABLE_STATUS_KEYS = Object.keys(BOOKING_STATUS_META).filter(key => key !== 'HELD');
 
 interface EditBookingModalProps {
     booking: BookingWithUser | null;
@@ -32,8 +36,13 @@ export default function EditBookingModal({ booking, onClose, onSaved }: EditBook
     const [reasonKind, setReasonKind] = useState<'FALTA' | 'NAO_REALIZADO' | null>(null);
     // CANCELLED pede a confirmação de perigo (D3) antes de gravar.
     const [confirmCancel, setConfirmCancel] = useState(false);
-    const { get: getRule } = useBusinessConfig();
-    const { showToast } = useUI();
+    useBusinessConfig(); // pré-carrega as regras (prazo da remarcação) que o modal de motivo mostra
+    const { showToast, showAlert } = useUI();
+    // Data/horário só com agendamentos.editar; status só as transições permitidas (mesma tabela do
+    // servidor). O servidor ignora data/horário reenviados sem mudança (regra por valor alterado).
+    const bp = useBookingPermissions();
+    const { can } = usePermission();
+    const canMarkPaid = can('cobrancas.baixa');
 
     useEffect(() => {
         if (booking) {
@@ -43,6 +52,32 @@ export default function EditBookingModal({ booking, onClose, onSaved }: EditBook
             setConfirmCancel(false);
         }
     }, [booking]);
+
+    // DIN-03/FIN-03: sem a baixa manual, descobre a faixa do NOVO horário (grade do dia) para avisar antes de
+    // salvar — o que o servidor recusa depende do tipo da sessão (abaixo).
+    const originalDate = booking ? booking.date.split('T')[0] : '';
+    const slotChanged = !!booking && !!editForm.date && !!editForm.startTime
+        && (editForm.date !== originalDate || editForm.startTime !== booking.startTime);
+    const [targetTier, setTargetTier] = useState<string | null>(null);
+    useEffect(() => {
+        setTargetTier(null);
+        if (canMarkPaid || !slotChanged) return;
+        let alive = true;
+        const t = setTimeout(() => {
+            bookingsApi.getAvailability(editForm.date)
+                .then(r => { if (alive) setTargetTier(r.slots.find(s => s.time === editForm.startTime)?.tier ?? null); })
+                .catch(() => { /* sem a grade, o servidor continua sendo a trava */ });
+        }, 300);
+        return () => { alive = false; clearTimeout(t); };
+    }, [canMarkPaid, slotChanged, editForm.date, editForm.startTime]);
+    // FIN-03 (espelho do PATCH /bookings/:id): sessão de PLANO (Fixo, Flex, Personalizado) não muda de valor ao
+    // mudar de faixa — o servidor só confere a faixa do PLANO (403 TIER_NOT_ALLOWED acima dela). Avulso e serviço:
+    // outra faixa muda o valor cobrado (403 cobrancas.baixa). UXT-08: a decisão é a função pura tierChangeBlockedFor
+    // (tierAccess.ts, com teste no eq-r5-front) — não reescreva a conta aqui.
+    const planContract = planContractOf(booking?.contract);
+    const tierChangeBlocked = !!booking && tierChangeBlockedFor({
+        canMarkPaid, slotChanged, targetTier, tierApplied: booking.tierApplied, contract: booking.contract,
+    });
 
     const isAvulso = booking?.contract?.type === 'AVULSO';
 
@@ -58,10 +93,14 @@ export default function EditBookingModal({ booking, onClose, onSaved }: EditBook
             if (reason && (editForm.status === 'FALTA' || editForm.status === 'NAO_REALIZADO')) {
                 Object.assign(data, buildReasonUpdate(editForm.status, reason.text, { isAvulso, justified: reason.justified }));
             }
-            await bookingsApi.update(booking.id, data);
+            const res = await bookingsApi.update(booking.id, data);
             if (reason && (editForm.status === 'FALTA' || editForm.status === 'NAO_REALIZADO')) {
-                showToast(reasonToastMessage(editForm.status, { isAvulso, justified: reason.justified, bookingDate: booking.date, makeupDays: getRule('avulso_makeup_days') }));
+                // AUDFIN6-03/TELA6-01: pela RESPOSTA — a remarcação só é prometida se a janela abriu; a sessão reaberta
+                // sem cobrança mostra só o aviso do servidor (nunca as duas mensagens contraditórias).
+                showReasonFeedback(reasonSaveFeedback(editForm.status, { isAvulso, justified: reason.justified }, res), { showToast, showAlert });
             }
+            // AUDFIN-01: reabriu (Concluído) uma sessão cuja cobrança foi anulada — o servidor avisa.
+            else if (res.reopenedWithoutCharge) showAlert({ type: 'warning', title: 'Sessão reaberta sem cobrança', message: res.message });
             setReasonKind(null);
             onSaved();
             onClose();
@@ -73,6 +112,11 @@ export default function EditBookingModal({ booking, onClose, onSaved }: EditBook
 
     const handleEdit = () => {
         if (!booking || saving) return;
+        // Rede de segurança: os botões só oferecem as transições permitidas.
+        // (canChangeStatus também recusa reabrir sessão cancelada de Personalizado e, no FLEX, tudo menos
+        // Concluído — DIN-01.)
+        if (editForm.status !== booking.status && !bp.canChangeStatus(booking, editForm.status)) return;
+        if (tierChangeBlocked) return;
         // Mudou PARA Falta/Não Realizado → primeiro o modal de motivo; o save sai de lá.
         if ((editForm.status === 'FALTA' || editForm.status === 'NAO_REALIZADO') && editForm.status !== booking.status) {
             setReasonKind(editForm.status);
@@ -104,6 +148,24 @@ export default function EditBookingModal({ booking, onClose, onSaved }: EditBook
     };
 
     if (!booking) return null;
+
+    const allStatusKeys = EDITABLE_STATUS_KEYS.includes(booking.status) ? EDITABLE_STATUS_KEYS : [booking.status, ...EDITABLE_STATUS_KEYS];
+    const statusKeys = bp.statusOptions(booking, allStatusKeys);
+    // DIN-01: sessão cancelada de Personalizado (todas) ou FLEX (todas menos Concluído) — as opções de reabrir
+    // somem (regra do plano, não do acesso), com a explicação própria; o aviso de acesso só fala do que o
+    // acesso esconde.
+    const reopenBlocked = isCancelledPlanReopenBlocked(booking, 'CONFIRMED');
+    // R7 (espelho do AUDFIN6-02): a cobrança da sessão foi anulada (o servidor disse) — não volta a ficar em aberto.
+    const voidedReopenBlocked = isVoidedChargeReopenBlocked(booking, 'CONFIRMED');
+    // FIN-01/ATK-02: sem a baixa, a sessão cancelada não sai de Cancelado para nenhum status — a explicação
+    // própria (pedir a quem tem a baixa; avulso/sessão paga: não criar outro agendamento — FIN-07) substitui a
+    // dica do plano e o aviso genérico de acesso.
+    const reopenNeedsBaixa = bp.cancelledReopenNeedsBaixa(booking);
+    // R5: o Cancelado some porque a sessão tem cobrança em aberto e falta a baixa — explicação própria abaixo.
+    const cancelNeedsBaixa = bp.cancelNeedsBaixa(booking);
+    // O aviso genérico só fala do que o ACESSO esconde (não das regras do plano/da Falta, nem da cobrança em aberto).
+    const someStatusHidden = !reopenNeedsBaixa && allStatusKeys.some(to => bp.hiddenByAccess(booking, to));
+    const tierLabelOf = (tier: string | null | undefined) => getMeta(TIER_META, tier).label;
 
     return (
         // preventClose com o modal de motivo / a confirmação de cancelamento aberta: o Esc fecha só o de
@@ -156,6 +218,8 @@ export default function EditBookingModal({ booking, onClose, onSaved }: EditBook
                             <input id="edit-booking-date" type="date" value={editForm.date}
                                 min={new Date().toISOString().split('T')[0]}
                                 onChange={e => setEditForm({ ...editForm, date: e.target.value })}
+                                disabled={!bp.canEditSlot}
+                                aria-describedby={!bp.canEditSlot ? 'edit-booking-slot-locked' : undefined}
                                 className="form-input form-input--raised"
                             />
                         </div>
@@ -164,19 +228,43 @@ export default function EditBookingModal({ booking, onClose, onSaved }: EditBook
                             <label className="admin-field__label" htmlFor="edit-booking-time" style={{ display: 'flex', alignItems: 'center', gap: 4 }}><Clock size={13} aria-hidden="true" /> Horário</label>
                             <input id="edit-booking-time" type="time" step="1800" value={editForm.startTime}
                                 onChange={e => setEditForm({ ...editForm, startTime: e.target.value })}
+                                disabled={!bp.canEditSlot}
+                                aria-describedby={!bp.canEditSlot ? 'edit-booking-slot-locked' : undefined}
                                 className="form-input form-input--raised"
                             />
                         </div>
                     </div>
+                    {!bp.canEditSlot && (
+                        <p id="edit-booking-slot-locked" style={{ margin: '-8px 0 16px', fontSize: '0.6875rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                            Mudar a data ou o horário exige a permissão “Mudar data, horário e status”.
+                        </p>
+                    )}
+                    {/* Sem a baixa manual: sessão de plano só nas faixas do plano (FIN-03); avulso e serviço só na
+                        MESMA faixa de preço (DIN-03). */}
+                    {bp.canEditSlot && !canMarkPaid && (tierChangeBlocked ? (
+                        <div id="edit-booking-tier-locked" className="admin-alert admin-alert--warning" role="status" style={{ margin: '-8px 0 16px', fontSize: '0.75rem', lineHeight: 1.45 }}>
+                            {planContract
+                                ? <>O plano {tierLabelOf(planContract.tier)} não permite agendar horários {tierLabelOf(targetTier)}. Escolha um horário que o plano permita.</>
+                                : <>Este horário é da faixa {tierLabelOf(targetTier)}, e a sessão é {tierLabelOf(booking.tierApplied)}. {TIER_CHANGE_NEEDS_BAIXA} Escolha um horário da mesma faixa.</>}
+                        </div>
+                    ) : (
+                        <p style={{ margin: '-8px 0 16px', fontSize: '0.6875rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                            {planContract
+                                ? <>Sessão do plano {tierLabelOf(planContract.tier)}: só horários que o plano permite ({accessibleTierLabels(planContract.tier)}). Sessão cobrada à parte (ex.: a extra do Fixo) só muda de faixa com a permissão “Marcar como pago, anular ou estornar”.</>
+                                : <>Só horários da mesma faixa de preço ({tierLabelOf(booking.tierApplied)}): outra faixa muda o valor cobrado e exige a permissão “Marcar como pago, anular ou estornar”.</>}
+                        </p>
+                    ))}
 
-                    {/* Status */}
+                    {/* Status (só as transições que o acesso permite) */}
                     <div className="admin-field" style={{ marginBottom: '16px' }}>
                         <span className="admin-field__label">Status</span>
-                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }} role="group" aria-label="Status do agendamento">
-                            {Object.entries(EDITABLE_STATUSES).map(([key, cfg]) => {
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }} role="group" aria-label="Status do agendamento"
+                            aria-describedby={reopenNeedsBaixa ? 'edit-booking-reopen-locked' : cancelNeedsBaixa ? 'edit-booking-cancel-locked' : undefined}>
+                            {statusKeys.map(key => {
+                                const cfg = getMeta(BOOKING_STATUS_META, key);
                                 const Icon = cfg.icon;
                                 return (
-                                    <button key={key}
+                                    <button key={key} type="button"
                                         onClick={() => setEditForm({ ...editForm, status: key })}
                                         aria-pressed={editForm.status === key}
                                         style={{
@@ -193,6 +281,31 @@ export default function EditBookingModal({ booking, onClose, onSaved }: EditBook
                                 );
                             })}
                         </div>
+                        {reopenNeedsBaixa ? (
+                            <div id="edit-booking-reopen-locked" style={{ fontSize: '0.6875rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                                {cancelledReopenNeedsBaixaHint(booking)}
+                            </div>
+                        ) : reopenBlocked ? (
+                            <div style={{ fontSize: '0.6875rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                                {cancelledPlanReopenHint(booking.contract?.type)}
+                            </div>
+                        ) : voidedReopenBlocked && (
+                            <div style={{ fontSize: '0.6875rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                                {VOIDED_CHARGE_REOPEN_HINT}
+                            </div>
+                        )}
+                        {cancelNeedsBaixa && (
+                            <div id="edit-booking-cancel-locked" style={{ fontSize: '0.6875rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                                {CANCEL_OPEN_CHARGE_NEEDS_BAIXA}
+                            </div>
+                        )}
+                        {someStatusHidden && (
+                            <div style={{ fontSize: '0.6875rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                                {statusKeys.length <= 1
+                                    ? 'O seu acesso não permite mudar o status deste agendamento.'
+                                    : 'Aparecem só os status que o seu acesso permite a partir do status atual.'}
+                            </div>
+                        )}
                     </div>
 
                     {/* Info summary */}
@@ -211,7 +324,8 @@ export default function EditBookingModal({ booking, onClose, onSaved }: EditBook
                         <button key="cancel" type="button" onClick={onClose} className="btn-admin-ghost" disabled={saving}>
                             Cancelar
                         </button>
-                        <button key="save" type="button" onClick={handleEdit} className="btn-admin-go" disabled={saving} aria-busy={saving || undefined}>
+                        <button key="save" type="button" onClick={handleEdit} className="btn-admin-go" disabled={saving || tierChangeBlocked} aria-busy={saving || undefined}
+                            aria-describedby={tierChangeBlocked ? 'edit-booking-tier-locked' : undefined}>
                             {saving && !reasonKind ? 'Salvando…' : 'Salvar Alterações'}
                         </button>
                     </div>
@@ -237,7 +351,7 @@ export default function EditBookingModal({ booking, onClose, onSaved }: EditBook
                     icon={Ban}
                     title="Cancelar agendamento?"
                     description={bookingSummary(booking)}
-                    consequences={cancelBookingConsequences(booking)}
+                    consequences={cancelBookingConsequences(booking, { canSettleCharges: bp.canSettleCharges })}
                     confirmLabel="Cancelar agendamento"
                     loadingLabel="Cancelando…"
                     onConfirm={performCancel}

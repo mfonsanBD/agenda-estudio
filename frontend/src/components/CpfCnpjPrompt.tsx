@@ -1,7 +1,8 @@
 import { useId, useRef, useState } from 'react';
 import { ShieldCheck, Check, CreditCard } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
-import { authApi, usersApi } from '../api/client';
+import { authApi, usersApi, ApiError } from '../api/client';
+import { usePermission } from '../hooks/usePermission';
 import { maskCpfCnpj, isValidCpfCnpj } from '../utils/mask';
 import { getErrorMessage } from '../utils/errors';
 
@@ -29,8 +30,14 @@ interface CpfCnpjPromptProps {
 export default function CpfCnpjPrompt({ onSaved, onCancel, title, subtitle, saveLabel, client }: CpfCnpjPromptProps) {
     const uid = useId();
     const { user, updateUser } = useAuth();
+    // Equipe cobrando (D3): gravar o CPF de um cliente que AINDA NÃO TEM documento vale com "Cobrar o
+    // cliente" ou "Editar o cadastro"; TROCAR um documento já gravado (mesmo inválido) só com "Editar o
+    // cadastro do cliente" (clientes.editar) — o servidor responde 403 PERMISSION_DENIED.
+    const { can } = usePermission();
     // Quando `client` está presente (admin cobrando um cliente), o documento é do CLIENTE.
     const docOwnerCpf = client ? client.cpfCnpj : user?.cpfCnpj;
+    const replacingClientDoc = !!client && !!(client.cpfCnpj || '').replace(/\D/g, '');
+    const cannotReplaceDoc = replacingClientDoc && !can('clientes.editar');
     const [value, setValue] = useState(docOwnerCpf ? maskCpfCnpj(docOwnerCpf) : '');
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState('');
@@ -58,7 +65,12 @@ export default function CpfCnpjPrompt({ onSaved, onCancel, title, subtitle, save
             }
             onSaved(digits);
         } catch (err: unknown) {
-            setError(getErrorMessage(err) || 'Não foi possível salvar. Tente novamente.');
+            const denied = !!client && err instanceof ApiError && err.status === 403 && err.code === 'PERMISSION_DENIED';
+            setError(denied
+                ? (replacingClientDoc
+                    ? 'Este cliente já tem um CPF/CNPJ no cadastro. Para trocá-lo é preciso a permissão “Editar o cadastro do cliente”.'
+                    : 'Você não tem permissão para salvar o CPF/CNPJ deste cliente.')
+                : (getErrorMessage(err) || 'Não foi possível salvar. Tente novamente.'));
             setSaving(false);
         } finally {
             savingRef.current = false;
@@ -115,6 +127,13 @@ export default function CpfCnpjPrompt({ onSaved, onCancel, title, subtitle, save
             {showError && (
                 <div style={{ width: '100%', textAlign: 'left', fontSize: '0.75rem', color: '#ef4444', marginBottom: 12 }}>
                     {docType} inválido — confira os números.
+                </div>
+            )}
+            {/* Equipe sem "Editar o cadastro do cliente" e o cliente já tem um documento (inválido) gravado:
+                avisa antes de tentar — o servidor recusaria a troca. */}
+            {cannotReplaceDoc && !error && (
+                <div role="note" style={{ width: '100%', textAlign: 'left', fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: 12 }}>
+                    O cadastro deste cliente já tem um CPF/CNPJ. Para corrigi-lo é preciso a permissão “Editar o cadastro do cliente” — peça a quem tem esse acesso.
                 </div>
             )}
             {error && <div className="checkout-error" style={{ width: '100%', marginBottom: 12 }}>{error}</div>}

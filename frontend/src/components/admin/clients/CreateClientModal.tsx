@@ -9,6 +9,7 @@ import { serializeSocialLinks } from './SocialLinksEditor';
 import {
     CLIENT_WIZARD_STEPS, CLIENT_WIZARD_TOTAL, EMPTY_CLIENT_FORM, ADDRESS_KEYS,
     ClientWizardStepFields, findFirstInvalidClientStep, mapClientApiError, useClientForm, useStepViewReset,
+    useClientWizardAccess,
 } from './ClientWizardFields';
 
 interface CreateClientModalProps {
@@ -36,6 +37,9 @@ export default function CreateClientModal({ isOpen, onClose, onCreated }: Create
     // Trava de requisição EM ANDAMENTO (não é trava por tempo): evita 2 POSTs num duplo clique.
     const inFlightRef = useRef(false);
     const stepRef = useStepViewReset(step);
+    // Cadastrar exige clientes.criar (guarda da tela). Nascer Bloqueado exige clientes.acesso; senha
+    // de cliente só o ADMIN define (sem senha, o cliente entra com um código no e-mail).
+    const access = useClientWizardAccess('create');
 
     // Avanço adiado 1 tick (anti-submit espúrio) e com destino fixo: um clique duplo no
     // "Próximo" enfileira dois avanços para a MESMA etapa, sem pular a seguinte.
@@ -60,17 +64,17 @@ export default function CreateClientModal({ isOpen, onClose, onCreated }: Create
         inFlightRef.current = true;
         setCreating(true);
         try {
+            // Sem `role` (D9): /api/users só cadastra CLIENTE.
             const payload: Parameters<typeof usersApi.create>[0] = {
                 name: values.name.trim(),
                 email: values.email.trim(),
-                password: values.password,
-                role: values.role,
             };
+            if (access.canSetPassword && values.password) payload.password = values.password;
             const phone = values.phone.replace(/\D/g, '');
             if (phone) payload.phone = phone;
             const doc = values.cpfCnpj.replace(/\D/g, '');
             if (doc) payload.cpfCnpj = doc;
-            if (values.clientStatus !== 'ACTIVE') payload.clientStatus = values.clientStatus;
+            if (values.clientStatus !== 'ACTIVE' && !access.statusLock(values.clientStatus)) payload.clientStatus = values.clientStatus;
             const social = serializeSocialLinks(Object.fromEntries(Object.entries(values.social).map(([k, v]) => [k, v.trim()])));
             if (social) payload.socialLinks = social;
             ADDRESS_KEYS.forEach(k => { const v = values[k].trim(); if (v) payload[k] = v; });
@@ -122,6 +126,7 @@ export default function CreateClientModal({ isOpen, onClose, onCreated }: Create
                             errors={form.visibleErrors(step)}
                             onPatch={form.patch}
                             onTouch={form.touch}
+                            access={access}
                         />
                     </div>
 

@@ -56,7 +56,8 @@ import { mkUser, mkContract, mkPayment, mkBooking } from './factories';
 //        PATCH /:id status=CANCELLED) ou excluída (DELETE /:id/hard-delete) → as cobranças PENDING/FAILED
 //        dos EXTRAS dela são anuladas pela sequência do contrato (aposenta no provedor → anula; PIX já
 //        pago vira PAID). Extra já PAGO fica intocado; remarcar e "aviso < 24 h" (FALTA) não anulam nada;
-//        gravação AVULSA não muda; falha na anulação não desfaz o cancelamento.
+//        falha na anulação não desfaz o cancelamento. R5 (FIN-10): a gravação AVULSA também — a cobrança em
+//        aberto da reserva é aposentada no provedor e anulada (antes ficava presa, impagável e listada como devida).
 //  Z2-b  o sino (GET /api/notifications) e o push de "faturas vencidas" / "pagamento falhou" não contam
 //        a cobrança de uma gravação CANCELADA (dado legado).
 
@@ -206,7 +207,7 @@ describe('Z2-a — cancelar a gravação de um plano anula as cobranças em aber
         const r = await call('PUT', `/api/bookings/${target.id}/client-cancel`, client);
         expect(r.status, r.text).toBe(200);
         expect(r.body.voidedExtras).toBe(1);
-        expect(r.body.message).toBe('Agendamento cancelado com sucesso. O crédito retornou ao seu plano. 1 cobrança de serviços extras desta gravação foi cancelada.');
+        expect(r.body.message).toBe('Agendamento cancelado com sucesso. O crédito retornou ao seu plano. 1 cobrança em aberto desta gravação foi cancelada.');
 
         expect(await bookingStatus(target.id)).toBe('CANCELLED');
         expect(await credits(contract.id)).toBe(9);
@@ -260,7 +261,7 @@ describe('Z2-a — cancelar a gravação de um plano anula as cobranças em aber
         const failed = await mkExtra(client.id, contract.id, byClient.id, { provider: 'STRIPE', status: 'FAILED' });
         const r1 = await call('DELETE', `/api/bookings/${byClient.id}`, client);
         expect(r1.status, r1.text).toBe(200);
-        expect(r1.body).toEqual({ message: 'Reserva cancelada com sucesso. 1 cobrança de serviços extras desta gravação foi cancelada.', voidedExtras: 1 });
+        expect(r1.body).toEqual({ message: 'Reserva cancelada com sucesso. 1 cobrança em aberto desta gravação foi cancelada.', voidedExtras: 1 });
         expect(await bookingStatus(byClient.id)).toBe('CANCELLED');
         expect(await payStatus(failed.id)).toBe('CANCELLED');
 
@@ -271,7 +272,7 @@ describe('Z2-a — cancelar a gravação de um plano anula as cobranças em aber
         getPI.mockResolvedValue({ id: PI_EXTRA, status: 'requires_payment_method', amount: 5000, metadata: { paymentId: card.id } });
         const r2 = await call('DELETE', `/api/bookings/${byAdmin.id}`, admin);
         expect(r2.status, r2.text).toBe(200);
-        expect(r2.body).toEqual({ message: 'Reserva cancelada com sucesso. 2 cobranças de serviços extras desta gravação foram canceladas.', voidedExtras: 2 });
+        expect(r2.body).toEqual({ message: 'Reserva cancelada com sucesso. 2 cobranças em aberto desta gravação foram canceladas.', voidedExtras: 2 });
         expect(cancelPI).toHaveBeenCalledWith(PI_EXTRA);
         expect(await payStatus(card.id)).toBe('CANCELLED');
         expect(await payStatus(plain.id)).toBe('CANCELLED');
@@ -311,7 +312,7 @@ describe('Z2-a — cancelar a gravação de um plano anula as cobranças em aber
         const cancel = await call('PATCH', `/api/bookings/${moved.id}`, admin, { status: 'CANCELLED' });
         expect(cancel.status, cancel.text).toBe(200);
         expect(cancel.body.voidedExtras).toBe(1);
-        expect(cancel.body.message).toBe('Agendamento atualizado com sucesso. 1 cobrança de serviços extras desta gravação foi cancelada.');
+        expect(cancel.body.message).toBe('Agendamento atualizado com sucesso. 1 cobrança em aberto desta gravação foi cancelada.');
         expect(cancel.body.booking.status).toBe('CANCELLED');
         expect(removeCob).toHaveBeenCalledWith(TX_LIVE);
         expect(await payStatus(extraMoved.id)).toBe('CANCELLED');
@@ -359,7 +360,7 @@ describe('Z2-a — cancelar a gravação de um plano anula as cobranças em aber
         const r = await call('DELETE', `/api/bookings/${booking.id}/hard-delete`, admin);
         expect(r.status, r.text).toBe(200);
         expect(r.body).toEqual({
-            message: 'Agendamento removido permanentemente. Crédito devolvido ao contrato. 1 cobrança de serviços extras desta gravação foi cancelada.',
+            message: 'Agendamento removido permanentemente. Crédito devolvido ao contrato. 1 cobrança em aberto desta gravação foi cancelada.',
             creditRestored: true,
             voidedExtras: 1,
         });
@@ -390,49 +391,63 @@ describe('Z2-a — cancelar a gravação de um plano anula as cobranças em aber
 });
 
 // ═══ Z2-a — gravação AVULSA: comportamento inalterado ═════════════════════════════════════════════
-describe('Z2-a — gravação avulsa cancelada: a cobrança da reserva não é tocada', () => {
-    const untouched = async (chargeId: string, bookingId: string | null) => {
-        expect(await pay(chargeId)).toMatchObject({ status: 'PENDING', providerRef: TX_AVULSO, bookingId, amount: 30000 });
-        expect(voidDetailed).not.toHaveBeenCalled();
-        expect(getCob).not.toHaveBeenCalled();
-        expect(removeCob).not.toHaveBeenCalled();
+describe('Z2-a — gravação avulsa cancelada: a cobrança em aberto da reserva é aposentada no provedor e anulada (R5)', () => {
+    const voided = async (contractId: string, chargeId: string, bookingId: string | null) => {
+        expect(await pay(chargeId)).toMatchObject({ status: 'CANCELLED', providerRef: TX_AVULSO, bookingId, amount: 30000 });
+        expect(voidDetailed).toHaveBeenCalledTimes(1);
+        expect(voidDetailed.mock.calls[0]![0]).toBe(contractId);
+        expect(removeCob).toHaveBeenCalledWith(TX_AVULSO);
     };
 
     it('DELETE /:id pelo cliente (reserva em espera)', async () => {
-        const { client, booking, charge } = await avulsoScene('RESERVED');
+        const { client, contract, booking, charge } = await avulsoScene('RESERVED');
+        getCob.mockResolvedValue(cobAtiva('300.00'));
         const r = await call('DELETE', `/api/bookings/${booking.id}`, client);
         expect(r.status, r.text).toBe(200);
-        expect(r.body).toEqual({ message: 'Reserva cancelada com sucesso.', voidedExtras: 0 });
+        expect(r.body).toEqual({ message: 'Reserva cancelada com sucesso. 1 cobrança em aberto desta gravação foi cancelada.', voidedExtras: 1 });
         expect(await bookingStatus(booking.id)).toBe('CANCELLED');
-        await untouched(charge.id, booking.id);
+        await voided(contract.id, charge.id, booking.id);
     });
 
     it('PUT /:id/client-cancel (≥ 24 h)', async () => {
-        const { client, booking, charge } = await avulsoScene('CONFIRMED');
+        const { client, contract, booking, charge } = await avulsoScene('CONFIRMED');
+        getCob.mockResolvedValue(cobAtiva('300.00'));
         const r = await call('PUT', `/api/bookings/${booking.id}/client-cancel`, client);
         expect(r.status, r.text).toBe(200);
-        expect(r.body).toEqual({ message: 'Agendamento cancelado com sucesso. O crédito retornou ao seu plano.', voidedExtras: 0 });
+        expect(r.body).toEqual({ message: 'Agendamento cancelado com sucesso. O crédito retornou ao seu plano. 1 cobrança em aberto desta gravação foi cancelada.', voidedExtras: 1 });
         expect(await bookingStatus(booking.id)).toBe('CANCELLED');
-        await untouched(charge.id, booking.id);
+        await voided(contract.id, charge.id, booking.id);
     });
 
     it('PATCH /:id do admin com status CANCELLED', async () => {
-        const { admin, booking, charge } = await avulsoScene('CONFIRMED');
+        const { admin, contract, booking, charge } = await avulsoScene('CONFIRMED');
+        getCob.mockResolvedValue(cobAtiva('300.00'));
         const r = await call('PATCH', `/api/bookings/${booking.id}`, admin, { status: 'CANCELLED' });
         expect(r.status, r.text).toBe(200);
-        expect(r.body.message).toBe('Agendamento atualizado com sucesso.');
-        expect(r.body.voidedExtras).toBeUndefined();
+        expect(r.body.message).toBe('Agendamento atualizado com sucesso. 1 cobrança em aberto desta gravação foi cancelada.');
+        expect(r.body.voidedExtras).toBe(1);
         expect(await bookingStatus(booking.id)).toBe('CANCELLED');
-        await untouched(charge.id, booking.id);
+        await voided(contract.id, charge.id, booking.id);
     });
 
     it('DELETE /:id/hard-delete do admin', async () => {
-        const { admin, booking, charge } = await avulsoScene('CONFIRMED');
+        const { admin, contract, booking, charge } = await avulsoScene('CONFIRMED');
+        getCob.mockResolvedValue(cobAtiva('300.00'));
         const r = await call('DELETE', `/api/bookings/${booking.id}/hard-delete`, admin);
         expect(r.status, r.text).toBe(200);
-        expect(r.body).toEqual({ message: 'Agendamento removido permanentemente. Crédito devolvido ao contrato.', creditRestored: true, voidedExtras: 0 });
+        expect(r.body).toEqual({ message: 'Agendamento removido permanentemente. Crédito devolvido ao contrato. 1 cobrança em aberto desta gravação foi cancelada.', creditRestored: true, voidedExtras: 1 });
         expect(await prisma.booking.findUnique({ where: { id: booking.id } })).toBeNull();
-        await untouched(charge.id, null); // como antes: o pagamento fica, sem o vínculo com a gravação
+        await voided(contract.id, charge.id, null); // anulada ANTES de apagar; a FK zera o vínculo com a gravação
+    });
+
+    it('a cobrança JÁ PAGA no banco vira PAID (não é anulada) e a reserva fica cancelada', async () => {
+        const { admin, booking, charge } = await avulsoScene('CONFIRMED');
+        getCob.mockResolvedValue(cobPaga('300.00'));
+        const r = await call('PATCH', `/api/bookings/${booking.id}`, admin, { status: 'CANCELLED' });
+        expect(r.status, r.text).toBe(200);
+        expect(r.body.voidedExtras).toBeUndefined();
+        expect(await bookingStatus(booking.id)).toBe('CANCELLED');
+        expect(await payStatus(charge.id)).toBe('PAID');
     });
 });
 

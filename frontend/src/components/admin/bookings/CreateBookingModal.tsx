@@ -14,6 +14,8 @@ import { ignoreMultiClick, wizardStepBodyStyle as stepBodyStyle, wizardStepConte
 import { TIER_META, getMeta } from '../../../constants/adminMeta';
 import WizardSteps from '../WizardSteps';
 import ChargeNowSheet from '../ChargeNowSheet';
+import Tooltip from '../../ui/Tooltip';
+import { usePermission } from '../../../hooks/usePermission';
 import {
     Search, FileText, CalendarDays, Zap, Wallet, TicketPercent, Sparkles,
     CreditCard, Check, NotebookPen, CheckCircle2, Clock as ClockIcon, AlertTriangle,
@@ -42,14 +44,55 @@ interface CreateBookingModalProps {
     onClose: () => void;
     users: UserSummary[];
     onCreated: () => void;
+    /** Clique num horário livre da Agenda: data e horário já escolhidos (a etapa 1 continua sendo o cliente). */
+    prefill?: { date: string; startTime: string } | null;
+    /** A lista de clientes ainda está chegando (a Agenda só busca ao abrir o modal). */
+    usersLoading?: boolean;
 }
 
-export default function CreateBookingModal({ isOpen, onClose, users, onCreated }: CreateBookingModalProps) {
+/** Texto do status "Confirmado" travado para quem não tem a baixa manual (DECISÕES D3/D7). */
+const CONFIRMED_LOCKED_HINT = 'Criar como Confirmado registra o pagamento como pago e exige a permissão “Marcar como pago, anular ou estornar”. O agendamento nasce Reservado, aguardando pagamento.';
+/**
+ * REG-1: sessão de PLANO (Flex, Personalizado) criada sem a baixa manual. O plano já cobre a sessão (o servidor
+ * não gera cobrança da sessão, só dos serviços extras): nada de "aguardando pagamento" — a presença é que fica a
+ * confirmar. O FIXO tem textos próprios (FIN-04, abaixo).
+ */
+const CONFIRMED_LOCKED_HINT_PLAN = 'Criar como Confirmado registra a sessão como paga e exige a permissão “Marcar como pago, anular ou estornar”. A sessão do plano nasce Reservada, com a presença a confirmar.';
+const PLAN_RESERVED_NOTE = 'A sessão do plano nasce Reservada, com a presença a confirmar: o plano já cobre a sessão.';
+const PLAN_RESERVED_TOAST = 'Agendamento criado como Reservado (presença a confirmar). A sessão já é coberta pelo plano.';
+/**
+ * FIN-04: FIXO sem a baixa manual. O FIXO nasce com TODAS as sessões do plano geradas (meses × sessões/mês),
+ * então o teto já está usado desde o 1º dia e uma sessão a mais é EXTRA — o servidor a cobra (PENDING do valor
+ * da sessão, `notice` FIXO_LIMIT). Só sobra vaga coberta quando alguma sessão do plano foi cancelada ou marcada
+ * como Não realizado, e a lista de contratos (GET /contracts) não traz as sessões usadas: o texto é condicional.
+ * FIXO Concluído = teto usado (contractCompletion): aí a sessão é extra com certeza.
+ */
+const FIXO_EXTRA_NOTE = 'No plano fixo, as sessões do plano já são geradas na contratação; uma sessão a mais é extra e será cobrada (aguardando pagamento), a não ser que alguma sessão do plano tenha sido cancelada ou marcada como Não realizado.';
+const FIXO_EXTRA_CHARGED_NOTE = 'Sessão extra: o plano fixo já usou todas as sessões, então esta será cobrada (aguardando pagamento).';
+const CONFIRMED_LOCKED_HINT_FIXO = 'Criar como Confirmado registra a sessão como paga e exige a permissão “Marcar como pago, anular ou estornar”. A sessão nasce Reservada: aguardando pagamento se for extra, ou com a presença a confirmar se o plano ainda tiver sessão livre.';
+/**
+ * REG-1 (espelho do POST /bookings/admin): só FIXO, FLEX e Personalizado cobrem a sessão. Contrato de
+ * SERVIÇO e AVULSO vinculado continuam cobrando a sessão; o FIXO que já usou o teto também é cobrado (FIN-04:
+ * é o caso comum — textos próprios; a resposta do servidor traz o `notice`).
+ */
+const PLAN_COVERED_TYPES: readonly string[] = ['FIXO', 'FLEX', 'CUSTOM'];
+/** FE-2: cupom que zera o valor registra o agendamento como pago (o servidor recusa sem a baixa manual). */
+const ZERO_COUPON_NEEDS_BAIXA = 'Cupom que zera o valor registra o agendamento como pago e exige a permissão “Marcar como pago, anular ou estornar”. Remova o cupom ou use um de valor menor.';
+
+export default function CreateBookingModal({ isOpen, onClose, users, onCreated, prefill, usersLoading }: CreateBookingModalProps) {
     const uid = useId();
     const { showToast } = useUI();
+    const { can } = usePermission();
+    // Sem cobrancas.baixa nada nasce PAGO (DECISÕES D3/D7): o padrão é "Reservado" (o servidor rebaixa um
+    // "Confirmado" para RESERVED com pagamento PENDING) e o preço manual some (customPrice diferente do
+    // preço da faixa dá 403). "Cobrar agora" só com cobrancas.cobrar.
+    const canMarkPaid = can('cobrancas.baixa');
+    const canCharge = can('cobrancas.cobrar');
+    const defaultStatus = canMarkPaid ? 'CONFIRMED' : 'RESERVED';
+    const emptyForm = () => ({ userId: '', contractId: '', date: prefill?.date ?? '', startTime: prefill?.startTime ?? '', status: defaultStatus, adminNotes: '' });
 
     const [createStep, setCreateStep] = useState(1);
-    const [createForm, setCreateForm] = useState({ userId: '', contractId: '', date: '', startTime: '', status: 'CONFIRMED', adminNotes: '' });
+    const [createForm, setCreateForm] = useState(emptyForm);
     const [createError, setCreateError] = useState('');
     const [createSearch, setCreateSearch] = useState('');
     const [clientContracts, setClientContracts] = useState<Contract[]>([]);
@@ -89,7 +132,7 @@ export default function CreateBookingModal({ isOpen, onClose, users, onCreated }
     const resetCreateModal = () => {
         onClose();
         setCreateStep(1);
-        setCreateForm({ userId: '', contractId: '', date: '', startTime: '', status: 'CONFIRMED', adminNotes: '' });
+        setCreateForm(emptyForm());
         setCreateError('');
         setCreateSearch('');
         setClientContracts([]);
@@ -111,20 +154,24 @@ export default function CreateBookingModal({ isOpen, onClose, users, onCreated }
         setCreateError('');
         setCreating(true);
         try {
-            const isAvulsoCharge = !createForm.contractId && chargeNow;
+            const isAvulsoCharge = canCharge && !createForm.contractId && chargeNow;
             const payload: any = {
                 userId: createForm.userId, date: createForm.date, startTime: createForm.startTime,
                 // To charge inline the booking must await payment (RESERVED), then the payment confirms it.
-                status: isAvulsoCharge ? 'RESERVED' : createForm.status,
+                // Sem a baixa manual, nunca pede "Confirmado" (nasce aguardando pagamento).
+                status: isAvulsoCharge || !canMarkPaid ? 'RESERVED' : createForm.status,
             };
             if (createForm.contractId) payload.contractId = createForm.contractId;
             if (createForm.adminNotes.trim()) payload.adminNotes = createForm.adminNotes;
-            if (!createForm.contractId && customPrice != null) payload.customPrice = customPrice;
+            // Preço manual só com a baixa manual; sem ela o servidor usa o preço da faixa.
+            if (canMarkPaid && !createForm.contractId && customPrice != null) payload.customPrice = customPrice;
             if (selectedAddons.length > 0) payload.addOns = selectedAddons;
             if (isAvulsoCharge) payload.paymentMethod = chargeMethod;
             // Cupom só vale para avulso (contrato tem fluxo próprio).
             if (!createForm.contractId && appliedCoupon) payload.couponCode = appliedCoupon.code;
-            const res = await bookingsApi.adminCreate(payload);
+            // `downgraded`/`notice`: o "Confirmado" virou Reservado (aguardando pagamento) no servidor.
+            // `coveredByPlan` (REG-1): sessão de plano sem a baixa — a `message` diz se só os extras ficaram pendentes.
+            const res = await bookingsApi.adminCreate(payload) as Awaited<ReturnType<typeof bookingsApi.adminCreate>> & { downgraded?: boolean; notice?: string; coveredByPlan?: boolean };
             if (isAvulsoCharge && res.paymentId) {
                 // Open the same InlineCheckout the client uses — charges the CLIENT (payment.userId).
                 // O backend retorna o valor JÁ com o cupom descontado (paymentAmount).
@@ -134,7 +181,16 @@ export default function CreateBookingModal({ isOpen, onClose, users, onCreated }
             } else {
                 onCreated();
                 resetCreateModal();
-                showToast('Agendamento criado com sucesso!');
+                // REG-1: sessão de plano sem a baixa manual não fica "aguardando pagamento" (o plano já cobre);
+                // o aviso do servidor, quando vem, tem a palavra final (ex.: serviços extras pendentes).
+                const linkedType = clientContracts.find(c => c.id === createForm.contractId)?.type;
+                const planReserved = !!createForm.contractId && !!linkedType && PLAN_COVERED_TYPES.includes(linkedType) && !canMarkPaid;
+                showToast(res.notice
+                    || (res.downgraded || res.coveredByPlan
+                        ? res.message
+                        : payload.status === 'RESERVED'
+                            ? (planReserved ? PLAN_RESERVED_TOAST : 'Agendamento criado como Reservado, aguardando pagamento.')
+                            : 'Agendamento criado com sucesso!'));
             }
         } catch (err: unknown) { setCreateError(getErrorMessage(err)); }
         finally { inFlightRef.current = false; setCreating(false); }
@@ -149,15 +205,30 @@ export default function CreateBookingModal({ isOpen, onClose, users, onCreated }
         } catch { setClientContracts([]); }
     }, []);
 
-    // Load slot availability when date changes
-    const loadDaySlots = useCallback(async (date: string) => {
+    // Load slot availability when date changes. `pickTime` (prefill da Agenda): já escolhe o horário e
+    // o valor da faixa, como o clique no horário faria.
+    const loadDaySlots = useCallback(async (date: string, pickTime?: string) => {
         setSlotsLoading(true);
         try {
             const res = await bookingsApi.getAvailability(date);
-            setDaySlots(res.slots || []);
+            const slots = res.slots || [];
+            setDaySlots(slots);
+            if (pickTime) {
+                const picked = slots.find(s => s.time === pickTime);
+                if (picked?.available && picked.price != null) { setCustomPrice(picked.price); setPriceDraft(picked.price); }
+                else if (picked && !picked.available) setCreateForm(f => (f.startTime === pickTime ? { ...f, startTime: '' } : f));
+            }
         } catch { setDaySlots([]); }
         finally { setSlotsLoading(false); }
     }, []);
+
+    // Aberto pela Agenda com data e horário: carrega a grade do dia uma vez (a etapa 2 já vem escolhida).
+    const prefillLoadedRef = useRef(false);
+    useEffect(() => {
+        if (!isOpen || !prefill?.date || prefillLoadedRef.current) return;
+        prefillLoadedRef.current = true;
+        void loadDaySlots(prefill.date, prefill.startTime);
+    }, [isOpen, prefill?.date, prefill?.startTime, loadDaySlots]);
 
     if (!isOpen) return null;
 
@@ -170,12 +241,37 @@ export default function CreateBookingModal({ isOpen, onClose, users, onCreated }
         const a = addons.find(x => x.key === key);
         return a ? acc + Math.round(a.price * (1 - inheritedDiscount / 100)) : acc;
     }, 0);
-    const filteredClients = users.filter(u => u.role !== 'ADMIN').filter(u => {
+    // /api/users já lista só clientes (D1); o filtro positivo é a segunda trava.
+    const filteredClients = users.filter(u => u.role === 'CLIENTE').filter(u => {
         if (!createSearch) return true;
         const q = createSearch.toLowerCase();
-        return u.name.toLowerCase().includes(q) || u.email.toLowerCase().includes(q);
+        return u.name.toLowerCase().includes(q) || (u.email ?? '').toLowerCase().includes(q);
     });
     const tc = (tier: string) => TIER_META[tier] || TIER_META.COMERCIAL;
+
+    // Trocar o vínculo (avulso ↔ plano) mantém o horário já escolhido (ex.: vindo da Agenda) quando ele
+    // continua livre e é da faixa do plano; senão limpa, como antes.
+    const keptTimeFor = (tier: string | null) => {
+        const s = daySlots.find(x => x.time === createForm.startTime);
+        return s && s.available && (!tier || s.tier === tier) ? createForm.startTime : '';
+    };
+    const selectAvulso = () => {
+        const keep = keptTimeFor(null);
+        setCreateForm({ ...createForm, contractId: '', startTime: keep });
+        const s = daySlots.find(x => x.time === keep);
+        if (keep && s?.price != null) { setCustomPrice(s.price); setPriceDraft(s.price); }
+    };
+    const selectContract = (c: Contract) => setCreateForm({ ...createForm, contractId: c.id, startTime: keptTimeFor(c.tier) });
+
+    // FE-2: sem a baixa manual, cupom que zera o avulso não pode ser usado (o servidor recusaria com 403):
+    // "Agendar" fica desabilitado com a explicação embaixo do cupom, em vez de um 403 genérico.
+    const zeroNeedsBaixa = !canMarkPaid && !createForm.contractId && !!appliedCoupon && appliedCoupon.finalAmount <= 0;
+    // REG-1: sessão de plano sem a baixa manual — textos de "presença a confirmar", não de pagamento. Contrato
+    // AVULSO ou de SERVIÇO vinculado continua cobrando a sessão (o servidor só deixa de cobrar FIXO/FLEX/Personalizado).
+    const planReservedLocked = !canMarkPaid && !!selectedContract && PLAN_COVERED_TYPES.includes(selectedContract.type);
+    // FIN-04: no FIXO o plano quase nunca cobre a sessão nova (o teto nasce usado) — nada de "o plano já cobre".
+    const fixoLocked = planReservedLocked && selectedContract!.type === 'FIXO';
+    const fixoCapUsed = fixoLocked && selectedContract!.status === 'COMPLETED';
 
     const stepLabels = ['Cliente', 'Horário', 'Confirmar'];
 
@@ -234,8 +330,16 @@ export default function CreateBookingModal({ isOpen, onClose, users, onCreated }
                                 <Search size={14} className="admin-search__icon" aria-hidden="true" />
                             </div>
 
+                            {prefill && createForm.date && createForm.startTime && (
+                                <div style={{ marginBottom: '12px', fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                                    <CalendarDays size={13} aria-hidden="true" />
+                                    Horário escolhido na agenda: <strong style={{ color: 'var(--text-primary)' }}>{new Date(createForm.date + 'T12:00:00').toLocaleDateString('pt-BR', { weekday: 'short', day: '2-digit', month: '2-digit' })} às {createForm.startTime}</strong>
+                                </div>
+                            )}
                             <div style={{ maxHeight: '340px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                                {filteredClients.length === 0 ? (
+                                {usersLoading && users.length === 0 ? (
+                                    <div style={{ padding: '32px', textAlign: 'center' }}><BrandLoader size="inline" label="Carregando clientes…" /></div>
+                                ) : filteredClients.length === 0 ? (
                                     <div style={{ padding: '32px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.8125rem' }}>
                                         Nenhum cliente encontrado
                                     </div>
@@ -264,7 +368,7 @@ export default function CreateBookingModal({ isOpen, onClose, users, onCreated }
                                                 <div style={{ fontSize: '0.6875rem', color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{u.email}</div>
                                             </div>
                                             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                                {u._count.contracts > 0 && (
+                                                {(u._count?.contracts ?? 0) > 0 && (
                                                     <span style={{
                                                         padding: '2px 8px', borderRadius: '6px', fontSize: '0.625rem', fontWeight: 700,
                                                         background: 'var(--success-bg)', color: 'var(--success)',
@@ -336,8 +440,8 @@ export default function CreateBookingModal({ isOpen, onClose, users, onCreated }
                                     <div
                                         role="button" tabIndex={0}
                                         aria-pressed={!createForm.contractId}
-                                        onClick={() => setCreateForm({ ...createForm, contractId: '', startTime: '' })}
-                                        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setCreateForm({ ...createForm, contractId: '', startTime: '' }); } }}
+                                        onClick={selectAvulso}
+                                        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectAvulso(); } }}
                                         style={{
                                             padding: '14px 16px', borderRadius: '12px', cursor: 'pointer',
                                             display: 'flex', alignItems: 'center', gap: '14px',
@@ -384,9 +488,9 @@ export default function CreateBookingModal({ isOpen, onClose, users, onCreated }
                                                 aria-disabled={!hasCredits}
                                                 onClick={() => {
                                                     if (!hasCredits) return;
-                                                    setCreateForm({ ...createForm, contractId: c.id, startTime: '' });
+                                                    selectContract(c);
                                                 }}
-                                                onKeyDown={e => { if (hasCredits && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); setCreateForm({ ...createForm, contractId: c.id, startTime: '' }); } }}
+                                                onKeyDown={e => { if (hasCredits && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); selectContract(c); } }}
                                                 style={{
                                                     padding: '14px 16px', borderRadius: '12px',
                                                     cursor: hasCredits ? 'pointer' : 'not-allowed',
@@ -440,7 +544,8 @@ export default function CreateBookingModal({ isOpen, onClose, users, onCreated }
                                                             </span>
                                                         )}
                                                         {!hasCredits && <span style={{ color: 'var(--danger)', fontWeight: 600 }}>Créditos esgotados</span>}
-                                                        {c.status === 'COMPLETED' && hasCredits && <span>Todas as sessões feitas · vincular reabre o plano</span>}
+                                                        {/* FIN-04: sem a baixa, a sessão a mais no FIXO concluído é extra e cobrada (o servidor reabre o plano de qualquer jeito). */}
+                                                        {c.status === 'COMPLETED' && hasCredits && <span>{!canMarkPaid && c.type === 'FIXO' ? 'Todas as sessões feitas · uma sessão a mais é extra e será cobrada' : 'Todas as sessões feitas · vincular reabre o plano'}</span>}
                                                     </div>
                                                 </div>
 
@@ -621,8 +726,16 @@ export default function CreateBookingModal({ isOpen, onClose, users, onCreated }
                                             {selectedContract ? <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>{(() => { const TI = tc(selectedContract.tier).icon; return <TI size={13} aria-hidden="true" />; })()} {selectedContract.name}</span> : <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}><Zap size={13} aria-hidden="true" /> Avulso (contrato automático)</span>}
                                         </div>
                                     </div>
+                                    {/* Sem a baixa manual: valor da faixa, sem edição (preço manual exige cobrancas.baixa). */}
+                                    {!createForm.contractId && !canMarkPaid && (
+                                        <div style={{ gridColumn: '1 / -1', marginTop: '4px' }}>
+                                            <div style={{ fontSize: '0.625rem', color: 'var(--text-muted)', fontWeight: 600, marginBottom: '3px' }}><Wallet size={12} style={{ verticalAlign: '-2px', marginRight: 4 }} aria-hidden="true" />Valor do Agendamento</div>
+                                            <div style={{ fontWeight: 800, fontSize: '1.125rem', color: 'var(--success)' }}>{customPrice != null ? formatBRL(customPrice) : 'Preço da faixa'}</div>
+                                            <div style={{ fontSize: '0.6875rem', color: 'var(--text-muted)', marginTop: '2px' }}>Preço da faixa. Mudar o valor exige a permissão “Marcar como pago, anular ou estornar”.</div>
+                                        </div>
+                                    )}
                                     {/* Editable price for Avulso */}
-                                    {!createForm.contractId && (
+                                    {!createForm.contractId && canMarkPaid && (
                                         <div style={{ gridColumn: '1 / -1', marginTop: '4px' }}>
                                             <label htmlFor={`${uid}-price`} style={{ display: 'block', fontSize: '0.625rem', color: 'var(--text-muted)', fontWeight: 600, marginBottom: '6px' }}><Wallet size={12} style={{ verticalAlign: '-2px', marginRight: 4 }} aria-hidden="true" />Valor do Agendamento</label>
                                             <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
@@ -706,11 +819,16 @@ export default function CreateBookingModal({ isOpen, onClose, users, onCreated }
                                         onRemove={() => setAppliedCoupon(null)}
                                         disabled={creating}
                                     />
+                                    {zeroNeedsBaixa && (
+                                        <div id={`${uid}-zero-coupon`} className="admin-alert admin-alert--warning" role="status" style={{ marginTop: '8px', marginBottom: 0, fontSize: '0.75rem', lineHeight: 1.45 }}>
+                                            <AlertTriangle size={13} aria-hidden="true" style={{ verticalAlign: '-2px', marginRight: 4 }} />{ZERO_COUPON_NEEDS_BAIXA}
+                                        </div>
+                                    )}
                                 </div>
                             )}
 
-                            {/* Avulso: cobrar agora (mesmo InlineCheckout do cliente) */}
-                            {!createForm.contractId && (
+                            {/* Avulso: cobrar agora (mesmo InlineCheckout do cliente) — só com cobrancas.cobrar */}
+                            {!createForm.contractId && canCharge && (
                                 <div style={{ marginBottom: '14px' }}>
                                     <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer', padding: '12px 14px', borderRadius: '10px', background: chargeNow ? 'rgba(17,129,155,0.08)' : 'var(--bg-elevated)', border: `1px solid ${chargeNow ? 'rgba(17,129,155,0.35)' : 'var(--border-default)'}` }}>
                                         <input type="checkbox" checked={chargeNow} onChange={e => setChargeNow(e.target.checked)} style={{ width: 18, height: 18, accentColor: 'var(--accent-primary)', cursor: 'pointer' }} />
@@ -737,22 +855,48 @@ export default function CreateBookingModal({ isOpen, onClose, users, onCreated }
                             {/* Status */}
                             <div style={{ marginBottom: '14px' }}>
                                 <label style={{ fontSize: '0.6875rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '8px', display: 'block' }}>Status inicial</label>
-                                <div style={{ display: 'flex', gap: '6px' }}>
-                                    {[{ key: 'CONFIRMED', icon: CheckCircle2, label: 'Confirmado' }, { key: 'RESERVED', icon: ClockIcon, label: 'Reservado' }].map(s => (
-                                        <button key={s.key} type="button"
-                                            onClick={() => setCreateForm({ ...createForm, status: s.key })}
-                                            aria-pressed={createForm.status === s.key}
-                                            style={{
-                                                padding: '8px 16px', minHeight: 40, borderRadius: '8px', fontSize: '0.8125rem', fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit',
-                                                background: createForm.status === s.key ? 'var(--success-bg)' : 'var(--bg-elevated)',
-                                                border: `1px solid ${createForm.status === s.key ? 'rgba(16,185,129,0.3)' : 'var(--border-default)'}`,
-                                                color: createForm.status === s.key ? 'var(--success)' : 'var(--text-secondary)',
-                                                transition: 'background 0.15s ease, color 0.15s ease, border-color 0.15s ease',
-                                            }}>
-                                            <s.icon size={13} style={{ verticalAlign: '-2px', marginRight: 5 }} aria-hidden="true" />{s.label}
-                                        </button>
-                                    ))}
+                                <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                                    {[{ key: 'CONFIRMED', icon: CheckCircle2, label: 'Confirmado' }, { key: 'RESERVED', icon: ClockIcon, label: 'Reservado' }].map(s => {
+                                        // "Confirmado" grava o pagamento como PAGO: travado (com a explicação) sem a baixa manual.
+                                        const locked = s.key === 'CONFIRMED' && !canMarkPaid;
+                                        const on = !locked && createForm.status === s.key;
+                                        const btn = (
+                                            <button key={s.key} type="button"
+                                                onClick={() => { if (!locked) setCreateForm({ ...createForm, status: s.key }); }}
+                                                aria-pressed={on}
+                                                disabled={locked}
+                                                aria-describedby={locked ? `${uid}-confirmed-locked` : undefined}
+                                                style={{
+                                                    padding: '8px 16px', minHeight: 40, borderRadius: '8px', fontSize: '0.8125rem', fontWeight: 600, cursor: locked ? 'not-allowed' : 'pointer', fontFamily: 'inherit',
+                                                    background: on ? 'var(--success-bg)' : 'var(--bg-elevated)',
+                                                    border: `1px solid ${on ? 'rgba(16,185,129,0.3)' : 'var(--border-default)'}`,
+                                                    color: on ? 'var(--success)' : 'var(--text-secondary)',
+                                                    opacity: locked ? 0.55 : 1,
+                                                    transition: 'background 0.15s ease, color 0.15s ease, border-color 0.15s ease',
+                                                }}>
+                                                <s.icon size={13} style={{ verticalAlign: '-2px', marginRight: 5 }} aria-hidden="true" />{s.label}
+                                            </button>
+                                        );
+                                        // Botão desabilitado não dispara eventos de ponteiro: a dica vai no span.
+                                        return locked ? (
+                                            <Tooltip key={s.key} content={fixoCapUsed ? CONFIRMED_LOCKED_HINT : fixoLocked ? CONFIRMED_LOCKED_HINT_FIXO : planReservedLocked ? CONFIRMED_LOCKED_HINT_PLAN : CONFIRMED_LOCKED_HINT}>
+                                                <span style={{ display: 'inline-flex' }} tabIndex={0}>{btn}</span>
+                                            </Tooltip>
+                                        ) : btn;
+                                    })}
                                 </div>
+                                {!canMarkPaid && (fixoLocked ? (
+                                    // FIN-04: antes de agendar — no FIXO a sessão a mais é extra e cobrada (quase sempre).
+                                    <div id={`${uid}-confirmed-locked`} className="admin-alert admin-alert--warning" role="status" style={{ marginTop: '8px', marginBottom: 0, fontSize: '0.75rem', lineHeight: 1.45 }}>
+                                        <AlertTriangle size={13} aria-hidden="true" style={{ verticalAlign: '-2px', marginRight: 4 }} />{fixoCapUsed ? FIXO_EXTRA_CHARGED_NOTE : FIXO_EXTRA_NOTE}
+                                    </div>
+                                ) : (
+                                    <div id={`${uid}-confirmed-locked`} style={{ marginTop: '6px', fontSize: '0.6875rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                                        {planReservedLocked
+                                            ? PLAN_RESERVED_NOTE
+                                            : 'O agendamento nasce Reservado, aguardando pagamento: confirmar na criação registra o pagamento como pago.'}
+                                    </div>
+                                ))}
                             </div>
 
                             {/* Admin notes */}
@@ -776,7 +920,8 @@ export default function CreateBookingModal({ isOpen, onClose, users, onCreated }
                                 <button key="back" type="button" onClick={() => setCreateStep(2)} className="btn-admin-ghost">
                                     ← Voltar
                                 </button>
-                                <button key="submit" type="button" onClick={ignoreMultiClick(handleCreate)} disabled={creating} className="btn-admin-go">
+                                <button key="submit" type="button" onClick={ignoreMultiClick(handleCreate)} disabled={creating || zeroNeedsBaixa}
+                                    aria-describedby={zeroNeedsBaixa ? `${uid}-zero-coupon` : undefined} className="btn-admin-go">
                                     {creating ? 'Criando…' : <><CalendarDays size={15} aria-hidden="true" /> Agendar</>}
                                 </button>
                             </div>

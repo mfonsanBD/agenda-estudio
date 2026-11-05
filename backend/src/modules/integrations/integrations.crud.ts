@@ -5,7 +5,7 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize } from '../../middleware/auth.js';
+import { requireAdmin } from '../../middleware/permissions.js';
 import { coraTestConnection } from '../../lib/coraService.js';
 import { sicoobTestConnection, sicoobAllowedEnvironment } from '../../lib/sicoobService.js';
 import { stripeTestConnection } from '../../lib/stripeService.js';
@@ -45,7 +45,7 @@ export function registerIntegrationRoutes(router: Router) {
 // ─── GET /api/integrations ──────────────────────────────
 // List all integrations (masked credentials)
 
-router.get('/', authenticate, authorize('ADMIN'), async (_req: Request, res: Response) => {
+router.get('/', requireAdmin(), async (_req: Request, res: Response) => {
     try {
         const integrations = await prisma.integrationConfig.findMany({
             orderBy: { provider: 'asc' },
@@ -99,7 +99,7 @@ router.get('/', authenticate, authorize('ADMIN'), async (_req: Request, res: Res
 
 // ─── GET /api/integrations/:provider ────────────────────
 
-router.get('/:provider', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.get('/:provider', requireAdmin(), async (req: Request, res: Response) => {
     const provider = (req.params.provider as string)?.toUpperCase();
     if (!VALID_PROVIDERS.includes(provider as any)) {
         res.status(400).json({ error: 'Provider inválido. Use CORA, SICOOB ou STRIPE.' });
@@ -151,7 +151,7 @@ router.get('/:provider', authenticate, authorize('ADMIN'), async (req: Request, 
 // ─── PUT /api/integrations/:provider ────────────────────
 // Save/update integration credentials
 
-router.put('/:provider', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.put('/:provider', requireAdmin(), async (req: Request, res: Response) => {
     try {
         const provider = (req.params.provider as string)?.toUpperCase();
         if (!VALID_PROVIDERS.includes(provider as any)) {
@@ -321,7 +321,7 @@ router.put('/:provider', authenticate, authorize('ADMIN'), async (req: Request, 
 // ─── POST /api/integrations/:provider/test ──────────────
 // Test connectivity for a provider
 
-router.post('/:provider/test', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.post('/:provider/test', requireAdmin(), async (req: Request, res: Response) => {
     const provider = (req.params.provider as string)?.toUpperCase();
     if (!VALID_PROVIDERS.includes(provider as any)) {
         res.status(400).json({ error: 'Provider inválido.' });
@@ -362,7 +362,7 @@ router.post('/:provider/test', authenticate, authorize('ADMIN'), async (req: Req
 // ─── POST /api/integrations/:provider/toggle ────────────
 // Enable/disable a provider
 
-router.post('/:provider/toggle', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.post('/:provider/toggle', requireAdmin(), async (req: Request, res: Response) => {
     const provider = (req.params.provider as string)?.toUpperCase();
     if (!VALID_PROVIDERS.includes(provider as any)) {
         res.status(400).json({ error: 'Provider inválido.' });

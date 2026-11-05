@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { contractsApi, usersApi, pricingApi, AdminContract, UserSummary, PricingConfig } from '../api/client';
+import { usePermission } from './usePermission';
 
 export type ContractFilter = 'ALL' | 'ACTIVE' | 'AWAITING_PAYMENT' | 'COMPLETED' | 'EXPIRED' | 'CANCELLED' | 'PENDING_CANCELLATION' | 'PAUSED';
 
@@ -14,6 +15,12 @@ export function useAdminContracts() {
     const [filter, setFilter] = useState<ContractFilter>('ALL');
     const [search, setSearch] = useState('');
     const loadedOnce = useRef(false);
+    // A lista de clientes só alimenta os seletores de "Novo contrato"/"Personalizado" (contratos.criar).
+    // Sem essa chave ela nem é pedida (menos dados pessoais no navegador de quem só consulta contratos).
+    const { can } = usePermission();
+    const needsClients = can('contratos.criar');
+    const needsClientsRef = useRef(needsClients);
+    needsClientsRef.current = needsClients;
 
     // `loading` só liga no PRIMEIRO carregamento. Os seguintes (após criar/editar/cancelar)
     // atualizam os dados em silêncio: a página mostra o skeleton quando `loading`, o que
@@ -24,7 +31,11 @@ export function useAdminContracts() {
         if (first) setLoading(true);
         else setRefreshing(true);
         try {
-            const [cRes, uRes, pRes] = await Promise.all([contractsApi.getAll(), usersApi.getAll(), pricingApi.get()]);
+            const [cRes, uRes, pRes] = await Promise.all([
+                contractsApi.getAll(),
+                needsClientsRef.current ? usersApi.getAll('CLIENTE') : Promise.resolve({ users: [] as UserSummary[] }),
+                pricingApi.get(),
+            ]);
             setContracts(cRes.contracts);
             setUsers(uRes.users);
             setPricing(pRes.pricing);

@@ -16,6 +16,8 @@ interface AddressFieldsProps {
     onCepFilled?: (patch: Partial<AddressValues>) => void;
     /** Mostra o cabeçalho "Endereço" com ícone (default true). */
     heading?: boolean;
+    /** Somente leitura (ex.: sem a permissão de editar o cadastro do cliente). */
+    disabled?: boolean;
 }
 
 const labelStyle: CSSProperties = { fontSize: '0.6875rem', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: '4px', display: 'block' };
@@ -26,7 +28,7 @@ const inputStyle: CSSProperties = { fontSize: '0.8125rem', padding: '8px 10px' }
  * cidade, UF). Digitar o CEP consulta o ViaCEP e autopreenche rua/bairro/cidade/UF.
  * Componente puramente controlado — quem salva é o pai (perfil: inline; modais: no submit).
  */
-export default function AddressFields({ values, onChange, onFieldBlur, onCepFilled, heading = true }: AddressFieldsProps) {
+export default function AddressFields({ values, onChange, onFieldBlur, onCepFilled, heading = true, disabled = false }: AddressFieldsProps) {
     const [cepLoading, setCepLoading] = useState(false);
     const uid = useId();
     // Último CEP já consultado — evita refetch e reverter edições manuais ao re-blurar sem mudar.
@@ -58,6 +60,7 @@ export default function AddressFields({ values, onChange, onFieldBlur, onCepFill
             <input id={`${uid}-${f}`} className="form-input" value={values[f]} placeholder={placeholder}
                 onChange={e => onChange({ [f]: e.target.value } as Partial<AddressValues>)}
                 onBlur={() => onFieldBlur?.(f)}
+                disabled={disabled}
                 style={inputStyle} />
         </div>
     );
@@ -78,6 +81,7 @@ export default function AddressFields({ values, onChange, onFieldBlur, onCepFill
                             aria-label="CEP (preenche o endereço automaticamente)"
                             onChange={e => onChange({ zipCode: maskCep(e.target.value) })}
                             onBlur={handleCepBlur}
+                            disabled={disabled}
                             onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); (e.currentTarget as HTMLInputElement).blur(); } }}
                             style={{ ...inputStyle, paddingRight: 30 }} />
                         <span style={{ position: 'absolute', right: 9, top: '50%', transform: 'translateY(-50%)', display: 'inline-flex', color: 'var(--text-muted)', pointerEvents: 'none' }}>
@@ -98,6 +102,7 @@ export default function AddressFields({ values, onChange, onFieldBlur, onCepFill
                         <input id={`${uid}-state`} className="form-input" value={values.state} placeholder="RJ" maxLength={2}
                             onChange={e => onChange({ state: e.target.value.toUpperCase() })}
                             onBlur={() => onFieldBlur?.('state')}
+                            disabled={disabled}
                             style={{ ...inputStyle, textTransform: 'uppercase' }} />
                     </div>
                 </div>

@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { useAuth } from '../context/AuthContext';
-
-const PUSH_REGISTERED_KEY = 'push-subscription-registered';
+// A marca da sessão e o desligamento no logout (NS-4, unregisterPushOnThisDevice) ficam em utils/pushDevice.ts.
+import { PUSH_REGISTERED_KEY } from '../utils/pushDevice';
 
 /**
  * Automatically subscribes the user to push notifications

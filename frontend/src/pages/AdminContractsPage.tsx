@@ -4,7 +4,8 @@ import { useNavigate } from 'react-router-dom';
 import { contractsApi, stripeApi, ApiError, Contract, ContractStatus } from '../api/client';
 import { useBusinessConfig } from '../hooks/useBusinessConfig';
 import { useUI } from '../context/UIContext';
-import { FileText, Search, X, Inbox, Link2, FolderOpen, FolderSymlink, Pencil, CircleDollarSign, HandCoins, Banknote, Ban, RefreshCw, Pause, Play, CreditCard, Sparkles, Loader2, Clock, UserX } from 'lucide-react';
+import { FileText, Search, X, Inbox, Link2, FolderOpen, FolderSymlink, Pencil, CircleDollarSign, HandCoins, Banknote, Ban, RefreshCw, Pause, Play, CreditCard, Sparkles, Loader2, Clock, UserX, Lock } from 'lucide-react';
+import { usePermission } from '../hooks/usePermission';
 import BottomSheetModal from '../components/BottomSheetModal';
 import AdminPageHeader from '../components/admin/AdminPageHeader';
 import ChargeNowSheet from '../components/admin/ChargeNowSheet';
@@ -19,6 +20,7 @@ import { describeContractTerms, isAvulsoContract } from '../utils/contractStatus
 import { formatBRL } from '../utils/format';
 import CreateContractModal from '../components/admin/contracts/CreateContractModal';
 import CustomContractModal from '../components/admin/contracts/CustomContractModal';
+import { cancelContractConsequences, contractCancelBlockReason, contractDecideBlockReason, pauseContractConsequences, sessionChargeLines } from '../components/admin/contracts/contractCancelRules';
 
 /** Status que o admin pode escolher no "Editar" (espelha updateContractSchema do backend). */
 const EDITABLE_STATUSES: readonly ContractStatus[] = ['ACTIVE', 'COMPLETED', 'EXPIRED', 'CANCELLED'];
@@ -38,6 +40,15 @@ const fmtDateSP = (iso: string) => new Date(iso).toLocaleDateString('pt-BR', { t
 /** E13: a multa de cancelamento gerada ainda está em aberto (o admin pode "Cobrar agora"). */
 const isFineOpen = (c: Contract) => c.cancellationFine?.status === 'PENDING' || c.cancellationFine?.status === 'FAILED';
 
+/** Junta itens em português: "a", "a e b", "a, b e c". */
+const joinPt = (items: string[]) => items.length <= 1 ? (items[0] ?? '') : `${items.slice(0, -1).join(', ')} e ${items[items.length - 1]}`;
+
+/** Campo travado no "Editar" (sem a permissão): em cinza — o CSS global não estiliza `.form-input:disabled`. */
+const lockedField = (locked: boolean): React.CSSProperties | undefined => (locked ? { opacity: 0.5, cursor: 'not-allowed' } : undefined);
+
+/** Resposta da API que deixou a lista defasada (o servidor recusou com base no estado atual): recarregar. */
+const isStaleListError = (err: unknown) => err instanceof ApiError && [400, 403, 409].includes(err.status);
+
 /** Cobrança da multa aberta no ChargeNowSheet (E13 — "Cobrar agora"). */
 interface FineCharge {
     paymentId: string;
@@ -52,6 +63,27 @@ export default function AdminContractsPage() {
     const uid = useId();
     const navigate = useNavigate();
     const { showConfirm, showToast, showAlert } = useUI();
+    // Equipe (D2/D3): cada botão segue a sua chave — o servidor é a autoridade (403 PERMISSION_DENIED).
+    const { can } = usePermission();
+    const canCreate = can('contratos.criar');           // Novo e Personalizado
+    // MAT-01: Renovar exige também a baixa manual — a renovação não gera parcelas (o servidor exige as duas).
+    const canRenew = canCreate && can('cobrancas.baixa');
+    const canEdit = can('contratos.editar');          // término, link, forma, ACTIVE/COMPLETED/EXPIRED, pausar/retomar
+    const canConditions = can('contratos.condicoes');   // créditos FLEX (e serviços, no detalhe)
+    const canCancel = can('contratos.cancelar');        // Cancelar contrato / status Cancelado
+    const canDecideFine = can('contratos.multa');       // Cobrar/Isentar multa e qualquer mudança em PENDING_CANCELLATION
+    const canSettleCharges = can('cobrancas.baixa');    // anular cobrança em aberto (R5): cancelar avulso, pausar Fixo
+    /**
+     * ATU5-03/AUDFIN6-01 (espelho do DELETE/PATCH /contracts/:id): cancelar o contrato anula a cobrança de sessão em
+     * aberto (o avulso inteiro; nos outros tipos, a cobrança própria de uma gravação). Sem a baixa e com ela (contagem
+     * conhecida > 0), o servidor recusa (403): a tela não oferece o status Cancelado e o botão "Cancelar contrato" fica
+     * travado com o motivo (TELA6-05). Contagem ausente não trava (o 403 aparece no diálogo). Devolve o motivo ou null.
+     */
+    const cancelBlockReason = (c: Contract) => contractCancelBlockReason(c, canSettleCharges);
+    /** ATU6-02 (espelho do resolve-cancellation): decidir o pedido anula o mesmo — sem a baixa, a decisão fica travada. */
+    const decideBlockReason = (c: Contract) => contractDecideBlockReason(c, canSettleCharges);
+    const canCharge = can('cobrancas.cobrar');          // "Cobrar multa agora"
+    const canOpenClient = can('clientes.ver');          // link para o perfil do cliente
     const {
         contracts,
         users,
@@ -100,18 +132,40 @@ export default function AdminContractsPage() {
         return res;
     };
 
+    /**
+     * Status que ESTA pessoa pode escolher no "Editar" (além do atual). Espelha requiredForContractPatch:
+     * Cancelado → contratos.cancelar; Ativo/Concluído/Expirado → contratos.editar; e, com o pedido de
+     * cancelamento em análise, qualquer mudança de status decide a multa → também contratos.multa; reabrir
+     * um contrato CANCELADO (sair de Cancelado) exige também contratos.cancelar e contratos.condicoes
+     * (MAT-03/DIN-04: devolve créditos e sessões sem parcela em aberto).
+     */
+    const statusTargetsFor = (c: Contract): ContractStatus[] => {
+        if (c.status === 'PENDING_CANCELLATION' && !canDecideFine) return [];
+        if (c.status === 'CANCELLED' && !(canCancel && canConditions)) return [];
+        return EDITABLE_STATUSES.filter(s => s !== c.status && (s === 'CANCELLED' ? canCancel && !cancelBlockReason(c) : canEdit));
+    };
+    /** Créditos FLEX editáveis (contratos.condicoes; nunca para cliente excluído). */
+    const creditsEditable = (c: Contract) => c.type === 'FLEX' && canConditions && !isClientDeleted(c);
+    /** O lápis só aparece se houver algo que a pessoa possa mudar no formulário. */
+    const canOpenEdit = (c: Contract) => canEdit || creditsEditable(c) || statusTargetsFor(c).length > 0;
+
     const handleEdit = async () => {
         if (!editContract) return;
         setEditError('');
         try {
             const data: any = {};
-            // Só envia o status quando MUDOU: o PATCH aceita apenas ACTIVE/COMPLETED/EXPIRED/CANCELLED,
-            // então reenviar o atual de um contrato Pausado/Pend. cancelamento/Aguard. pagamento dava 400.
+            // Só envia o que MUDOU (a permissão é conferida por campo alterado — requiredForContractPatch).
+            // Status: o PATCH aceita apenas ACTIVE/COMPLETED/EXPIRED/CANCELLED, então reenviar o atual de um
+            // contrato Pausado/Pend. cancelamento/Aguard. pagamento dava 400.
             if (editForm.status && editForm.status !== editContract.status) data.status = editForm.status;
-            if (editForm.endDate) data.endDate = editForm.endDate;
-            if (editForm.flexCreditsRemaining !== '') data.flexCreditsRemaining = Number(editForm.flexCreditsRemaining);
+            if (editForm.endDate && editForm.endDate !== editContract.endDate.split('T')[0]) data.endDate = editForm.endDate;
+            if (editForm.flexCreditsRemaining !== '' && editForm.flexCreditsRemaining !== (editContract.flexCreditsRemaining?.toString() || '')) {
+                data.flexCreditsRemaining = Number(editForm.flexCreditsRemaining);
+            }
             if (editForm.contractUrl !== (editContract.contractUrl || '')) data.contractUrl = editForm.contractUrl;
             if (editForm.paymentMethod && editForm.paymentMethod !== (editContract.paymentMethod || '')) data.paymentMethod = editForm.paymentMethod;
+            // Nada mudou: fecha sem chamar a API.
+            if (Object.keys(data).length === 0) { setEditContract(null); return; }
             // Mudar para Cancelado pelo "Editar" faz o MESMO que "Cancelar contrato" no backend (anula
             // parcelas, encerra a recorrência, cancela as gravações de hoje em diante) → confirmação danger.
             if (data.status === 'CANCELLED') {
@@ -123,16 +177,25 @@ export default function AdminContractsPage() {
                     title: 'Cancelar este contrato?',
                     message: `“${c.name}”${clientLabel(c)} será encerrado ao salvar. As demais alterações deste formulário são salvas junto.`,
                     consequences: [
-                        ...cancelContractConsequences(c),
+                        ...cancelContractConsequences(c, { canSettleCharges }),
                         ...(c.status === 'PENDING_CANCELLATION'
                             ? ['O cliente pediu o cancelamento: salvar como Cancelado equivale a isentar a multa (para cobrá-la, use “Cobrar multa” na lista).']
                             : []),
                     ],
                     confirmLabel: 'Salvar e cancelar contrato',
                     cancelLabel: 'Voltar à edição',
-                    // Sem try/catch: o erro do PATCH aparece dentro do diálogo.
+                    // O erro do PATCH aparece dentro do diálogo. 409 CONTRACT_STATUS_CHANGED (o status mudou
+                    // entre abrir e salvar, ex.: o cliente pediu o cancelamento): nada foi gravado — fecha o
+                    // "Editar" e recarrega a lista por trás do diálogo.
                     onConfirm: async () => {
-                        const res = await submitEdit(c, data);
+                        const res = await submitEdit(c, data).catch(async (err: unknown) => {
+                            if (err instanceof ApiError && err.code === 'CONTRACT_STATUS_CHANGED') {
+                                setEditContract(null);
+                                setConfirmingEditCancel(false);
+                                await reload();
+                            }
+                            throw err;
+                        });
                         setConfirmingEditCancel(false);
                         // Mesmo aviso do botão “Cancelar contrato”: cobrança já paga / não cancelável no banco fica NA TELA.
                         announceCancellation(res);
@@ -143,6 +206,14 @@ export default function AdminContractsPage() {
             }
             await submitEdit(editContract, data);
         } catch (err: unknown) {
+            // O status do contrato mudou entre abrir e salvar (ex.: o cliente pediu o cancelamento) — nada foi
+            // gravado. Fecha o formulário velho e recarrega a lista.
+            if (err instanceof ApiError && err.code === 'CONTRACT_STATUS_CHANGED') {
+                setEditContract(null);
+                showToast({ message: err.message || 'O status deste contrato mudou. Confira e edite de novo.', type: 'error' });
+                await reload();
+                return;
+            }
             // E3: o boleto foi desligado (ou a Cora desativada) entre abrir o modal e salvar — nada foi gravado.
             if (err instanceof ApiError && err.code === 'BOLETO_UNAVAILABLE') {
                 setEditError(`${err.message || 'O pagamento por boleto não está disponível.'} Escolha PIX ou Cartão.`);
@@ -164,17 +235,7 @@ export default function AdminContractsPage() {
     // D3 — confirmações com o que o backend faz DE FATO (contract.lifecycle.ts). Com `tone`, o
     // diálogo aguarda o onConfirm e mostra o erro dentro dele: por isso nada de try/catch aqui.
     function clientLabel(c: Contract) { return c.user?.name ? ` de ${c.user.name}` : ''; }
-
-    /** O que o cancelamento faz (DELETE /contracts/:id e PATCH status CANCELLED fazem o mesmo). */
-    function cancelContractConsequences(c: Contract): string[] {
-        return [
-            'O contrato passa a Cancelado.',
-            ...(c.type === 'SERVICO' ? [] : ['As gravações que ainda não aconteceram são canceladas e os horários ficam livres para outros clientes (as já feitas ou em andamento ficam como estão).']),
-            'As parcelas pendentes são anuladas: a cobrança já emitida (QR PIX, boleto ou cartão em aberto) é cancelada no banco antes.',
-            'O cliente é avisado do cancelamento.',
-            'Nenhuma multa é gerada e nada do que já foi pago é estornado.',
-        ];
-    }
+    // O que o cancelamento faz: cancelContractConsequences (components/admin/contracts/contractCancelRules).
 
     /**
      * Resultado de um cancelamento (DELETE, resolve-cancellation ou PATCH status CANCELLED). Quando o banco confirmou uma cobrança como
@@ -196,7 +257,7 @@ export default function AdminContractsPage() {
             icon: Ban,
             title: 'Cancelar este contrato?',
             message: `“${c.name}”${clientLabel(c)} será encerrado agora.`,
-            consequences: cancelContractConsequences(c),
+            consequences: cancelContractConsequences(c, { canSettleCharges }),
             confirmLabel: 'Cancelar contrato',
             cancelLabel: 'Manter contrato',
             onConfirm: async () => {
@@ -205,9 +266,10 @@ export default function AdminContractsPage() {
                     await reload();
                     announceCancellation(res);
                 } catch (err: unknown) {
-                    // 400 = a lista estava defasada (ex.: “Contrato já está cancelado.”): recarrega ANTES de o
-                    // erro aparecer no diálogo, para a linha não continuar oferecendo a ação.
-                    if (err instanceof ApiError && err.status === 400) await reload();
+                    // 400/409 = a lista estava defasada (ex.: “Contrato já está cancelado.”); 403 = o contrato
+                    // passou a ter pedido de cancelamento (decidir a multa exige outra permissão): recarrega
+                    // ANTES de o erro aparecer no diálogo, para a linha não continuar oferecendo a ação.
+                    if (isStaleListError(err)) await reload();
                     throw err;
                 }
             },
@@ -237,6 +299,7 @@ export default function AdminContractsPage() {
         const common = [
             'O contrato passa a Cancelado (as gravações que ainda não tinham acontecido já foram liberadas quando o cliente pediu o cancelamento).',
             'As parcelas pendentes são anuladas: a cobrança já emitida (QR PIX, boleto ou cartão em aberto) é cancelada no banco antes.',
+            ...sessionChargeLines(c, canSettleCharges, 'decide'),
         ];
         // Multa do pedido (vem em GET /contracts): o % congelado no pedido sobre a base EFETIVA — as parcelas da
         // base ainda não pagas (parcela paga durante a análise sai; a multa nunca aumenta).
@@ -276,7 +339,10 @@ export default function AdminContractsPage() {
                     : `Encerra “${c.name}”${clientLabel(c)} com a multa de ${pct}% sobre o que faltava pagar do plano.`,
                 consequences: [
                     `É gerada a cobrança “Multa de cancelamento”${fineKnown ? ` de ${formatBRL(fineAmount)}` : ''}, que fica pendente: o cliente é avisado e paga em Meus Pagamentos (PIX ou cartão).`,
-                    'Com o cliente presente, use “Cobrar multa agora” (na lista ou dentro do contrato). Ela não é cobrada sozinha no cartão salvo, mesmo com a cobrança automática ligada.',
+                    // TELA-3: "Cobrar multa agora" (lista e detalhe) exige cobrancas.cobrar — sem ela, não citar o botão.
+                    canCharge
+                        ? 'Com o cliente presente, use “Cobrar multa agora” (na lista ou dentro do contrato). Ela não é cobrada sozinha no cartão salvo, mesmo com a cobrança automática ligada.'
+                        : 'A multa fica pendente para o cliente pagar pelo app (cobrar no balcão exige “Cobrar o cliente”). Ela não é cobrada sozinha no cartão salvo, mesmo com a cobrança automática ligada.',
                     ...common,
                 ],
                 confirmLabel: 'Cobrar multa e cancelar',
@@ -351,17 +417,8 @@ export default function AdminContractsPage() {
             icon: Pause,
             title: 'Pausar este contrato?',
             message: `“${c.name}”${clientLabel(c)} fica pausado até você retomar.`,
-            consequences: c.type === 'FIXO'
-                ? [
-                    'As gravações agendadas daqui em diante são canceladas e os horários ficam livres para outros clientes.',
-                    'Ao retomar, a vigência é estendida pelos dias em pausa e as gravações do dia e horário fixos são recriadas.',
-                    'Parcelas pendentes não são cobradas automaticamente enquanto o contrato estiver pausado.',
-                ]
-                : [
-                    'As gravações já agendadas são mantidas.',
-                    'Ao retomar, a vigência é estendida pelos dias em pausa.',
-                    'Parcelas pendentes não são cobradas automaticamente enquanto o contrato estiver pausado.',
-                ],
+            // TELA6-04: o que o servidor faz de fato (só a extra fica; a cobrada à parte dentro do plano é cancelada).
+            consequences: pauseContractConsequences(c, { canSettleCharges }),
             confirmLabel: 'Pausar contrato',
             onConfirm: async () => {
                 const r = await contractsApi.pause(c.id, { reason: 'Pausa administrativa' });
@@ -421,6 +478,32 @@ export default function AdminContractsPage() {
         return boletoAvailable ? [...base, getBoletoMethodConfig()] : base;
     })();
 
+    // "Editar" — o que ESTA pessoa pode mudar no contrato aberto (os demais campos ficam em cinza).
+    const editTargets = editContract ? statusTargetsFor(editContract) : [];
+    const editCreditsOk = !!editContract && creditsEditable(editContract);
+    const editPendingLocked = editContract?.status === 'PENDING_CANCELLATION' && !canDecideFine;
+    const editCancelledLocked = editContract?.status === 'CANCELLED' && !(canCancel && canConditions);
+    // ATU5-03/AUDFIN6-01: cobrança de sessão em aberto e sem a baixa — o Cancelado sai das opções (o servidor recusa com 403).
+    const editCancelBlockReason = editContract && canCancel ? cancelBlockReason(editContract) : null;
+    const editLockNote = (() => {
+        if (!editContract) return null;
+        const isFlex = editContract.type === 'FLEX';
+        const statusFull = canEdit && canCancel && !editPendingLocked && !editCancelledLocked && !editCancelBlockReason;
+        const locked = !statusFull || !canEdit || (isFlex && !canConditions);
+        if (!locked) return null;
+        const parts = [
+            editTargets.length > 0 ? (statusFull ? 'o status' : `o status (para ${joinPt(editTargets.map(s => getMeta(CONTRACT_STATUS_META, s).label))})`) : '',
+            canEdit ? 'o término, o link e a forma de pagamento' : '',
+            isFlex && editCreditsOk ? 'os créditos' : '',
+        ].filter(Boolean);
+        const base = parts.length > 0
+            ? `Com o seu acesso, dá para alterar só ${joinPt(parts)}. Os campos em cinza exigem outra permissão.`
+            : 'Com o seu acesso, nenhum campo deste contrato pode ser alterado.';
+        if (editCancelledLocked) return `${base} Reabrir um contrato cancelado exige “Cancelar contrato” e “Mudar créditos, serviços e condições de pagamento”.`;
+        if (editCancelBlockReason) return `${base} ${editCancelBlockReason}`;
+        return base;
+    })();
+
     if (loading) return <div><HeroSkeleton /><TableSkeleton rows={6} cols={7} /></div>;
 
     return (
@@ -430,7 +513,7 @@ export default function AdminContractsPage() {
                 icon={FileText}
                 title="Contratos"
                 subtitle="Gestão do ciclo de vida dos contratos"
-                actions={
+                actions={canCreate ? (
                     <>
                         <button className="btn-admin-go" onClick={() => { setShowCreate(true); }}>
                             <span style={{ fontSize: '1.1rem' }} aria-hidden="true">+</span> Novo Contrato
@@ -445,7 +528,7 @@ export default function AdminContractsPage() {
                             <Sparkles size={16} aria-hidden="true" /> Contrato Personalizado
                         </button>
                     </>
-                }
+                ) : undefined}
             />
 
             {/* --- KPI CARDS --- */}
@@ -590,13 +673,18 @@ export default function AdminContractsPage() {
                                                         {(() => { const TI = getMeta(CONTRACT_TYPE_META, c.type).icon; return <TI size={17} />; })()}
                                                     </div>
                                                     <div>
-                                                        <Tooltip content={c.user?.name ? 'Abrir perfil do cliente' : null}>
-                                                            <button
-                                                                style={{ fontWeight: 600, fontSize: '0.875rem', cursor: 'pointer', color: 'var(--accent-text)', background: 'none', border: 'none', padding: 0, fontFamily: 'inherit', textAlign: 'left' }}
-                                                                onClick={() => c.user?.id && navigate(`/admin/clients/${c.user.id}`)}>
-                                                                {c.user?.name || '—'}
-                                                            </button>
-                                                        </Tooltip>
+                                                        {/* O perfil do cliente só abre com "Ver clientes": sem ela, o nome é só texto. */}
+                                                        {canOpenClient ? (
+                                                            <Tooltip content={c.user?.name ? 'Abrir perfil do cliente' : null}>
+                                                                <button
+                                                                    style={{ fontWeight: 600, fontSize: '0.875rem', cursor: 'pointer', color: 'var(--accent-text)', background: 'none', border: 'none', padding: 0, fontFamily: 'inherit', textAlign: 'left' }}
+                                                                    onClick={() => c.user?.id && navigate(`/admin/clients/${c.user.id}`)}>
+                                                                    {c.user?.name || '—'}
+                                                                </button>
+                                                            </Tooltip>
+                                                        ) : (
+                                                            <span style={{ fontWeight: 600, fontSize: '0.875rem', color: 'var(--text-primary)' }}>{c.user?.name || '—'}</span>
+                                                        )}
                                                         {clientDeleted && (
                                                             <div style={{ marginTop: 3 }}>
                                                                 <StatusBadge meta={DELETED_CLIENT_META} />
@@ -722,14 +810,16 @@ export default function AdminContractsPage() {
                                                         <button className="admin-icon-btn" aria-label={`Abrir contrato ${c.name}`}
                                                             onClick={() => navigate(`/admin/contracts/${c.id}`)}><FolderOpen size={16} aria-hidden="true" /></button>
                                                     </Tooltip>
-                                                    <Tooltip content="Editar contrato" describe={false}>
-                                                        <button className="admin-icon-btn admin-icon-btn--success" aria-label={`Editar contrato ${c.name}`}
-                                                            onClick={() => openEdit(c)}><Pencil size={16} aria-hidden="true" /></button>
-                                                    </Tooltip>
+                                                    {canOpenEdit(c) && (
+                                                        <Tooltip content="Editar contrato" describe={false}>
+                                                            <button className="admin-icon-btn admin-icon-btn--success" aria-label={`Editar contrato ${c.name}`}
+                                                                onClick={() => openEdit(c)}><Pencil size={16} aria-hidden="true" /></button>
+                                                        </Tooltip>
+                                                    )}
 
                                                     {/* E13: multa gerada e ainda em aberto → cobrar com o cliente presente (PIX/cartão).
-                                                        Nunca para cliente excluído (D3). */}
-                                                    {!clientDeleted && fine && isFineOpen(c) && (
+                                                        Nunca para cliente excluído (D3). Exige "Cobrar o cliente". */}
+                                                    {canCharge && !clientDeleted && fine && isFineOpen(c) && (
                                                         <Tooltip content={`Cobrar multa agora (${formatBRL(fine.amount)})`} describe={false}>
                                                             <button type="button" className="admin-icon-btn admin-icon-btn--success"
                                                                 aria-label={`Cobrar agora a multa de cancelamento de ${c.name} (${formatBRL(fine.amount)})`}
@@ -742,7 +832,19 @@ export default function AdminContractsPage() {
                                                         </Tooltip>
                                                     )}
 
-                                                    {c.status === 'PENDING_CANCELLATION' && (
+                                                    {/* Decidir o pedido de cancelamento (cobrar ou isentar a multa): contratos.multa.
+                                                        ATU6-02 (espelho): com cobrança de sessão em aberto e sem a baixa, o servidor
+                                                        recusa — a decisão fica travada com o motivo (no toque, o clique mostra o texto). */}
+                                                    {canDecideFine && c.status === 'PENDING_CANCELLATION' && decideBlockReason(c) && (
+                                                        <Tooltip content={decideBlockReason(c)}>
+                                                            <button type="button" className="admin-icon-btn" aria-disabled="true"
+                                                                aria-label={`Decidir o pedido de cancelamento de ${c.name} indisponível: ver por quê`}
+                                                                onClick={() => showAlert({ type: 'info', title: 'Decidir o pedido indisponível', message: decideBlockReason(c) ?? '' })}>
+                                                                <Lock size={16} aria-hidden="true" />
+                                                            </button>
+                                                        </Tooltip>
+                                                    )}
+                                                    {canDecideFine && c.status === 'PENDING_CANCELLATION' && !decideBlockReason(c) && (
                                                         <>
                                                             {/* Multa = cobrança nova: nunca para cliente excluído (D3). */}
                                                             {!clientDeleted && (
@@ -758,17 +860,28 @@ export default function AdminContractsPage() {
                                                         </>
                                                     )}
 
-                                                    {c.status === 'ACTIVE' && (
+                                                    {canCancel && c.status === 'ACTIVE' && !cancelBlockReason(c) && (
                                                         <Tooltip content="Cancelar contrato" describe={false}>
                                                             <button className="admin-icon-btn admin-icon-btn--danger" aria-label={`Cancelar contrato ${c.name}`}
                                                                 onClick={() => handleCancel(c)}><Ban size={16} aria-hidden="true" /></button>
                                                         </Tooltip>
                                                     )}
+                                                    {/* TELA6-05: com cobrança de sessão em aberto e sem a baixa, o Cancelar fica travado com o
+                                                        motivo (antes sumia sem explicação para quem não tem "Editar"); no toque, o clique mostra o texto. */}
+                                                    {canCancel && c.status === 'ACTIVE' && cancelBlockReason(c) && (
+                                                        <Tooltip content={cancelBlockReason(c)}>
+                                                            <button type="button" className="admin-icon-btn" aria-disabled="true"
+                                                                aria-label={`Cancelar contrato ${c.name} indisponível: ver por quê`}
+                                                                onClick={() => showAlert({ type: 'info', title: 'Cancelar indisponível', message: cancelBlockReason(c) ?? '' })}>
+                                                                <Lock size={16} aria-hidden="true" />
+                                                            </button>
+                                                        </Tooltip>
+                                                    )}
 
                                                     {/* E4: o backend decide (`canRenew`) — plano Ativo/Concluído a ≤ 30 dias do fim, ou
                                                         Expirado; ainda não renovado; nunca avulso/serviço nem cliente excluído (D3).
-                                                        O `!clientDeleted` é só cinto e suspensório. */}
-                                                    {!clientDeleted && c.canRenew === true && (
+                                                        O `!clientDeleted` é só cinto e suspensório. Renovar = contratos.criar + cobrancas.baixa (MAT-01). */}
+                                                    {canRenew && !clientDeleted && c.canRenew === true && (
                                                         <Tooltip content="Renovar contrato (+3 meses)" describe={false}>
                                                             <button type="button" className="admin-icon-btn" aria-label={`Renovar contrato ${c.name}`}
                                                                 onClick={() => handleRenew(c)}><RefreshCw size={16} aria-hidden="true" /></button>
@@ -781,13 +894,14 @@ export default function AdminContractsPage() {
                                                                 onClick={() => navigate(`/admin/contracts/${c.renewedToId}`)}><FolderSymlink size={16} aria-hidden="true" /></button>
                                                         </Tooltip>
                                                     )}
-                                                    {!clientDeleted && c.status === 'ACTIVE' && (
+                                                    {/* Pausar e retomar fazem parte de "Editar, pausar e retomar contratos". */}
+                                                    {canEdit && !clientDeleted && c.status === 'ACTIVE' && (
                                                         <Tooltip content="Pausar contrato" describe={false}>
                                                             <button className="admin-icon-btn" aria-label={`Pausar contrato ${c.name}`}
                                                                 onClick={() => handlePause(c)}><Pause size={16} aria-hidden="true" /></button>
                                                         </Tooltip>
                                                     )}
-                                                    {!clientDeleted && (c.status as string) === 'PAUSED' && (
+                                                    {canEdit && !clientDeleted && (c.status as string) === 'PAUSED' && (
                                                         <Tooltip content="Retomar contrato" describe={false}>
                                                             <button className="admin-icon-btn admin-icon-btn--success" aria-label={`Retomar contrato ${c.name}`}
                                                                 onClick={() => {
@@ -833,38 +947,59 @@ export default function AdminContractsPage() {
                                 Cliente excluído: o contrato não pode voltar a Ativo nem ter os créditos alterados. Link, forma de pagamento, término e encerramento continuam editáveis.
                             </div>
                         )}
+                        {/* Equipe: o que o acesso desta pessoa permite mudar (os campos bloqueados ficam em cinza). */}
+                        {editLockNote && (
+                            <div className="admin-info-banner" role="note" style={{ marginBottom: 14 }}>
+                                <Lock size={15} className="admin-info-banner__icon" aria-hidden="true" />
+                                <span>{editLockNote}</span>
+                            </div>
+                        )}
                         <div className="form-group"><label className="form-label" htmlFor={`${uid}-status`}>Status</label>
-                            <select id={`${uid}-status`} className="form-select" value={editForm.status} onChange={e => setEditForm({ ...editForm, status: e.target.value })}>
+                            <select id={`${uid}-status`} className="form-select" value={editForm.status} disabled={editTargets.length === 0}
+                                style={lockedField(editTargets.length === 0)}
+                                onChange={e => setEditForm({ ...editForm, status: e.target.value })}>
                                 {/* O PATCH aceita só estes 4. Pausado/Pend. cancelamento/Aguard. pagamento têm fluxo
-                                    próprio (Retomar, Cobrar/Isentar multa, pagamento) e aparecem só como "atual". */}
+                                    próprio (Retomar, Cobrar/Isentar multa, pagamento) e aparecem só como "atual".
+                                    Equipe: só o atual + os status que a pessoa pode escolher (statusTargetsFor). */}
                                 {!EDITABLE_STATUSES.includes(editContract.status) && (
                                     <option value={editContract.status} disabled>{getMeta(CONTRACT_STATUS_META, editContract.status).label} (atual)</option>
                                 )}
-                                {EDITABLE_STATUSES.map(s => (
+                                {EDITABLE_STATUSES.filter(s => s === editContract.status || editTargets.includes(s)).map(s => (
                                     <option key={s} value={s}
                                         disabled={s === 'ACTIVE' && editContract.status !== 'ACTIVE' && isClientDeleted(editContract)}>
                                         {getMeta(CONTRACT_STATUS_META, s).label}
                                     </option>
                                 ))}
                             </select>
+                            {editPendingLocked && (
+                                <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', margin: '6px 0 0' }}>
+                                    O cliente pediu o cancelamento: mudar o status decide a multa e exige a permissão “Decidir pedido de cancelamento (cobrar ou isentar multa)”.
+                                </p>
+                            )}
                         </div>
                         <div className="form-group"><label className="form-label" htmlFor={`${uid}-end-date`}>Data de Término</label>
-                            <input id={`${uid}-end-date`} type="date" className="form-input" value={editForm.endDate} onChange={e => setEditForm({ ...editForm, endDate: e.target.value })} />
+                            <input id={`${uid}-end-date`} type="date" className="form-input" value={editForm.endDate} disabled={!canEdit}
+                                style={lockedField(!canEdit)}
+                                onChange={e => setEditForm({ ...editForm, endDate: e.target.value })} />
                         </div>
                         {editContract.type === 'FLEX' && (
                             <div className="form-group"><label className="form-label" htmlFor={`${uid}-flex-credits`}>Créditos Flex Restantes</label>
                                 <input id={`${uid}-flex-credits`} type="number" className="form-input" min={0} value={editForm.flexCreditsRemaining}
-                                    disabled={isClientDeleted(editContract)}
+                                    disabled={!editCreditsOk} style={lockedField(!editCreditsOk)}
                                     onChange={e => setEditForm({ ...editForm, flexCreditsRemaining: e.target.value })} />
                             </div>
                         )}
                         <div className="form-group">
                             <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: 5 }} htmlFor={`${uid}-contract-url`}><Link2 size={13} aria-hidden="true" /> Link do Contrato Digital</label>
-                            <input id={`${uid}-contract-url`} className="form-input" type="url" placeholder="https://..." value={editForm.contractUrl} onChange={e => setEditForm({ ...editForm, contractUrl: e.target.value })} />
+                            <input id={`${uid}-contract-url`} className="form-input" type="url" placeholder="https://..." value={editForm.contractUrl} disabled={!canEdit}
+                                style={lockedField(!canEdit)}
+                                onChange={e => setEditForm({ ...editForm, contractUrl: e.target.value })} />
                         </div>
                         <div className="form-group">
                             <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: 5 }} htmlFor={`${uid}-payment-method`}><CreditCard size={13} aria-hidden="true" /> Forma de Pagamento</label>
-                            <select id={`${uid}-payment-method`} className="form-select" value={editForm.paymentMethod} onChange={e => setEditForm({ ...editForm, paymentMethod: e.target.value })}>
+                            <select id={`${uid}-payment-method`} className="form-select" value={editForm.paymentMethod} disabled={!canEdit}
+                                style={lockedField(!canEdit)}
+                                onChange={e => setEditForm({ ...editForm, paymentMethod: e.target.value })}>
                                 <option value="">-- Não definido --</option>
                                 {editMethodOptions.map(pm => (
                                     <option key={pm.key} value={pm.key}>{pm.emoji} {pm.label}</option>

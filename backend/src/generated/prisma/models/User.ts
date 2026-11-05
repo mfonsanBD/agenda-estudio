@@ -355,6 +355,7 @@ export type UserWhereInput = {
   notifications?: Prisma.NotificationListRelationFilter
   couponEligibilities?: Prisma.CouponEligibleUserListRelationFilter
   couponRedemptions?: Prisma.CouponRedemptionListRelationFilter
+  staffProfile?: Prisma.XOR<Prisma.StaffProfileNullableScalarRelationFilter, Prisma.StaffProfileWhereInput> | null
 }
 
 export type UserOrderByWithRelationInput = {
@@ -393,6 +394,7 @@ export type UserOrderByWithRelationInput = {
   notifications?: Prisma.NotificationOrderByRelationAggregateInput
   couponEligibilities?: Prisma.CouponEligibleUserOrderByRelationAggregateInput
   couponRedemptions?: Prisma.CouponRedemptionOrderByRelationAggregateInput
+  staffProfile?: Prisma.StaffProfileOrderByWithRelationInput
 }
 
 export type UserWhereUniqueInput = Prisma.AtLeast<{
@@ -434,6 +436,7 @@ export type UserWhereUniqueInput = Prisma.AtLeast<{
   notifications?: Prisma.NotificationListRelationFilter
   couponEligibilities?: Prisma.CouponEligibleUserListRelationFilter
   couponRedemptions?: Prisma.CouponRedemptionListRelationFilter
+  staffProfile?: Prisma.XOR<Prisma.StaffProfileNullableScalarRelationFilter, Prisma.StaffProfileWhereInput> | null
 }, "id" | "email" | "googleId" | "cpfCnpj" | "stripeCustomerId">
 
 export type UserOrderByWithAggregationInput = {
@@ -536,6 +539,7 @@ export type UserCreateInput = {
   notifications?: Prisma.NotificationCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileCreateNestedOneWithoutUserInput
 }
 
 export type UserUncheckedCreateInput = {
@@ -574,6 +578,7 @@ export type UserUncheckedCreateInput = {
   notifications?: Prisma.NotificationUncheckedCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileUncheckedCreateNestedOneWithoutUserInput
 }
 
 export type UserUpdateInput = {
@@ -612,6 +617,7 @@ export type UserUpdateInput = {
   notifications?: Prisma.NotificationUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUpdateOneWithoutUserNestedInput
 }
 
 export type UserUncheckedUpdateInput = {
@@ -650,6 +656,7 @@ export type UserUncheckedUpdateInput = {
   notifications?: Prisma.NotificationUncheckedUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUncheckedUpdateOneWithoutUserNestedInput
 }
 
 export type UserCreateManyInput = {
@@ -870,6 +877,20 @@ export type DateTimeFieldUpdateOperationsInput = {
   set?: Date | string
 }
 
+export type UserCreateNestedOneWithoutStaffProfileInput = {
+  create?: Prisma.XOR<Prisma.UserCreateWithoutStaffProfileInput, Prisma.UserUncheckedCreateWithoutStaffProfileInput>
+  connectOrCreate?: Prisma.UserCreateOrConnectWithoutStaffProfileInput
+  connect?: Prisma.UserWhereUniqueInput
+}
+
+export type UserUpdateOneRequiredWithoutStaffProfileNestedInput = {
+  create?: Prisma.XOR<Prisma.UserCreateWithoutStaffProfileInput, Prisma.UserUncheckedCreateWithoutStaffProfileInput>
+  connectOrCreate?: Prisma.UserCreateOrConnectWithoutStaffProfileInput
+  upsert?: Prisma.UserUpsertWithoutStaffProfileInput
+  connect?: Prisma.UserWhereUniqueInput
+  update?: Prisma.XOR<Prisma.XOR<Prisma.UserUpdateToOneWithWhereWithoutStaffProfileInput, Prisma.UserUpdateWithoutStaffProfileInput>, Prisma.UserUncheckedUpdateWithoutStaffProfileInput>
+}
+
 export type UserCreateNestedOneWithoutPushSubscriptionsInput = {
   create?: Prisma.XOR<Prisma.UserCreateWithoutPushSubscriptionsInput, Prisma.UserUncheckedCreateWithoutPushSubscriptionsInput>
   connectOrCreate?: Prisma.UserCreateOrConnectWithoutPushSubscriptionsInput
@@ -996,6 +1017,174 @@ export type UserUpdateOneRequiredWithoutNotificationsNestedInput = {
   update?: Prisma.XOR<Prisma.XOR<Prisma.UserUpdateToOneWithWhereWithoutNotificationsInput, Prisma.UserUpdateWithoutNotificationsInput>, Prisma.UserUncheckedUpdateWithoutNotificationsInput>
 }
 
+export type UserCreateWithoutStaffProfileInput = {
+  id?: string
+  email?: string | null
+  passwordHash?: string | null
+  name: string
+  phone?: string | null
+  googleId?: string | null
+  role?: $Enums.Role
+  photoUrl?: string | null
+  notes?: string | null
+  cpfCnpj?: string | null
+  address?: string | null
+  addressNumber?: string | null
+  complement?: string | null
+  neighborhood?: string | null
+  city?: string | null
+  state?: string | null
+  zipCode?: string | null
+  tags?: Prisma.UserCreatetagsInput | string[]
+  socialLinks?: string | null
+  clientStatus?: string
+  stripeCustomerId?: string | null
+  autoChargeEnabled?: boolean
+  essentialNotificationsOnly?: boolean
+  deletedAt?: Date | string | null
+  createdAt?: Date | string
+  updatedAt?: Date | string
+  bookings?: Prisma.BookingCreateNestedManyWithoutUserInput
+  contracts?: Prisma.ContractCreateNestedManyWithoutUserInput
+  payments?: Prisma.PaymentCreateNestedManyWithoutUserInput
+  blockedSlots?: Prisma.BlockedSlotCreateNestedManyWithoutCreatorInput
+  savedPaymentMethods?: Prisma.SavedPaymentMethodCreateNestedManyWithoutUserInput
+  pushSubscriptions?: Prisma.PushSubscriptionCreateNestedManyWithoutUserInput
+  notifications?: Prisma.NotificationCreateNestedManyWithoutUserInput
+  couponEligibilities?: Prisma.CouponEligibleUserCreateNestedManyWithoutUserInput
+  couponRedemptions?: Prisma.CouponRedemptionCreateNestedManyWithoutUserInput
+}
+
+export type UserUncheckedCreateWithoutStaffProfileInput = {
+  id?: string
+  email?: string | null
+  passwordHash?: string | null
+  name: string
+  phone?: string | null
+  googleId?: string | null
+  role?: $Enums.Role
+  photoUrl?: string | null
+  notes?: string | null
+  cpfCnpj?: string | null
+  address?: string | null
+  addressNumber?: string | null
+  complement?: string | null
+  neighborhood?: string | null
+  city?: string | null
+  state?: string | null
+  zipCode?: string | null
+  tags?: Prisma.UserCreatetagsInput | string[]
+  socialLinks?: string | null
+  clientStatus?: string
+  stripeCustomerId?: string | null
+  autoChargeEnabled?: boolean
+  essentialNotificationsOnly?: boolean
+  deletedAt?: Date | string | null
+  createdAt?: Date | string
+  updatedAt?: Date | string
+  bookings?: Prisma.BookingUncheckedCreateNestedManyWithoutUserInput
+  contracts?: Prisma.ContractUncheckedCreateNestedManyWithoutUserInput
+  payments?: Prisma.PaymentUncheckedCreateNestedManyWithoutUserInput
+  blockedSlots?: Prisma.BlockedSlotUncheckedCreateNestedManyWithoutCreatorInput
+  savedPaymentMethods?: Prisma.SavedPaymentMethodUncheckedCreateNestedManyWithoutUserInput
+  pushSubscriptions?: Prisma.PushSubscriptionUncheckedCreateNestedManyWithoutUserInput
+  notifications?: Prisma.NotificationUncheckedCreateNestedManyWithoutUserInput
+  couponEligibilities?: Prisma.CouponEligibleUserUncheckedCreateNestedManyWithoutUserInput
+  couponRedemptions?: Prisma.CouponRedemptionUncheckedCreateNestedManyWithoutUserInput
+}
+
+export type UserCreateOrConnectWithoutStaffProfileInput = {
+  where: Prisma.UserWhereUniqueInput
+  create: Prisma.XOR<Prisma.UserCreateWithoutStaffProfileInput, Prisma.UserUncheckedCreateWithoutStaffProfileInput>
+}
+
+export type UserUpsertWithoutStaffProfileInput = {
+  update: Prisma.XOR<Prisma.UserUpdateWithoutStaffProfileInput, Prisma.UserUncheckedUpdateWithoutStaffProfileInput>
+  create: Prisma.XOR<Prisma.UserCreateWithoutStaffProfileInput, Prisma.UserUncheckedCreateWithoutStaffProfileInput>
+  where?: Prisma.UserWhereInput
+}
+
+export type UserUpdateToOneWithWhereWithoutStaffProfileInput = {
+  where?: Prisma.UserWhereInput
+  data: Prisma.XOR<Prisma.UserUpdateWithoutStaffProfileInput, Prisma.UserUncheckedUpdateWithoutStaffProfileInput>
+}
+
+export type UserUpdateWithoutStaffProfileInput = {
+  id?: Prisma.StringFieldUpdateOperationsInput | string
+  email?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  passwordHash?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  name?: Prisma.StringFieldUpdateOperationsInput | string
+  phone?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  googleId?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  role?: Prisma.EnumRoleFieldUpdateOperationsInput | $Enums.Role
+  photoUrl?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  notes?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  cpfCnpj?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  address?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  addressNumber?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  complement?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  neighborhood?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  city?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  state?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  zipCode?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  tags?: Prisma.UserUpdatetagsInput | string[]
+  socialLinks?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  clientStatus?: Prisma.StringFieldUpdateOperationsInput | string
+  stripeCustomerId?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  autoChargeEnabled?: Prisma.BoolFieldUpdateOperationsInput | boolean
+  essentialNotificationsOnly?: Prisma.BoolFieldUpdateOperationsInput | boolean
+  deletedAt?: Prisma.NullableDateTimeFieldUpdateOperationsInput | Date | string | null
+  createdAt?: Prisma.DateTimeFieldUpdateOperationsInput | Date | string
+  updatedAt?: Prisma.DateTimeFieldUpdateOperationsInput | Date | string
+  bookings?: Prisma.BookingUpdateManyWithoutUserNestedInput
+  contracts?: Prisma.ContractUpdateManyWithoutUserNestedInput
+  payments?: Prisma.PaymentUpdateManyWithoutUserNestedInput
+  blockedSlots?: Prisma.BlockedSlotUpdateManyWithoutCreatorNestedInput
+  savedPaymentMethods?: Prisma.SavedPaymentMethodUpdateManyWithoutUserNestedInput
+  pushSubscriptions?: Prisma.PushSubscriptionUpdateManyWithoutUserNestedInput
+  notifications?: Prisma.NotificationUpdateManyWithoutUserNestedInput
+  couponEligibilities?: Prisma.CouponEligibleUserUpdateManyWithoutUserNestedInput
+  couponRedemptions?: Prisma.CouponRedemptionUpdateManyWithoutUserNestedInput
+}
+
+export type UserUncheckedUpdateWithoutStaffProfileInput = {
+  id?: Prisma.StringFieldUpdateOperationsInput | string
+  email?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  passwordHash?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  name?: Prisma.StringFieldUpdateOperationsInput | string
+  phone?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  googleId?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  role?: Prisma.EnumRoleFieldUpdateOperationsInput | $Enums.Role
+  photoUrl?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  notes?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  cpfCnpj?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  address?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  addressNumber?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  complement?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  neighborhood?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  city?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  state?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  zipCode?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  tags?: Prisma.UserUpdatetagsInput | string[]
+  socialLinks?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  clientStatus?: Prisma.StringFieldUpdateOperationsInput | string
+  stripeCustomerId?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+  autoChargeEnabled?: Prisma.BoolFieldUpdateOperationsInput | boolean
+  essentialNotificationsOnly?: Prisma.BoolFieldUpdateOperationsInput | boolean
+  deletedAt?: Prisma.NullableDateTimeFieldUpdateOperationsInput | Date | string | null
+  createdAt?: Prisma.DateTimeFieldUpdateOperationsInput | Date | string
+  updatedAt?: Prisma.DateTimeFieldUpdateOperationsInput | Date | string
+  bookings?: Prisma.BookingUncheckedUpdateManyWithoutUserNestedInput
+  contracts?: Prisma.ContractUncheckedUpdateManyWithoutUserNestedInput
+  payments?: Prisma.PaymentUncheckedUpdateManyWithoutUserNestedInput
+  blockedSlots?: Prisma.BlockedSlotUncheckedUpdateManyWithoutCreatorNestedInput
+  savedPaymentMethods?: Prisma.SavedPaymentMethodUncheckedUpdateManyWithoutUserNestedInput
+  pushSubscriptions?: Prisma.PushSubscriptionUncheckedUpdateManyWithoutUserNestedInput
+  notifications?: Prisma.NotificationUncheckedUpdateManyWithoutUserNestedInput
+  couponEligibilities?: Prisma.CouponEligibleUserUncheckedUpdateManyWithoutUserNestedInput
+  couponRedemptions?: Prisma.CouponRedemptionUncheckedUpdateManyWithoutUserNestedInput
+}
+
 export type UserCreateWithoutPushSubscriptionsInput = {
   id?: string
   email?: string | null
@@ -1031,6 +1220,7 @@ export type UserCreateWithoutPushSubscriptionsInput = {
   notifications?: Prisma.NotificationCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileCreateNestedOneWithoutUserInput
 }
 
 export type UserUncheckedCreateWithoutPushSubscriptionsInput = {
@@ -1068,6 +1258,7 @@ export type UserUncheckedCreateWithoutPushSubscriptionsInput = {
   notifications?: Prisma.NotificationUncheckedCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileUncheckedCreateNestedOneWithoutUserInput
 }
 
 export type UserCreateOrConnectWithoutPushSubscriptionsInput = {
@@ -1121,6 +1312,7 @@ export type UserUpdateWithoutPushSubscriptionsInput = {
   notifications?: Prisma.NotificationUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUpdateOneWithoutUserNestedInput
 }
 
 export type UserUncheckedUpdateWithoutPushSubscriptionsInput = {
@@ -1158,6 +1350,7 @@ export type UserUncheckedUpdateWithoutPushSubscriptionsInput = {
   notifications?: Prisma.NotificationUncheckedUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUncheckedUpdateOneWithoutUserNestedInput
 }
 
 export type UserCreateWithoutContractsInput = {
@@ -1195,6 +1388,7 @@ export type UserCreateWithoutContractsInput = {
   notifications?: Prisma.NotificationCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileCreateNestedOneWithoutUserInput
 }
 
 export type UserUncheckedCreateWithoutContractsInput = {
@@ -1232,6 +1426,7 @@ export type UserUncheckedCreateWithoutContractsInput = {
   notifications?: Prisma.NotificationUncheckedCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileUncheckedCreateNestedOneWithoutUserInput
 }
 
 export type UserCreateOrConnectWithoutContractsInput = {
@@ -1285,6 +1480,7 @@ export type UserUpdateWithoutContractsInput = {
   notifications?: Prisma.NotificationUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUpdateOneWithoutUserNestedInput
 }
 
 export type UserUncheckedUpdateWithoutContractsInput = {
@@ -1322,6 +1518,7 @@ export type UserUncheckedUpdateWithoutContractsInput = {
   notifications?: Prisma.NotificationUncheckedUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUncheckedUpdateOneWithoutUserNestedInput
 }
 
 export type UserCreateWithoutBookingsInput = {
@@ -1359,6 +1556,7 @@ export type UserCreateWithoutBookingsInput = {
   notifications?: Prisma.NotificationCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileCreateNestedOneWithoutUserInput
 }
 
 export type UserUncheckedCreateWithoutBookingsInput = {
@@ -1396,6 +1594,7 @@ export type UserUncheckedCreateWithoutBookingsInput = {
   notifications?: Prisma.NotificationUncheckedCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileUncheckedCreateNestedOneWithoutUserInput
 }
 
 export type UserCreateOrConnectWithoutBookingsInput = {
@@ -1449,6 +1648,7 @@ export type UserUpdateWithoutBookingsInput = {
   notifications?: Prisma.NotificationUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUpdateOneWithoutUserNestedInput
 }
 
 export type UserUncheckedUpdateWithoutBookingsInput = {
@@ -1486,6 +1686,7 @@ export type UserUncheckedUpdateWithoutBookingsInput = {
   notifications?: Prisma.NotificationUncheckedUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUncheckedUpdateOneWithoutUserNestedInput
 }
 
 export type UserCreateWithoutPaymentsInput = {
@@ -1523,6 +1724,7 @@ export type UserCreateWithoutPaymentsInput = {
   notifications?: Prisma.NotificationCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileCreateNestedOneWithoutUserInput
 }
 
 export type UserUncheckedCreateWithoutPaymentsInput = {
@@ -1560,6 +1762,7 @@ export type UserUncheckedCreateWithoutPaymentsInput = {
   notifications?: Prisma.NotificationUncheckedCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileUncheckedCreateNestedOneWithoutUserInput
 }
 
 export type UserCreateOrConnectWithoutPaymentsInput = {
@@ -1613,6 +1816,7 @@ export type UserUpdateWithoutPaymentsInput = {
   notifications?: Prisma.NotificationUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUpdateOneWithoutUserNestedInput
 }
 
 export type UserUncheckedUpdateWithoutPaymentsInput = {
@@ -1650,6 +1854,7 @@ export type UserUncheckedUpdateWithoutPaymentsInput = {
   notifications?: Prisma.NotificationUncheckedUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUncheckedUpdateOneWithoutUserNestedInput
 }
 
 export type UserCreateWithoutCouponEligibilitiesInput = {
@@ -1687,6 +1892,7 @@ export type UserCreateWithoutCouponEligibilitiesInput = {
   pushSubscriptions?: Prisma.PushSubscriptionCreateNestedManyWithoutUserInput
   notifications?: Prisma.NotificationCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileCreateNestedOneWithoutUserInput
 }
 
 export type UserUncheckedCreateWithoutCouponEligibilitiesInput = {
@@ -1724,6 +1930,7 @@ export type UserUncheckedCreateWithoutCouponEligibilitiesInput = {
   pushSubscriptions?: Prisma.PushSubscriptionUncheckedCreateNestedManyWithoutUserInput
   notifications?: Prisma.NotificationUncheckedCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileUncheckedCreateNestedOneWithoutUserInput
 }
 
 export type UserCreateOrConnectWithoutCouponEligibilitiesInput = {
@@ -1777,6 +1984,7 @@ export type UserUpdateWithoutCouponEligibilitiesInput = {
   pushSubscriptions?: Prisma.PushSubscriptionUpdateManyWithoutUserNestedInput
   notifications?: Prisma.NotificationUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUpdateOneWithoutUserNestedInput
 }
 
 export type UserUncheckedUpdateWithoutCouponEligibilitiesInput = {
@@ -1814,6 +2022,7 @@ export type UserUncheckedUpdateWithoutCouponEligibilitiesInput = {
   pushSubscriptions?: Prisma.PushSubscriptionUncheckedUpdateManyWithoutUserNestedInput
   notifications?: Prisma.NotificationUncheckedUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUncheckedUpdateOneWithoutUserNestedInput
 }
 
 export type UserCreateWithoutCouponRedemptionsInput = {
@@ -1851,6 +2060,7 @@ export type UserCreateWithoutCouponRedemptionsInput = {
   pushSubscriptions?: Prisma.PushSubscriptionCreateNestedManyWithoutUserInput
   notifications?: Prisma.NotificationCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileCreateNestedOneWithoutUserInput
 }
 
 export type UserUncheckedCreateWithoutCouponRedemptionsInput = {
@@ -1888,6 +2098,7 @@ export type UserUncheckedCreateWithoutCouponRedemptionsInput = {
   pushSubscriptions?: Prisma.PushSubscriptionUncheckedCreateNestedManyWithoutUserInput
   notifications?: Prisma.NotificationUncheckedCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileUncheckedCreateNestedOneWithoutUserInput
 }
 
 export type UserCreateOrConnectWithoutCouponRedemptionsInput = {
@@ -1941,6 +2152,7 @@ export type UserUpdateWithoutCouponRedemptionsInput = {
   pushSubscriptions?: Prisma.PushSubscriptionUpdateManyWithoutUserNestedInput
   notifications?: Prisma.NotificationUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUpdateOneWithoutUserNestedInput
 }
 
 export type UserUncheckedUpdateWithoutCouponRedemptionsInput = {
@@ -1978,6 +2190,7 @@ export type UserUncheckedUpdateWithoutCouponRedemptionsInput = {
   pushSubscriptions?: Prisma.PushSubscriptionUncheckedUpdateManyWithoutUserNestedInput
   notifications?: Prisma.NotificationUncheckedUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUncheckedUpdateOneWithoutUserNestedInput
 }
 
 export type UserCreateWithoutSavedPaymentMethodsInput = {
@@ -2015,6 +2228,7 @@ export type UserCreateWithoutSavedPaymentMethodsInput = {
   notifications?: Prisma.NotificationCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileCreateNestedOneWithoutUserInput
 }
 
 export type UserUncheckedCreateWithoutSavedPaymentMethodsInput = {
@@ -2052,6 +2266,7 @@ export type UserUncheckedCreateWithoutSavedPaymentMethodsInput = {
   notifications?: Prisma.NotificationUncheckedCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileUncheckedCreateNestedOneWithoutUserInput
 }
 
 export type UserCreateOrConnectWithoutSavedPaymentMethodsInput = {
@@ -2105,6 +2320,7 @@ export type UserUpdateWithoutSavedPaymentMethodsInput = {
   notifications?: Prisma.NotificationUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUpdateOneWithoutUserNestedInput
 }
 
 export type UserUncheckedUpdateWithoutSavedPaymentMethodsInput = {
@@ -2142,6 +2358,7 @@ export type UserUncheckedUpdateWithoutSavedPaymentMethodsInput = {
   notifications?: Prisma.NotificationUncheckedUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUncheckedUpdateOneWithoutUserNestedInput
 }
 
 export type UserCreateWithoutBlockedSlotsInput = {
@@ -2179,6 +2396,7 @@ export type UserCreateWithoutBlockedSlotsInput = {
   notifications?: Prisma.NotificationCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileCreateNestedOneWithoutUserInput
 }
 
 export type UserUncheckedCreateWithoutBlockedSlotsInput = {
@@ -2216,6 +2434,7 @@ export type UserUncheckedCreateWithoutBlockedSlotsInput = {
   notifications?: Prisma.NotificationUncheckedCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileUncheckedCreateNestedOneWithoutUserInput
 }
 
 export type UserCreateOrConnectWithoutBlockedSlotsInput = {
@@ -2269,6 +2488,7 @@ export type UserUpdateWithoutBlockedSlotsInput = {
   notifications?: Prisma.NotificationUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUpdateOneWithoutUserNestedInput
 }
 
 export type UserUncheckedUpdateWithoutBlockedSlotsInput = {
@@ -2306,6 +2526,7 @@ export type UserUncheckedUpdateWithoutBlockedSlotsInput = {
   notifications?: Prisma.NotificationUncheckedUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUncheckedUpdateOneWithoutUserNestedInput
 }
 
 export type UserCreateWithoutNotificationsInput = {
@@ -2343,6 +2564,7 @@ export type UserCreateWithoutNotificationsInput = {
   pushSubscriptions?: Prisma.PushSubscriptionCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileCreateNestedOneWithoutUserInput
 }
 
 export type UserUncheckedCreateWithoutNotificationsInput = {
@@ -2380,6 +2602,7 @@ export type UserUncheckedCreateWithoutNotificationsInput = {
   pushSubscriptions?: Prisma.PushSubscriptionUncheckedCreateNestedManyWithoutUserInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedCreateNestedManyWithoutUserInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedCreateNestedManyWithoutUserInput
+  staffProfile?: Prisma.StaffProfileUncheckedCreateNestedOneWithoutUserInput
 }
 
 export type UserCreateOrConnectWithoutNotificationsInput = {
@@ -2433,6 +2656,7 @@ export type UserUpdateWithoutNotificationsInput = {
   pushSubscriptions?: Prisma.PushSubscriptionUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUpdateOneWithoutUserNestedInput
 }
 
 export type UserUncheckedUpdateWithoutNotificationsInput = {
@@ -2470,6 +2694,7 @@ export type UserUncheckedUpdateWithoutNotificationsInput = {
   pushSubscriptions?: Prisma.PushSubscriptionUncheckedUpdateManyWithoutUserNestedInput
   couponEligibilities?: Prisma.CouponEligibleUserUncheckedUpdateManyWithoutUserNestedInput
   couponRedemptions?: Prisma.CouponRedemptionUncheckedUpdateManyWithoutUserNestedInput
+  staffProfile?: Prisma.StaffProfileUncheckedUpdateOneWithoutUserNestedInput
 }
 
 
@@ -2611,6 +2836,7 @@ export type UserSelect<ExtArgs extends runtime.Types.Extensions.InternalArgs = r
   notifications?: boolean | Prisma.User$notificationsArgs<ExtArgs>
   couponEligibilities?: boolean | Prisma.User$couponEligibilitiesArgs<ExtArgs>
   couponRedemptions?: boolean | Prisma.User$couponRedemptionsArgs<ExtArgs>
+  staffProfile?: boolean | Prisma.User$staffProfileArgs<ExtArgs>
   _count?: boolean | Prisma.UserCountOutputTypeDefaultArgs<ExtArgs>
 }, ExtArgs["result"]["user"]>
 
@@ -2712,6 +2938,7 @@ export type UserInclude<ExtArgs extends runtime.Types.Extensions.InternalArgs = 
   notifications?: boolean | Prisma.User$notificationsArgs<ExtArgs>
   couponEligibilities?: boolean | Prisma.User$couponEligibilitiesArgs<ExtArgs>
   couponRedemptions?: boolean | Prisma.User$couponRedemptionsArgs<ExtArgs>
+  staffProfile?: boolean | Prisma.User$staffProfileArgs<ExtArgs>
   _count?: boolean | Prisma.UserCountOutputTypeDefaultArgs<ExtArgs>
 }
 export type UserIncludeCreateManyAndReturn<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {}
@@ -2729,6 +2956,7 @@ export type $UserPayload<ExtArgs extends runtime.Types.Extensions.InternalArgs =
     notifications: Prisma.$NotificationPayload<ExtArgs>[]
     couponEligibilities: Prisma.$CouponEligibleUserPayload<ExtArgs>[]
     couponRedemptions: Prisma.$CouponRedemptionPayload<ExtArgs>[]
+    staffProfile: Prisma.$StaffProfilePayload<ExtArgs> | null
   }
   scalars: runtime.Types.Extensions.GetPayloadResult<{
     id: string
@@ -3160,6 +3388,7 @@ export interface Prisma__UserClient<T, Null = never, ExtArgs extends runtime.Typ
   notifications<T extends Prisma.User$notificationsArgs<ExtArgs> = {}>(args?: Prisma.Subset<T, Prisma.User$notificationsArgs<ExtArgs>>): Prisma.PrismaPromise<runtime.Types.Result.GetResult<Prisma.$NotificationPayload<ExtArgs>, T, "findMany", GlobalOmitOptions> | Null>
   couponEligibilities<T extends Prisma.User$couponEligibilitiesArgs<ExtArgs> = {}>(args?: Prisma.Subset<T, Prisma.User$couponEligibilitiesArgs<ExtArgs>>): Prisma.PrismaPromise<runtime.Types.Result.GetResult<Prisma.$CouponEligibleUserPayload<ExtArgs>, T, "findMany", GlobalOmitOptions> | Null>
   couponRedemptions<T extends Prisma.User$couponRedemptionsArgs<ExtArgs> = {}>(args?: Prisma.Subset<T, Prisma.User$couponRedemptionsArgs<ExtArgs>>): Prisma.PrismaPromise<runtime.Types.Result.GetResult<Prisma.$CouponRedemptionPayload<ExtArgs>, T, "findMany", GlobalOmitOptions> | Null>
+  staffProfile<T extends Prisma.User$staffProfileArgs<ExtArgs> = {}>(args?: Prisma.Subset<T, Prisma.User$staffProfileArgs<ExtArgs>>): Prisma.Prisma__StaffProfileClient<runtime.Types.Result.GetResult<Prisma.$StaffProfilePayload<ExtArgs>, T, "findUniqueOrThrow", GlobalOmitOptions> | null, null, ExtArgs, GlobalOmitOptions>
   /**
    * Attaches callbacks for the resolution and/or rejection of the Promise.
    * @param onfulfilled The callback to execute when the Promise is resolved.
@@ -3821,6 +4050,25 @@ export type User$couponRedemptionsArgs<ExtArgs extends runtime.Types.Extensions.
   take?: number
   skip?: number
   distinct?: Prisma.CouponRedemptionScalarFieldEnum | Prisma.CouponRedemptionScalarFieldEnum[]
+}
+
+/**
+ * User.staffProfile
+ */
+export type User$staffProfileArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
+  /**
+   * Select specific fields to fetch from the StaffProfile
+   */
+  select?: Prisma.StaffProfileSelect<ExtArgs> | null
+  /**
+   * Omit specific fields from the StaffProfile
+   */
+  omit?: Prisma.StaffProfileOmit<ExtArgs> | null
+  /**
+   * Choose, which related nodes to fetch as well
+   */
+  include?: Prisma.StaffProfileInclude<ExtArgs> | null
+  where?: Prisma.StaffProfileWhereInput
 }
 
 /**

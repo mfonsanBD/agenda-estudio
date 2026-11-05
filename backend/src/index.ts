@@ -30,6 +30,7 @@ import webhookRoutes from './modules/webhooks/routes.js';
 import stripeRoutes from './modules/stripe/routes.js';
 import pushRoutes from './modules/push/routes.js';
 import couponRoutes from './modules/coupons/routes.js';
+import staffRoutes from './modules/staff/routes.js';
 
 import { prisma } from './lib/prisma.js';
 import { redis } from './lib/redis.js';
@@ -171,6 +172,16 @@ const broadcastLimiter = rateLimit({
     legacyHeaders: false,
 });
 
+// "Enviar acesso" da tela Equipe (e-mail para um membro): limite leve contra disparo repetido.
+const staffAccessLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    store: rlStore('rl:staff-access:'),
+    message: { error: 'Muitos e-mails de acesso enviados. Aguarde alguns minutos.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
 // ─── Body Parsing ───────────────────────────────────────
 
 // Stripe webhooks need the raw body for signature verification.
@@ -211,6 +222,7 @@ app.use('/api/contracts/:id/client-renew', paymentLimiter);
 app.use('/api/bookings/:id/complete-payment', paymentLimiter);
 app.use('/api/coupons/validate', couponLimiter);
 app.use('/api/notifications/admin/broadcast', broadcastLimiter);
+app.use('/api/staff/:id/send-access', staffAccessLimiter);
 app.use('/api', apiLimiter);
 
 app.use('/api/auth', authRoutes);
@@ -229,6 +241,7 @@ app.use('/api/webhooks', webhookRoutes);
 app.use('/api/stripe', stripeRoutes);
 app.use('/api/push', pushRoutes);
 app.use('/api/coupons', couponRoutes);
+app.use('/api/staff', staffRoutes);
 
 // ─── Serve Frontend (Production) ────────────────────────
 

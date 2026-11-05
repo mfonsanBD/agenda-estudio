@@ -12,8 +12,9 @@ import { TIER_META, getMeta } from '../constants/adminMeta';
 import { formatBRL } from '../utils/format';
 import { todayStrSaoPaulo } from '../utils/time';
 import { getErrorMessage } from '../utils/errors';
-import { buildReportCsv, reportCsvFileName } from '../utils/reportCsv';
+import { buildReportCsv, reportCsvFileName, csvRow, REPORT_CSV_BOM, REPORT_CSV_EOL, REPORT_CSV_SEPARATOR } from '../utils/reportCsv';
 import { useUI } from '../context/UIContext';
+import { usePermission } from '../hooks/usePermission';
 import Tooltip from '../components/ui/Tooltip';
 
 function formatBRLCompact(cents: number): string {
@@ -47,6 +48,58 @@ function downloadTextFile(fileName: string, content: string, mime: string) {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+/** Lê o CSV de buildReportCsv (`;`, aspas RFC 4180, registros em CRLF; quebra de linha só dentro de aspas). */
+function parseReportCsv(text: string): string[][] {
+    const rows: string[][] = [];
+    let row: string[] = [];
+    let cell = '';
+    let quoted = false;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (quoted) {
+            if (ch === '"') {
+                if (text[i + 1] === '"') { cell += '"'; i++; } else quoted = false;
+            } else cell += ch;
+        } else if (ch === '"') quoted = true;
+        else if (ch === REPORT_CSV_SEPARATOR) { row.push(cell); cell = ''; }
+        else if (ch === '\r' && text[i + 1] === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; i++; }
+        else cell += ch;
+    }
+    if (cell !== '' || row.length > 0) { row.push(cell); rows.push(row); }
+    return rows;
+}
+
+/**
+ * CSV SEM receita — equipe sem "Ver o financeiro e a receita" (D2/resposta 3 do dono). O servidor já não
+ * manda os campos de receita, então o arquivo não pode sair com "R$ 0,00" no lugar deles. Parte do CSV
+ * completo (buildReportCsv continua sendo a fonte única do formato) e, em cada seção (linha em branco →
+ * título → cabeçalho → linhas): tira a coluna cujo cabeçalho é "Receita" (faixas e ranking, inclusive o
+ * TOTAL), a linha-indicador "Receita" do resumo, e troca "POR RECEITA" por "POR SESSÕES" no título do
+ * ranking (é a ordem que o servidor manda sem a permissão). O resto do arquivo sai idêntico.
+ */
+function stripRevenueFromReportCsv(csv: string): string {
+    const body = csv.startsWith(REPORT_CSV_BOM) ? csv.slice(REPORT_CSV_BOM.length) : csv;
+    const out: string[][] = [];
+    let pos = -1;       // -1 = cabeçalho do arquivo; 0 = título da seção; 1 = cabeçalho de colunas; 2+ = linhas
+    let dropCol = -1;   // coluna "Receita" da seção atual (-1 = nenhuma)
+    for (const row of parseReportCsv(body)) {
+        if (row.length === 1 && row[0] === '') { pos = 0; dropCol = -1; out.push(row); continue; }
+        if (pos === -1) { out.push(row); continue; }
+        if (pos === 0) {
+            out.push(row.map(c => c.replace('POR RECEITA', 'POR SESSÕES')));
+        } else if (pos === 1) {
+            dropCol = row.indexOf('Receita');
+            out.push(dropCol >= 0 ? row.filter((_, i) => i !== dropCol) : row);
+        } else if (dropCol < 0 && row[0] === 'Receita') {
+            // linha-indicador "Receita" do resumo: some inteira
+        } else {
+            out.push(dropCol >= 0 ? row.filter((_, i) => i !== dropCol) : row);
+        }
+        pos++;
+    }
+    return REPORT_CSV_BOM + out.map(r => csvRow(r)).join(REPORT_CSV_EOL) + REPORT_CSV_EOL;
+}
+
 function getDateRange(period: Period): { from: string; to: string } {
     // B29: derivar da data-calendário de São Paulo. Antes usava new Date().toISOString() (UTC), que
     // entre ~21h–24h SP retornava SP+1 e deslocava toda a janela 1 dia à frente.
@@ -61,6 +114,11 @@ function getDateRange(period: Period): { from: string; to: string } {
 export default function AdminReportsPage() {
     const navigate = useNavigate();
     const { showToast } = useUI();
+    // Equipe (D2): a página abre com relatorios.ver; a RECEITA (cartão, coluna do ranking, valores por faixa
+    // e no CSV) só com financeiro.ver — o servidor já não manda os campos sem ela. Perfil do cliente: clientes.ver.
+    const { can } = usePermission();
+    const canSeeRevenue = can('financeiro.ver');
+    const canOpenClient = can('clientes.ver');
     const [exporting, setExporting] = useState(false);
     const [summary, setSummary] = useState<ReportSummary | null>(null);
     const [slotOccupancy, setSlotOccupancy] = useState<SlotOccupancy[]>([]);
@@ -123,12 +181,18 @@ export default function AdminReportsPage() {
                 ranking: rankRes.ranking,
                 tierLabels: Object.fromEntries(Object.entries(TIER_META).map(([key, meta]) => [key, meta.label])),
             });
-            downloadTextFile(reportCsvFileName(range.from, range.to), csv, 'text/csv;charset=utf-8;');
+            // Sem financeiro.ver o arquivo sai sem as colunas/linha de receita (nunca "R$ 0,00" no lugar).
+            const file = canSeeRevenue ? csv : stripRevenueFromReportCsv(csv);
+            downloadTextFile(reportCsvFileName(range.from, range.to), file, 'text/csv;charset=utf-8;');
             showToast('Relatório exportado em CSV.');
         } catch (err: unknown) {
             showToast({ message: getErrorMessage(err) || 'Não foi possível exportar o relatório. Tente novamente.', type: 'error' });
         } finally { setExporting(false); }
     };
+
+    // Receita só aparece com a permissão E com o dado vindo do servidor (sem financeiro.ver ele não manda).
+    const showRevenue = canSeeRevenue && typeof summary?.totalRevenue === 'number';
+    const money = (cents: number | undefined, fmt: (c: number) => string) => (typeof cents === 'number' ? fmt(cents) : '—');
 
     if (loading) return <div><HeroSkeleton /><TableSkeleton rows={6} cols={7} /></div>;
 
@@ -198,11 +262,13 @@ export default function AdminReportsPage() {
                     <div className="admin-kpi-card__value">{summary.cancelledBookings}</div>
                     <div className="admin-kpi-card__caption">{summary.cancellationRate}%</div>
                 </div>
-                <div className="admin-kpi-card admin-kpi-card--success">
-                    <div className="admin-kpi-card__label" style={{ color: 'var(--success)' }}>Receita</div>
-                    <div className="admin-kpi-card__value admin-kpi-card__value--sm" style={{ color: 'var(--success)' }}>{formatBRLCompact(summary.totalRevenue)}</div>
-                    <div className="admin-kpi-card__caption">total acumulado</div>
-                </div>
+                {showRevenue && (
+                    <div className="admin-kpi-card admin-kpi-card--success">
+                        <div className="admin-kpi-card__label" style={{ color: 'var(--success)' }}>Receita</div>
+                        <div className="admin-kpi-card__value admin-kpi-card__value--sm" style={{ color: 'var(--success)' }}>{formatBRLCompact(summary.totalRevenue)}</div>
+                        <div className="admin-kpi-card__caption">total acumulado</div>
+                    </div>
+                )}
             </div>
 
             {/* ─── OCCUPANCY: Slot + Day ─── */}
@@ -280,7 +346,9 @@ export default function AdminReportsPage() {
                                     <div style={{ flex: 1 }}>
                                         <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
                                             <span style={{ fontSize: '0.8125rem', fontWeight: 700, color: meta.color }}>{meta.label}</span>
-                                            <span style={{ fontSize: '0.6875rem', color: 'var(--text-muted)' }}>{t.count} sessões · {formatBRLCompact(t.revenue)}</span>
+                                            <span style={{ fontSize: '0.6875rem', color: 'var(--text-muted)' }}>
+                                                {t.count} sessões{canSeeRevenue && typeof t.revenue === 'number' ? ` · ${formatBRLCompact(t.revenue)}` : ''}
+                                            </span>
                                         </div>
                                         <div style={{ height: 6, borderRadius: 3, background: 'rgba(255,255,255,0.04)', overflow: 'hidden' }}>
                                             <div style={{ height: '100%', borderRadius: 3, width: `${t.pct}%`, background: meta.color, transition: 'width 0.3s ease' }} />
@@ -332,7 +400,7 @@ export default function AdminReportsPage() {
                 <div style={{ padding: '20px 24px 0', marginBottom: '16px' }}>
                     <h3 style={{ fontSize: '0.8125rem', fontWeight: 700, color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '8px' }}>
                         <span style={{ width: 16, height: 2, background: 'var(--warning)', borderRadius: 1 }} />
-                        <Trophy size={15} aria-hidden="true" /> Ranking de Clientes — Top 10 por Receita
+                        <Trophy size={15} aria-hidden="true" /> Ranking de Clientes — Top 10 por {canSeeRevenue ? 'Receita' : 'Sessões'}
                     </h3>
                     <p style={{ fontSize: '0.6875rem', color: 'var(--text-muted)', margin: '6px 0 0' }}>
                         A tela mostra os 10 primeiros; o arquivo de “Exportar CSV” traz o ranking completo do período.
@@ -354,7 +422,7 @@ export default function AdminReportsPage() {
                                     <th style={{ textAlign: 'center' }}>Sessões</th>
                                     <th style={{ textAlign: 'center' }}>Concluídas</th>
                                     <th style={{ textAlign: 'center' }}>Faltas</th>
-                                    <th style={{ textAlign: 'right' }}>Receita</th>
+                                    {canSeeRevenue && <th style={{ textAlign: 'right' }}>Receita</th>}
                                     <th style={{ textAlign: 'center' }}>Média Viewers</th>
                                 </tr>
                             </thead>
@@ -383,18 +451,25 @@ export default function AdminReportsPage() {
                                                 }}>
                                                     {c.name.charAt(0).toUpperCase()}
                                                 </div>
-                                                <Tooltip content={`Abrir perfil de ${c.name}`}>
-                                                    <button type="button" style={{ fontWeight: 600, cursor: 'pointer', color: 'var(--accent-text)', fontSize: '0.875rem', background: 'none', border: 'none', padding: 0, fontFamily: 'inherit', textAlign: 'left' }}
-                                                        onClick={() => navigate(`/admin/clients/${c.id}`)}>
-                                                        {c.name}
-                                                    </button>
-                                                </Tooltip>
+                                                {/* Perfil do cliente só com "Ver clientes": sem ela, o nome é só texto. */}
+                                                {canOpenClient ? (
+                                                    <Tooltip content={`Abrir perfil de ${c.name}`}>
+                                                        <button type="button" style={{ fontWeight: 600, cursor: 'pointer', color: 'var(--accent-text)', fontSize: '0.875rem', background: 'none', border: 'none', padding: 0, fontFamily: 'inherit', textAlign: 'left' }}
+                                                            onClick={() => navigate(`/admin/clients/${c.id}`)}>
+                                                            {c.name}
+                                                        </button>
+                                                    </Tooltip>
+                                                ) : (
+                                                    <span style={{ fontWeight: 600, fontSize: '0.875rem', color: 'var(--text-primary)' }}>{c.name}</span>
+                                                )}
                                             </div>
                                         </td>
                                         <td data-label="Sessões" style={{ textAlign: 'center', fontSize: '0.875rem', fontWeight: 600 }}>{c.sessions}</td>
                                         <td data-label="Concluídas" style={{ textAlign: 'center' }}><span style={{ color: 'var(--success)', fontWeight: 700, fontSize: '0.875rem' }}>{c.completed}</span></td>
                                         <td data-label="Faltas" style={{ textAlign: 'center' }}><span style={{ color: c.falta > 0 ? 'var(--danger)' : 'var(--text-muted)', fontWeight: 700, fontSize: '0.875rem' }}>{c.falta}</span></td>
-                                        <td data-label="Receita" style={{ textAlign: 'right', fontWeight: 800, fontSize: '0.9375rem', fontVariantNumeric: 'tabular-nums' }}>{formatBRL(c.revenue)}</td>
+                                        {canSeeRevenue && (
+                                            <td data-label="Receita" style={{ textAlign: 'right', fontWeight: 800, fontSize: '0.9375rem', fontVariantNumeric: 'tabular-nums' }}>{money(c.revenue, formatBRL)}</td>
+                                        )}
                                         <td data-label="Média viewers" style={{ textAlign: 'center', color: c.avgViewers > 0 ? 'var(--accent-text)' : 'var(--text-muted)', fontSize: '0.875rem', fontWeight: 600 }}>
                                             {c.avgViewers > 0 ? c.avgViewers.toLocaleString('pt-BR') : '—'}
                                         </td>

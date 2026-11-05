@@ -8,24 +8,34 @@ import BroadcastComposer from '../components/admin/notifications/BroadcastCompos
 import { resolveNotifMeta } from '../utils/notificationMeta';
 import { Bell, Pencil, Megaphone, SlidersHorizontal } from 'lucide-react';
 import BrandLoader from '../components/ui/BrandLoader';
+import { usePermission } from '../hooks/usePermission';
 
 const GROUP_LABELS: Record<string, string> = {
     pagamentos: 'Pagamentos',
     sessoes: 'Sessões',
     contratos: 'Contratos',
     creditos: 'Créditos FLEX',
-    admin: 'Administração',
+    // Avisos para a equipe (rótulos "Equipe — …" no catálogo; só o ADMIN os edita — o colaborador nem os recebe).
+    admin: 'Equipe',
 };
 
 export default function AdminNotificationsPage() {
     const { showToast } = useUI();
-    const [tab, setTab] = useState<'eventos' | 'broadcast'>('eventos');
+    // Equipe (D2): a página abre com avisos.enviar OU avisos.modelos (guarda da rota). Aba "Eventos"
+    // (textos das mensagens automáticas, ligar/desligar, testar) = avisos.modelos; "Enviar aviso" = avisos.enviar.
+    const { can } = usePermission();
+    const canTemplates = can('avisos.modelos');
+    const canBroadcast = can('avisos.enviar');
+    const [tabChoice, setTab] = useState<'eventos' | 'broadcast'>(canTemplates ? 'eventos' : 'broadcast');
+    // A aba exibida é sempre uma permitida (a permissão pode mudar com a tela aberta).
+    const tab: 'eventos' | 'broadcast' = !canTemplates ? 'broadcast' : !canBroadcast ? 'eventos' : tabChoice;
     const [events, setEvents] = useState<NotificationEventDef[]>([]);
     const [loading, setLoading] = useState(true);
     const [editing, setEditing] = useState<NotificationEventDef | null>(null);
 
     const load = () => notificationsAdminApi.getEvents().then(r => { setEvents(r.events); setLoading(false); }).catch(() => setLoading(false));
-    useEffect(() => { load(); }, []);
+    // Os modelos só carregam para quem pode editá-los (quem só envia avisos não precisa da lista).
+    useEffect(() => { if (canTemplates) load(); }, [canTemplates]);
 
     const grouped = useMemo(() => {
         const map = new Map<string, NotificationEventDef[]>();
@@ -46,20 +56,29 @@ export default function AdminNotificationsPage() {
 
     return (
         <div>
+            {/* EQ-REQ-03: "Avisos" = o módulo do catálogo ("Avisos e modelos de mensagem"); "Notificações"
+                é a página do sino (/notificacoes), que toda a equipe tem. */}
             <AdminPageHeader
                 icon={Bell}
-                title="Notificações"
-                subtitle="Edite os textos por evento e envie avisos aos clientes"
+                title="Avisos"
+                subtitle={canTemplates && canBroadcast
+                    ? 'Edite os textos por evento e envie avisos aos clientes'
+                    : canTemplates
+                        ? 'Edite os textos das mensagens automáticas que os clientes recebem'
+                        : 'Envie avisos aos clientes pelo sino e pelo push'}
             />
 
-            <div className="payments-tabs" role="tablist" style={{ marginBottom: 20 }}>
-                <button role="tab" aria-selected={tab === 'eventos'} className={`payments-tab ${tab === 'eventos' ? 'payments-tab--active' : ''}`} onClick={() => setTab('eventos')}>
-                    <SlidersHorizontal size={15} /> <span className="payments-tab__label">Eventos</span>
-                </button>
-                <button role="tab" aria-selected={tab === 'broadcast'} className={`payments-tab ${tab === 'broadcast' ? 'payments-tab--active' : ''}`} onClick={() => setTab('broadcast')}>
-                    <Megaphone size={15} /> <span className="payments-tab__label">Enviar aviso</span>
-                </button>
-            </div>
+            {/* Abas só quando a pessoa tem as duas permissões; com uma só, a página mostra direto o conteúdo dela. */}
+            {canTemplates && canBroadcast && (
+                <div className="payments-tabs" role="tablist" style={{ marginBottom: 20 }}>
+                    <button role="tab" aria-selected={tab === 'eventos'} className={`payments-tab ${tab === 'eventos' ? 'payments-tab--active' : ''}`} onClick={() => setTab('eventos')}>
+                        <SlidersHorizontal size={15} /> <span className="payments-tab__label">Eventos</span>
+                    </button>
+                    <button role="tab" aria-selected={tab === 'broadcast'} className={`payments-tab ${tab === 'broadcast' ? 'payments-tab--active' : ''}`} onClick={() => setTab('broadcast')}>
+                        <Megaphone size={15} /> <span className="payments-tab__label">Enviar aviso</span>
+                    </button>
+                </div>
+            )}
 
             {tab === 'broadcast' ? (
                 <BroadcastComposer />
@@ -103,7 +122,7 @@ export default function AdminNotificationsPage() {
                 ))
             )}
 
-            {editing && (
+            {canTemplates && editing && (
                 <EventTemplateModal
                     event={editing}
                     onClose={() => setEditing(null)}

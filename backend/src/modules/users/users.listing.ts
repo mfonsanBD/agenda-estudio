@@ -1,25 +1,68 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, RequestHandler } from 'express';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize } from '../../middleware/auth.js';
+import { authenticate } from '../../middleware/auth.js';
+import { actorOrReply, canAny, requirePermission } from '../../middleware/permissions.js';
+import type { PermissionKey } from '../../config/staffPermissions.js';
 import { paidChargedAmount } from '../../lib/pixGateway.js';
 
-export function registerUserListingRoutes(router: Router) {
-    // ─── GET /api/users (ADMIN) ─────────────────────────────
+// /api/users trata SÓ de CLIENTE (D1). A equipe (ADMIN/COLABORADOR) fica em /api/staff, só para o ADMIN.
 
-    router.get('/', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
-        const { role } = req.query;
-
-        const where: any = {};
-        if (role && typeof role === 'string') {
-            where.role = role;
-        } else {
-            // L4: o diretório de clientes não deve listar contas ADMIN (não são clientes) — isso inflava
-            // "N resultados" e divergia do KPI "TOTAL N clientes". Um filtro explícito (?role=ADMIN) ainda funciona.
-            where.role = { not: 'ADMIN' };
+/** Express 4 não captura rejeições de handlers async: responde 500 em vez de deixar a promessa solta. */
+export function safeHandler(logTag: string, fallback: string, handler: (req: Request, res: Response) => Promise<void>): RequestHandler {
+    return async (req: Request, res: Response) => {
+        try {
+            await handler(req, res);
+        } catch (err) {
+            console.error(logTag, err);
+            if (!res.headersSent) res.status(500).json({ error: fallback });
         }
+    };
+}
+
+/**
+ * Quem abre o diretório de clientes: a tela Clientes e os SELETORES de cliente das outras telas
+ * (Agendamentos, Contratos, Cupons e o aviso aos clientes — os dois primeiros carregam a lista num
+ * Promise.all com a tela, então negar aqui derrubaria a tela inteira).
+ */
+export const CLIENT_DIRECTORY_PERMISSIONS: readonly PermissionKey[] = [
+    'clientes.ver', 'agendamentos.ver', 'contratos.ver', 'cupons.ver', 'avisos.enviar',
+];
+
+/**
+ * Quem recebe a FICHA na listagem (CPF/CNPJ para cobrar, telefone, etiquetas, contagens e totais). Os
+ * demais recebem só o diretório mínimo `{ id, name, email, role }` (crítica I5).
+ */
+export const CLIENT_DIRECTORY_FULL_PERMISSIONS: readonly PermissionKey[] = [
+    'clientes.ver', 'agendamentos.criar', 'contratos.criar', 'cobrancas.cobrar',
+];
+
+export function registerUserListingRoutes(router: Router) {
+    // ─── GET /api/users (equipe: diretório de clientes) ─────
+
+    router.get('/', authenticate, requirePermission(...CLIENT_DIRECTORY_PERMISSIONS), safeHandler('[USERS] list', 'Erro ao carregar os clientes.', async (req: Request, res: Response) => {
+        const { role } = req.query;
+        // Lista só de clientes: `?role` só aceita CLIENTE (a equipe não aparece aqui).
+        if (role !== undefined && role !== 'CLIENTE') {
+            res.status(400).json({ error: 'Esta lista é só de clientes. A equipe fica na tela Equipe.', code: 'ROLE_NOT_ALLOWED' });
+            return;
+        }
+        const actor = await actorOrReply(req, res);
+        if (!actor) return;
+
+        // Filtro POSITIVO (D1): só CLIENTE — nem ADMIN nem COLABORADOR aparecem em Clientes nem nos seletores.
         // D3: cliente excluído (soft delete) some da lista, da busca, dos KPIs e de todos os seletores
         // de cliente dos modais — o perfil histórico continua acessível por GET /:id.
-        where.deletedAt = null;
+        const where = { role: 'CLIENTE' as const, deletedAt: null };
+
+        if (!canAny(actor, ...CLIENT_DIRECTORY_FULL_PERMISSIONS)) {
+            const users = await prisma.user.findMany({
+                where,
+                orderBy: { createdAt: 'desc' },
+                select: { id: true, name: true, email: true, role: true },
+            });
+            res.json({ users });
+            return;
+        }
 
         const rawUsers = await prisma.user.findMany({
             where,
@@ -30,8 +73,8 @@ export function registerUserListingRoutes(router: Router) {
                 name: true,
                 phone: true,
                 role: true,
-                // Necessário para o admin cobrar o CLIENTE (gate/coleta de CPF do PIX/Boleto usa o
-                // documento do cliente selecionado, não o do admin). Endpoint é ADMIN-only.
+                // Necessário para a equipe cobrar o CLIENTE (gate/coleta de CPF do PIX/Boleto usa o
+                // documento do cliente selecionado, não o de quem opera). Só na ficha (FULL_PERMISSIONS).
                 cpfCnpj: true,
                 clientStatus: true,
                 tags: true,
@@ -66,11 +109,11 @@ export function registerUserListingRoutes(router: Router) {
         });
 
         res.json({ users });
-    });
+    }));
 
-    // ─── GET /api/users/:id (ADMIN) ─────────────────────────
+    // ─── GET /api/users/:id (perfil do cliente) ─────────────
 
-    router.get('/:id', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+    router.get('/:id', authenticate, requirePermission('clientes.ver'), safeHandler('[USERS] detail', 'Erro ao carregar o cliente.', async (req: Request, res: Response) => {
         const id = req.params.id as string;
 
         const user = await prisma.user.findUnique({
@@ -152,11 +195,12 @@ export function registerUserListingRoutes(router: Router) {
             },
         });
 
-        if (!user) {
-            res.status(404).json({ error: 'Usuário não encontrado.' });
+        // Alvo precisa ser CLIENTE (a equipe não é revelada por aqui). Excluído continua acessível (histórico).
+        if (!user || user.role !== 'CLIENTE') {
+            res.status(404).json({ error: 'Cliente não encontrado.' });
             return;
         }
 
         res.json({ user });
-    });
+    }));
 }

@@ -12,10 +12,12 @@ interface FieldItemProps {
     field: string;
     userId: string;
     onSaved: () => void;
+    /** Somente leitura (sem a permissão de editar o cadastro): mostra o valor, sem edição. */
+    readOnly?: boolean;
 }
 
 /** Campo com edição inline (clique para editar, salva no blur/Enter). */
-export default function FieldItem({ label, value, field, userId, onSaved }: FieldItemProps) {
+export default function FieldItem({ label, value, field, userId, onSaved, readOnly = false }: FieldItemProps) {
     const { showToast } = useUI();
     const [editing, setEditing] = useState(false);
     const [val, setVal] = useState(value || '');
@@ -39,7 +41,11 @@ export default function FieldItem({ label, value, field, userId, onSaved }: Fiel
     return (
         <div>
             <div style={{ fontSize: '0.6875rem', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: '4px' }}>{label}</div>
-            {editing ? (
+            {readOnly ? (
+                <div style={{ fontSize: '0.8125rem', padding: '6px 8px', minHeight: '32px', color: val ? 'var(--text-primary)' : 'var(--text-muted)' }}>
+                    {val ? (isCpf ? maskCpfCnpj(val) : val) : '—'}
+                </div>
+            ) : editing ? (
                 <>
                     <input className="form-input" value={val}
                         onChange={e => setVal(isCpf ? maskCpfCnpj(e.target.value) : e.target.value)}

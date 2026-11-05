@@ -36,6 +36,7 @@ import {
 } from '../constants/paymentMethods';
 import { Copy, Check, Lock, QrCode, CreditCard, Plus, ShieldCheck, FileText, Info, AlertTriangle } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { usePermission } from '../hooks/usePermission';
 import { isValidCpfCnpj } from '../utils/mask';
 import CpfCnpjPrompt from './CpfCnpjPrompt';
 import { getBrandIcon } from '../utils/cardBrand';
@@ -164,6 +165,13 @@ export default function InlineCheckout({
     usePaymentMethodsVersion();
     // Admin cobrando um cliente: cartões e CPF são SEMPRE os do dono do pagamento (E1).
     const adminCharge = isAdmin || !!chargeClient;
+    // Equipe (D2): debitar o cartão SALVO do cliente exige `cobrancas.cartao_salvo`. Sem ela o servidor já
+    // devolve a lista vazia (`canUseSavedCards: false`) e recusa `savedPaymentMethodId` com 403 — aqui a
+    // lista nem aparece e o cartão salvo nunca é enviado. O cliente pagando o próprio não passa por isto.
+    const { can } = usePermission();
+    const staffSavedCardsAllowed = !adminCharge || can('cobrancas.cartao_salvo');
+    const [serverDeniedSavedCards, setServerDeniedSavedCards] = useState(false);
+    const savedCardsLocked = adminCharge && (!staffSavedCardsAllowed || serverDeniedSavedCards);
 
     // Boleto state — o servidor recusou (400 BOLETO_UNAVAILABLE / BOLETO_NOT_ALLOWED_HERE): a aba some.
     const [boletoRefused, setBoletoRefused] = useState(false);
@@ -458,7 +466,10 @@ export default function InlineCheckout({
         stripeApi.paymentMethodsForPayment(paymentId)
             .then(res => {
                 if (!alive) return;
-                const methods = res.paymentMethods || [];
+                // `canUseSavedCards` (B3): false quando o servidor não liberou o cartão salvo para quem cobra.
+                const serverDenied = (res as { canUseSavedCards?: boolean }).canUseSavedCards === false;
+                setServerDeniedSavedCards(serverDenied);
+                const methods = staffSavedCardsAllowed && !serverDenied ? (res.paymentMethods || []) : [];
                 setSavedCards(methods);
                 setPayer(res.payer ?? null);
                 // Mantém a escolha do admin se o cartão ainda existe; senão, volta para "novo cartão".
@@ -468,7 +479,7 @@ export default function InlineCheckout({
             .catch(() => { if (alive) { setSavedCards([]); setSelectedCard('new'); } })
             .finally(() => { if (alive) setLoadingCards(false); });
         return () => { alive = false; };
-    }, [adminCharge, paymentId, cardsNonce]);
+    }, [adminCharge, paymentId, cardsNonce, staffSavedCardsAllowed]);
 
     // Parcelas: a política REAL vem do backend (/stripe/installment-plans com o paymentId — inclui o
     // teto do serviço: mensal parcelado = 1..N sem juros, à vista = só 1x; avulso/à vista de contrato
@@ -589,8 +600,8 @@ export default function InlineCheckout({
         setError('');
         let pid = paymentId;
         try {
-            // Saved card: charge directly
-            if (selectedCard && selectedCard !== 'new') {
+            // Saved card: charge directly (equipe só com cobrancas.cartao_salvo — sem ela a lista nem aparece)
+            if (selectedCard && selectedCard !== 'new' && !savedCardsLocked) {
                 setPayingSavedCard(true);
                 if (createPaymentFn) {
                     const result = await createPaymentFn('CARTAO');
@@ -1177,6 +1188,13 @@ export default function InlineCheckout({
                                         </div>
                                     </button>
                                 </div>
+                                {/* Equipe sem "Debitar o cartão salvo do cliente": explica por que a lista não aparece. */}
+                                {savedCardsLocked && (
+                                    <p className="checkout-save-note" role="note" style={{ display: 'flex', alignItems: 'flex-start', gap: 6 }}>
+                                        <Lock size={13} aria-hidden="true" style={{ flexShrink: 0, marginTop: 2 }} />
+                                        <span>Os cartões salvos do cliente não aparecem para você: debitá-los exige a permissão “Debitar o cartão salvo do cliente”. Use um cartão novo, com o cliente presente, ou o PIX.</span>
+                                    </p>
+                                )}
                             </>
                         );
                     })()}

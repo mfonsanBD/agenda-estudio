@@ -24,7 +24,7 @@ Toque (ou clique) numa gravação para abrir o detalhe. Você encontra:
 - **Resultados da gravação** — depois que o estúdio finaliza: **duração, início e fim, visualizações, pico de espectadores, inscritos, curtidas, comentários e mensagens no chat**, no total e **por rede**, com o link **Abrir** de cada transmissão (ou **Assistir gravação**, quando não foi ao vivo) e a **origem da audiência**.
 - **Recado do estúdio** — o feedback que a equipe deixa para você ao finalizar a gravação.
 - **Informações do episódio** — título, descrição, **capa** e as **redes** onde pretende transmitir (YouTube, TikTok, Instagram, Facebook).
-- **Serviços** — os serviços daquela gravação.
+- **Serviços** — os serviços daquela gravação. **Adicionar serviço** gera uma cobrança só do serviço. Numa reserva avulsa que ainda está no prazo de pagamento (o contador de 10 minutos), o botão não aparece: os serviços entram no próprio pagamento da reserva. Pagar um serviço extra não confirma a gravação quando o pagamento da própria sessão ainda está em aberto: pague a fatura da sessão em **Pagamentos**.
 
 Durante a gravação o detalhe mostra **AO VIVO** e "Gravação em andamento desde HH:MM"; quando o estúdio finaliza, os resultados aparecem ali mesmo.
 
@@ -52,6 +52,7 @@ a gravação mostra **Remarcar** com o prazo. Você pode escolher uma nova data 
 - **Falta justificada:** se o prazo acabar sem remarcar, o valor pago é perdido.
 - **Não realizada pelo estúdio:** se o prazo acabar, você **não perde** o valor — o estúdio entra em contato para combinar a nova data.
 - Uma falta **sem** justificativa (inclusive cancelar com menos de 24h de antecedência) não dá direito a remarcar.
+- A remarcação sem novo pagamento só vale para gravação **paga**: o pagamento da própria gravação, não o de um serviço extra.
 
 **Como remarcar:**
 
@@ -69,7 +70,7 @@ Quando há métricas registradas, um **gráfico por rede** resume o desempenho d
 
 ## Dicas
 
-- As métricas aparecem **depois** que o estúdio finaliza a gravação (ver, no lado do admin, [Hoje → Finalizar gravação](../guia-admin/hoje.md#finalizar-gravacao-metricas-de-transmissao)).
+- As métricas aparecem **depois** que o estúdio finaliza a gravação (ver, no lado do admin, [Hoje → Finalizar gravação](../guia-admin/hoje.md#finalizar-gravação-métricas-de-transmissão)).
 - Você pode **remarcar** uma sessão futura dentro da janela permitida (ver [Agenda](agenda-e-agendamento.md)).
 
 ## Ver também

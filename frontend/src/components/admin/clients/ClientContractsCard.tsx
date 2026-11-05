@@ -5,6 +5,7 @@ import { FolderOpen, FileText, ClipboardCheck } from 'lucide-react';
 import StatusBadge from '../../ui/StatusBadge';
 import { TIER_META, CONTRACT_STATUS_META, CONTRACT_TYPE_META, getMeta } from '../../../constants/adminMeta';
 import { describeContractTerms, type TermsBooking } from '../../../utils/contractStatus';
+import { usePermission } from '../../../hooks/usePermission';
 
 /** Lista de contratos do cliente.
  *  `bookings` (opcional, ex.: `user.bookings` do perfil): com eles o AVULSO mostra a data/horário
@@ -15,6 +16,8 @@ export default function ClientContractsCard({ contracts, bookings }: {
 }) {
     const navigate = useNavigate();
     const { get: getRule } = useBusinessConfig();
+    // O detalhe do contrato exige contratos.ver (senão o link cairia no redirecionamento).
+    const canOpenContract = usePermission().can('contratos.ver');
 
     return (
         <div className="card" style={{ padding: '20px', marginBottom: '16px' }}>
@@ -55,10 +58,12 @@ export default function ClientContractsCard({ contracts, bookings }: {
                                 )}
                             </div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginTop: '8px', flexWrap: 'wrap' }}>
-                                <button onClick={() => navigate(`/admin/contracts/${c.id}`)}
-                                    style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', background: 'none', border: 'none', padding: 0, cursor: 'pointer', fontSize: '0.8125rem', fontWeight: 600, color: 'var(--accent-text)' }}>
-                                    <FolderOpen size={14} aria-hidden="true" /> Abrir contrato →
-                                </button>
+                                {canOpenContract && (
+                                    <button onClick={() => navigate(`/admin/contracts/${c.id}`)}
+                                        style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', background: 'none', border: 'none', padding: 0, cursor: 'pointer', fontSize: '0.8125rem', fontWeight: 600, color: 'var(--accent-text)' }}>
+                                        <FolderOpen size={14} aria-hidden="true" /> Abrir contrato →
+                                    </button>
+                                )}
                                 {c.contractUrl && (
                                     <a href={c.contractUrl} target="_blank" rel="noopener noreferrer"
                                         style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', fontSize: '0.8125rem', color: 'var(--accent-text)', textDecoration: 'none' }}>

@@ -46,5 +46,13 @@ beforeEach(async () => {
 
 afterAll(async () => {
     await prisma.$disconnect();
-    await redis.quit();
+    // QUIT numa conexão já encerrada (status 'end') — ou que cai antes de a resposta do QUIT chegar — rejeita
+    // com "Connection is closed." do ioredis, e o arquivo era marcado como falho com todos os testes verdes.
+    // Fechar a conexão aqui é só limpeza: se o QUIT não der, desconecta à força e segue.
+    if (redis.status === 'end') return;
+    try {
+        await redis.quit();
+    } catch {
+        redis.disconnect();
+    }
 });

@@ -1,6 +1,6 @@
 import { getErrorMessage } from '../../../utils/errors';
 import { useState, useEffect } from 'react';
-import { pricingApi, BusinessConfigItem } from '../../../api/client';
+import { pricingApi, BusinessConfigItem, ApiError } from '../../../api/client';
 import { invalidateFrontendConfigCache } from '../../../hooks/useBusinessConfig';
 import { invalidateContractSlotGridCache } from '../../../hooks/useContractSlotGrid';
 import LoadingSpinner from '../../ui/LoadingSpinner';
@@ -15,7 +15,7 @@ import ColorField from '../../ui/fields/ColorField';
 import UrlField from '../../ui/fields/UrlField';
 import EmailField from '../../ui/fields/EmailField';
 import type { LucideIcon } from 'lucide-react';
-import { Package, ClipboardCheck, CreditCard, Clock, Landmark, Building2, Info, Cloud, Clapperboard } from 'lucide-react';
+import { Package, ClipboardCheck, CreditCard, Clock, Landmark, Building2, Info, Cloud, Clapperboard, Lock } from 'lucide-react';
 
 /**
  * Group metadata copied verbatim from AdminPricingPage so the section headers,
@@ -50,6 +50,21 @@ interface SettingsBusinessConfigSectionProps {
     subtitle?: string;
     /** Stack the save bar above a sibling section's bar (financeiro: tiers + config). */
     stackedSaveBar?: boolean;
+    /**
+     * Equipe (D2): grupos desta seção que são exclusivos do ADMIN (ex.: `gateway` = config.taxas). Não são
+     * carregados nem enviados — aparecem só como um cartão em cinza, "só o administrador".
+     */
+    adminOnlyGroups?: string[];
+}
+
+/** 403 do PUT /business-config (B3): `deniedGroups` lista os grupos que a pessoa não pode alterar. */
+function deniedGroupsMessage(err: unknown): string | null {
+    if (!(err instanceof ApiError) || err.status !== 403 || err.code !== 'PERMISSION_DENIED') return null;
+    const raw = err.body?.deniedGroups;
+    const groups = Array.isArray(raw) ? raw.filter((g): g is string => typeof g === 'string') : [];
+    if (groups.length === 0) return null;
+    const labels = groups.map(g => GROUP_LABELS[g]?.label ?? (g === 'email' ? 'E-mail' : 'Outras configurações'));
+    return `Você não tem permissão para alterar: ${labels.join(', ')}. Nada foi salvo.`;
 }
 
 /**
@@ -59,7 +74,7 @@ interface SettingsBusinessConfigSectionProps {
  * via pricingApi.updateBusinessConfig sending the full set (preserving the
  * legacy behavior). Owns its own dirty flag + floating save bar.
  */
-export default function SettingsBusinessConfigSection({ groups, title, subtitle, stackedSaveBar }: SettingsBusinessConfigSectionProps) {
+export default function SettingsBusinessConfigSection({ groups, title, subtitle, stackedSaveBar, adminOnlyGroups = [] }: SettingsBusinessConfigSectionProps) {
     const [configs, setConfigs] = useState<BusinessConfigItem[]>([]);
     const [configGrouped, setConfigGrouped] = useState<Record<string, BusinessConfigItem[]>>({});
     const [configEdited, setConfigEdited] = useState(false);
@@ -116,7 +131,7 @@ export default function SettingsBusinessConfigSection({ groups, title, subtitle,
             showMsg('✅ Regras de negócio atualizadas!');
             setConfigEdited(false);
             setFeeRefreshKey(k => k + 1); // taxa pode ter mudado → recarrega a linha do tempo
-        } catch (err: unknown) { setError(getErrorMessage(err)); }
+        } catch (err: unknown) { setError(deniedGroupsMessage(err) ?? getErrorMessage(err)); }
         finally { setSaving(false); }
     };
 
@@ -196,6 +211,40 @@ export default function SettingsBusinessConfigSection({ groups, title, subtitle,
 
                             {/* Linha do tempo das taxas (só no grupo gateway) — logo abaixo dos campos editáveis. */}
                             {groupKey === 'gateway' && <GatewayFeeTimeline refreshKey={feeRefreshKey} />}
+                        </div>
+                    );
+                })}
+
+                {/* Grupos exclusivos do ADMIN nesta seção (ex.: Taxas de Gateway): só um cartão em cinza. */}
+                {adminOnlyGroups.map(groupKey => {
+                    const groupMeta = GROUP_LABELS[groupKey];
+                    if (!groupMeta) return null;
+                    const GI = groupMeta.icon;
+                    return (
+                        <div key={`admin-only-${groupKey}`} role="note" aria-label={`${groupMeta.label}: só o administrador`} style={{
+                            padding: '18px 24px', borderRadius: '16px',
+                            background: 'var(--bg-secondary)', border: '1px dashed var(--border-color)',
+                            color: 'var(--text-muted)', opacity: 0.85,
+                        }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                                <span style={{
+                                    width: 28, height: 28, borderRadius: '8px', background: 'var(--bg-elevated)',
+                                    display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+                                }}>
+                                    <GI size={15} aria-hidden="true" />
+                                </span>
+                                <span style={{ fontSize: '0.9375rem', fontWeight: 700 }}>{groupMeta.label}</span>
+                                <span style={{
+                                    display: 'inline-flex', alignItems: 'center', gap: 4, marginLeft: 'auto',
+                                    fontSize: '0.6875rem', fontWeight: 700, padding: '2px 8px', borderRadius: 999,
+                                    background: 'var(--bg-elevated)', color: 'var(--text-secondary)', whiteSpace: 'nowrap',
+                                }}>
+                                    <Lock size={11} aria-hidden="true" /> só o administrador
+                                </span>
+                            </div>
+                            <p style={{ fontSize: '0.75rem', margin: '8px 0 0 36px' }}>
+                                {groupMeta.desc}.{groupKey === 'gateway' ? ' Afetam o fechamento financeiro, por isso só o administrador altera.' : ' Só o administrador altera.'}
+                            </p>
                         </div>
                     );
                 })}

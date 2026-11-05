@@ -2,10 +2,55 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import bcrypt from 'bcryptjs';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize, revokeUserSessions } from '../../middleware/auth.js';
+import { logAudit } from '../../lib/audit.js';
+import { authenticate, revokeUserSessions } from '../../middleware/auth.js';
+import { enforceRuleResult, requirePermission, requireStaff, can, type Actor } from '../../middleware/permissions.js';
+import { routeActor } from '../bookings/permissionGuards.js';
+import { requiredForUserCreate, requiredForUserPatch } from '../../lib/permissionRules.js';
 import { cleanDocument, isValidCpfCnpj } from '../../utils/document.js';
 import { formatBRL } from '../../utils/pricing.js';
-import { deleteUser, getDeletionPreview, assertUserDeletable, UserDeletionError } from '../../lib/userDeletion.js';
+import {
+    deleteUser, getDeletionPreview, assertUserDeletable, UserDeletionError,
+    deletionMissingPermissions, deletionMissingPermissionsMessage, type DeletionSettleKey,
+} from '../../lib/userDeletion.js';
+
+/**
+ * AUDFIN-04: o `can` da exclusão para o ator — ADMIN não confere nada (como antes); a equipe precisa também da chave
+ * de tudo que a exclusão anularia (lib/userDeletion.deletionSettleRequirements).
+ */
+const deletionCan = (actor: Actor): ((key: DeletionSettleKey) => boolean) | undefined =>
+    actor.isAdmin ? undefined : (key) => can(actor, key);
+import { notifyLoginEmailChanged } from '../staff/staffMail.js';
+
+// /api/users trata SÓ de CLIENTE (D1/D9). Permissões por rota (matriz da Equipe):
+//   POST /              clientes.criar (+ regras do corpo: senha só ADMIN; nascer BLOCKED = clientes.acesso)
+//   PATCH /:id          equipe + requiredForUserPatch (por VALOR alterado: cadastro = clientes.editar;
+//                       e-mail de login e bloqueio = clientes.acesso; senha = só ADMIN; CPF ainda vazio
+//                       também com cobrancas.cobrar)
+//   deletion-preview e DELETE   clientes.excluir (alvo da equipe → 400 de assertUserDeletable, I1)
+//   payment-overview    clientes.ver, financeiro.ver ou cobrancas.automatica (DECISOES resposta 3)
+//   (trocar o e-mail de login zera o googleId — AUTH-03)
+//   auto-charge         cobrancas.automatica
+// `role` não se altera aqui: 'CLIENTE' é aceito e ignorado (PWA antiga); outro valor → 400.
+// Alvo que não é CLIENTE → 404 (a equipe não é revelada por aqui).
+
+const CLIENT_NOT_FOUND = { error: 'Cliente não encontrado.' } as const;
+const EMAIL_TAKEN = { error: 'E-mail já cadastrado em outra conta.', code: 'EMAIL_TAKEN' } as const;
+
+/** Conta com este e-mail sem diferenciar maiúsculas (crítica E6), opcionalmente ignorando `exceptId`. */
+function findOtherByEmail(email: string, exceptId?: string) {
+    return prisma.user.findFirst({
+        where: { email: { equals: email, mode: 'insensitive' }, ...(exceptId ? { id: { not: exceptId } } : {}) },
+        select: { id: true },
+    });
+}
+
+/** P2002 (UNIQUE): e-mail ou CPF/CNPJ repetido numa corrida entre a checagem e a gravação. */
+function uniqueViolationBody(err: unknown): { error: string; code?: string } | null {
+    if (!err || typeof err !== 'object' || (err as { code?: string }).code !== 'P2002') return null;
+    const meta = JSON.stringify((err as { meta?: unknown }).meta ?? '');
+    return /email/i.test(meta) ? { ...EMAIL_TAKEN } : { error: 'Este CPF/CNPJ já está cadastrado em outra conta.' };
+}
 
 /**
  * Normalizes a CPF/CNPJ to digits-only and validates the check digits.
@@ -18,14 +63,18 @@ function normalizeCpfCnpj(value: string | null | undefined): { ok: true; value: 
     return { ok: true, value: digits || null };
 }
 
-// ─── POST /api/users (ADMIN create) ─────────────────────
+// ─── POST /api/users (equipe cria CLIENTE) ──────────────
+// Toda chave daqui precisa de regra em lib/permissionRules.ts (USER_CREATE_FIELDS) — teste unitário.
+// `password` é opcional: só o ADMIN define senha de cliente (crítica F8); sem senha, o cliente entra
+// pelo código no e-mail ('' ou null contam como "sem senha", para o formulário que esconde o campo).
+// `role` só existe para a PWA antiga: 'CLIENTE' é ignorado, outro valor → 400.
 
 const createUserSchema = z.object({
-    email: z.string().email(),
-    password: z.string().min(6),
+    email: z.string().trim().toLowerCase().email(),
+    password: z.preprocess(v => (v === '' || v === null ? undefined : v), z.string().min(6).optional()),
     name: z.string().min(2),
     phone: z.string().optional(),
-    role: z.enum(['ADMIN', 'CLIENTE']).optional().default('CLIENTE'),
+    role: z.string().optional(),
     notes: z.string().optional(),
     cpfCnpj: z.string().optional().nullable(),
     address: z.string().optional().nullable(),
@@ -40,13 +89,14 @@ const createUserSchema = z.object({
     clientStatus: z.enum(['ACTIVE', 'INACTIVE', 'BLOCKED']).optional(),
 });
 
-// ─── PATCH /api/users/:id (ADMIN update) ────────────────
+// ─── PATCH /api/users/:id (equipe edita CLIENTE) ────────
+// Toda chave daqui precisa de regra em lib/permissionRules.ts (USER_PATCH_FIELDS) — teste unitário.
 
 const updateUserSchema = z.object({
     name: z.string().min(2).optional(),
-    email: z.string().email().optional(),
+    email: z.string().trim().toLowerCase().email().optional(),
     phone: z.string().optional(),
-    role: z.enum(['ADMIN', 'CLIENTE']).optional(),
+    role: z.string().optional(),
     password: z.string().min(6).optional(),
     notes: z.string().optional(),
     cpfCnpj: z.string().optional().nullable(),
@@ -63,15 +113,15 @@ const updateUserSchema = z.object({
 });
 
 export function registerUserCrudRoutes(router: Router) {
-    // ─── POST /api/users (ADMIN create) ─────────────────────
+    // ─── POST /api/users (equipe cria CLIENTE) ──────────────
 
-    router.post('/', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+    router.post('/', authenticate, requirePermission('clientes.criar'), async (req: Request, res: Response) => {
         try {
             const data = createUserSchema.parse(req.body);
+            if (!(await enforceRuleResult(req, res, requiredForUserCreate(data)))) return;
 
-            const existing = await prisma.user.findUnique({ where: { email: data.email } });
-            if (existing) {
-                res.status(409).json({ error: 'E-mail já cadastrado.' });
+            if (await findOtherByEmail(data.email)) {
+                res.status(409).json({ ...EMAIL_TAKEN });
                 return;
             }
 
@@ -81,7 +131,7 @@ export function registerUserCrudRoutes(router: Router) {
                 return;
             }
 
-            const passwordHash = await bcrypt.hash(data.password, 12);
+            const passwordHash = data.password ? await bcrypt.hash(data.password, 12) : null;
 
             const user = await prisma.user.create({
                 data: {
@@ -89,7 +139,7 @@ export function registerUserCrudRoutes(router: Router) {
                     passwordHash,
                     name: data.name,
                     phone: data.phone,
-                    role: data.role as any,
+                    role: 'CLIENTE', // sempre: a equipe se cria na tela Equipe (/api/staff)
                     ...(data.notes ? { notes: data.notes } : {}),
                     ...(cpf.value !== null ? { cpfCnpj: cpf.value } : {}),
                     ...(data.tags ? { tags: data.tags } : {}),
@@ -106,30 +156,37 @@ export function registerUserCrudRoutes(router: Router) {
                 select: { id: true, email: true, name: true, phone: true, role: true, createdAt: true },
             });
 
-            res.status(201).json({ user, message: `Usuário ${data.name} criado com sucesso.` });
+            await logAudit('USER', user.id, 'CLIENT_CREATED', req.user!.userId, {
+                withPassword: !!passwordHash,
+                clientStatus: data.clientStatus ?? 'ACTIVE',
+            });
+
+            res.status(201).json({ user, message: `Cliente ${data.name} cadastrado com sucesso.` });
         } catch (err) {
             if (err instanceof z.ZodError) {
                 res.status(400).json({ error: 'Dados inválidos.', details: err.errors });
                 return;
             }
-            if (err && typeof err === 'object' && (err as { code?: string }).code === 'P2002') {
-                res.status(409).json({ error: 'Este CPF/CNPJ já está cadastrado em outra conta.' });
+            const unique = uniqueViolationBody(err);
+            if (unique) {
+                res.status(409).json(unique);
                 return;
             }
-            throw err;
+            console.error('[USERS] create', err);
+            if (!res.headersSent) res.status(500).json({ error: 'Erro ao cadastrar o cliente.' });
         }
     });
 
-    // ─── PATCH /api/users/:id (ADMIN update) ────────────────
+    // ─── PATCH /api/users/:id (equipe edita CLIENTE) ────────
 
-    router.patch('/:id', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+    router.patch('/:id', authenticate, requireStaff(), async (req: Request, res: Response) => {
         try {
             const id = req.params.id as string;
             const data = updateUserSchema.parse(req.body);
 
             const existing = await prisma.user.findUnique({ where: { id } });
-            if (!existing) {
-                res.status(404).json({ error: 'Usuário não encontrado.' });
+            if (!existing || existing.role !== 'CLIENTE') {
+                res.status(404).json({ ...CLIENT_NOT_FOUND });
                 return;
             }
             // D3: cadastro excluído (anonimizado) é só histórico — não pode ser reeditado.
@@ -138,20 +195,32 @@ export function registerUserCrudRoutes(router: Router) {
                 return;
             }
 
-            // Check email uniqueness if changing
-            if (data.email && data.email !== existing.email) {
-                const emailTaken = await prisma.user.findUnique({ where: { email: data.email } });
-                if (emailTaken) {
-                    res.status(409).json({ error: 'E-mail já em uso por outro usuário.' });
-                    return;
-                }
+            // Permissão pelo que MUDA (registro completo como alvo). Corpo sem mudança nenhuma ainda exige
+            // alguém que poderia editar algo do cliente (não vira leitura gratuita do cadastro).
+            const rule = requiredForUserPatch(data, existing);
+            if (rule.requirements.length === 0) {
+                rule.requirements.push({ anyOf: ['clientes.editar', 'clientes.acesso', 'cobrancas.cobrar'], field: '*' });
+            }
+            if (!(await enforceRuleResult(req, res, rule))) return;
+
+            // E-mail de login: comparado sem maiúsculas. Diferença só de caixa = normalização (sem revogar).
+            const currentEmail = (existing.email ?? '').trim().toLowerCase();
+            const emailChanged = data.email !== undefined && data.email !== currentEmail;
+            const writeEmail = data.email !== undefined && data.email !== existing.email;
+            if (writeEmail && (await findOtherByEmail(data.email!, id))) {
+                res.status(409).json({ ...EMAIL_TAKEN });
+                return;
             }
 
             const updateData: any = {};
             if (data.name) updateData.name = data.name;
-            if (data.email) updateData.email = data.email;
+            if (writeEmail) updateData.email = data.email;
+            // E-mail de login trocado de fato (AUTH-03): desfaz o vínculo com o Google. O /auth/google acha a
+            // conta pelo googleId ANTES do e-mail; sem isto, o dono do endereço antigo (ex.: e-mail digitado
+            // errado) seguiria entrando na conta do cliente pelo Google. Só maiúsculas diferentes não desvincula.
+            if (emailChanged) updateData.googleId = null;
             if (data.phone !== undefined) updateData.phone = data.phone;
-            if (data.role) updateData.role = data.role;
+            // `role` nunca é gravado aqui ('CLIENTE' aceito e ignorado; outro valor já foi recusado com 400).
             if (data.notes !== undefined) updateData.notes = data.notes;
             if (data.cpfCnpj !== undefined) {
                 const cpf = normalizeCpfCnpj(data.cpfCnpj);
@@ -182,33 +251,70 @@ export function registerUserCrudRoutes(router: Router) {
             });
 
             // D3: bloquear encerra NA HORA a sessão já aberta do cliente (o login/refresh já recusam
-            // conta bloqueada; sem isto o access token residual valia por até 1h).
-            if (data.clientStatus === 'BLOCKED' && existing.clientStatus !== 'BLOCKED') {
+            // conta bloqueada; sem isto o access token residual valia por até 1h). Trocar o e-mail de login
+            // ou a senha também encerra (crítica F8: quem tinha a sessão não segue dentro da conta).
+            const newlyBlocked = data.clientStatus === 'BLOCKED' && existing.clientStatus !== 'BLOCKED';
+            const passwordSet = !!data.password;
+            if (newlyBlocked || emailChanged || passwordSet) {
                 await revokeUserSessions(id);
             }
+            if (emailChanged && existing.email && data.email) {
+                notifyLoginEmailChanged(existing.email, data.email, existing.name);
+            }
 
-            res.json({ user, message: 'Usuário atualizado com sucesso.' });
+            // Auditoria (sem valores sensíveis): campos de cadastro alterados e, à parte, o acesso ao app.
+            const actorId = req.user!.userId;
+            const before = existing as unknown as Record<string, unknown>;
+            const profileFields = Object.keys(updateData).filter(k =>
+                !['email', 'googleId', 'passwordHash', 'clientStatus'].includes(k)
+                && JSON.stringify(updateData[k] ?? null) !== JSON.stringify(before[k] ?? null));
+            const statusChanged = data.clientStatus !== undefined && data.clientStatus !== existing.clientStatus;
+            const accessBlockChange = statusChanged && (data.clientStatus === 'BLOCKED' || existing.clientStatus === 'BLOCKED');
+            if (statusChanged && !accessBlockChange) profileFields.push('clientStatus');
+            if (profileFields.length > 0) await logAudit('USER', id, 'CLIENT_UPDATED', actorId, { fields: profileFields });
+            if (emailChanged || passwordSet || accessBlockChange) {
+                await logAudit('USER', id, 'CLIENT_ACCESS_CHANGED', actorId, {
+                    ...(emailChanged ? { email: true } : {}),
+                    ...(passwordSet ? { password: true } : {}),
+                    ...(accessBlockChange ? { blocked: data.clientStatus === 'BLOCKED' } : {}),
+                });
+            }
+
+            res.json({ user, message: 'Cliente atualizado com sucesso.' });
         } catch (err) {
             if (err instanceof z.ZodError) {
                 res.status(400).json({ error: 'Dados inválidos.', details: err.errors });
                 return;
             }
-            if (err && typeof err === 'object' && (err as { code?: string }).code === 'P2002') {
-                res.status(409).json({ error: 'Este CPF/CNPJ já está cadastrado em outra conta.' });
+            const unique = uniqueViolationBody(err);
+            if (unique) {
+                res.status(409).json(unique);
                 return;
             }
-            throw err;
+            console.error('[USERS] update', err);
+            if (!res.headersSent) res.status(500).json({ error: 'Erro ao atualizar o cliente.' });
         }
     });
 
-    // ─── GET /api/users/:id/deletion-preview (ADMIN) ────────
+    // ─── GET /api/users/:id/deletion-preview (clientes.excluir) ──
     // D3: consequências reais da exclusão para o modal (modo hard × soft, o que será cancelado/anulado,
-    // o que fica preservado). Mesmas recusas do DELETE (auto-exclusão, ADMIN, já excluído).
-    router.get('/:id/deletion-preview', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+    // o que fica preservado). Mesmas recusas do DELETE (auto-exclusão, conta da equipe, já excluído) —
+    // assertUserDeletable (400) roda antes de qualquer 404 de alvo (crítica I1).
+    router.get('/:id/deletion-preview', authenticate, requirePermission('clientes.excluir'), async (req: Request, res: Response) => {
         try {
             const id = req.params.id as string;
             await assertUserDeletable(id, req.user!.userId);
-            res.json({ preview: await getDeletionPreview(id) });
+            const actor = await routeActor(req, res);
+            if (!actor) return;
+            // AUDFIN-04: o modal já sabe se o DELETE vai recusar (403) por faltar a chave do que a exclusão anularia.
+            const missingPermissions = await deletionMissingPermissions(id, deletionCan(actor));
+            res.json({
+                preview: {
+                    ...(await getDeletionPreview(id)),
+                    missingPermissions,
+                    blockedMessage: missingPermissions.length > 0 ? deletionMissingPermissionsMessage(missingPermissions) : null,
+                },
+            });
         } catch (err) {
             if (err instanceof UserDeletionError) {
                 res.status(err.httpStatus).json({ error: err.message });
@@ -219,14 +325,16 @@ export function registerUserCrudRoutes(router: Router) {
         }
     });
 
-    // ─── DELETE /api/users/:id (ADMIN) ──────────────────────
+    // ─── DELETE /api/users/:id (clientes.excluir) ───────────
     // D3: sem nenhum vínculo de negócio → exclusão física; com qualquer vínculo → soft delete com
     // anonimização, cancelando contratos em andamento, gravações futuras e cobranças PENDING
-    // (histórico PAID preservado). Regras em lib/userDeletion.ts.
-    router.delete('/:id', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+    // (histórico PAID preservado). Regras em lib/userDeletion.ts (conta da equipe → 400).
+    router.delete('/:id', authenticate, requirePermission('clientes.excluir'), async (req: Request, res: Response) => {
         try {
             const id = req.params.id as string;
-            const result = await deleteUser(id, req.user!.userId);
+            const actor = await routeActor(req, res);
+            if (!actor) return;
+            const result = await deleteUser(id, req.user!.userId, new Date(), { can: deletionCan(actor) });
             const { contracts, bookings, payments } = result.cancelled;
             const parts: string[] = [];
             if (contracts > 0) parts.push(`${contracts} contrato(s) cancelado(s)`);
@@ -242,7 +350,7 @@ export function registerUserCrudRoutes(router: Router) {
             res.json({ message, softDeleted: result.softDeleted, cancelled: result.cancelled, paidDuringDeletion: paidLate });
         } catch (err) {
             if (err instanceof UserDeletionError) {
-                res.status(err.httpStatus).json({ error: err.message });
+                res.status(err.httpStatus).json({ error: err.message, ...(err.extra ?? {}) });
                 return;
             }
             console.error('[DELETE USER ERROR]:', err);
@@ -250,17 +358,20 @@ export function registerUserCrudRoutes(router: Router) {
         }
     });
 
-    // ─── GET /api/users/:id/payment-overview (ADMIN) ────────
-    // The admin's window into a client's billing: auto-charge status, saved cards (last4),
+    // ─── GET /api/users/:id/payment-overview (clientes.ver, financeiro.ver ou cobrancas.automatica) ──
+    // The staff's window into a client's billing: auto-charge status, saved cards (last4),
     // and upcoming/overdue installments — mirrors what the client sees in "Meus Pagamentos".
-    router.get('/:id/payment-overview', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+    // DECISOES resposta 3: sem financeiro.ver some SÓ a receita consolidada; o card "Pagamento" do perfil
+    // (parcelas, cartão salvo, status da cobrança automática) segue para quem abre o perfil (clientes.ver).
+    // Ligar/desligar a cobrança automática continua só com cobrancas.automatica (PATCH /auto-charge).
+    router.get('/:id/payment-overview', authenticate, requirePermission('clientes.ver', 'financeiro.ver', 'cobrancas.automatica'), async (req: Request, res: Response) => {
         try {
             const userId = req.params.id as string;
             const user = await prisma.user.findUnique({
                 where: { id: userId },
-                select: { autoChargeEnabled: true, stripeCustomerId: true },
+                select: { autoChargeEnabled: true, stripeCustomerId: true, role: true },
             });
-            if (!user) { res.status(404).json({ error: 'Usuário não encontrado.' }); return; }
+            if (!user || user.role !== 'CLIENTE') { res.status(404).json({ ...CLIENT_NOT_FOUND }); return; }
 
             const cards = await prisma.savedPaymentMethod.findMany({
                 where: { userId },
@@ -295,14 +406,14 @@ export function registerUserCrudRoutes(router: Router) {
         }
     });
 
-    // ─── PATCH /api/users/:id/auto-charge (ADMIN) ───────────
-    // Admin toggles a client's automatic charging (enabling requires a saved CREDIT card — checkAutoChargeCard).
-    router.patch('/:id/auto-charge', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+    // ─── PATCH /api/users/:id/auto-charge (cobrancas.automatica) ──
+    // Staff toggles a client's automatic charging (enabling requires a saved CREDIT card — checkAutoChargeCard).
+    router.patch('/:id/auto-charge', authenticate, requirePermission('cobrancas.automatica'), async (req: Request, res: Response) => {
         try {
             const userId = req.params.id as string;
             const enabled = !!req.body?.enabled;
-            const target = await prisma.user.findUnique({ where: { id: userId }, select: { deletedAt: true } });
-            if (!target) { res.status(404).json({ error: 'Usuário não encontrado.' }); return; }
+            const target = await prisma.user.findUnique({ where: { id: userId }, select: { deletedAt: true, role: true, autoChargeEnabled: true } });
+            if (!target || target.role !== 'CLIENTE') { res.status(404).json({ ...CLIENT_NOT_FOUND }); return; }
             if (target.deletedAt) {
                 res.status(409).json({ error: 'Este cliente foi excluído. O cadastro não pode ser alterado.' });
                 return;
@@ -322,6 +433,10 @@ export function registerUserCrudRoutes(router: Router) {
                 await pinAutoChargeCard(userId, check.card);
             }
             await prisma.user.update({ where: { id: userId }, data: { autoChargeEnabled: enabled } });
+            // Nome próprio: AUTO_CHARGE_ENABLED/DISABLED são do próprio cliente (e marcadores em testes).
+            if (target.autoChargeEnabled !== enabled) {
+                await logAudit('USER', userId, 'AUTO_CHARGE_TOGGLED_BY_STAFF', req.user!.userId, { enabled });
+            }
             res.json({ autoChargeEnabled: enabled });
         } catch (err) {
             console.error('[AUTO-CHARGE-TOGGLE]', err);

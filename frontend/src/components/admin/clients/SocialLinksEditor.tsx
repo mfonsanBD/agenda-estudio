@@ -39,10 +39,12 @@ interface SocialLinksEditorProps {
     socialLinks: string | null;
     userId: string;
     onSaved: () => void;
+    /** Somente leitura: só os links, sem edição. */
+    readOnly?: boolean;
 }
 
 /** Editor de redes sociais (JSON serializado no campo socialLinks). */
-export default function SocialLinksEditor({ socialLinks, userId, onSaved }: SocialLinksEditorProps) {
+export default function SocialLinksEditor({ socialLinks, userId, onSaved, readOnly = false }: SocialLinksEditorProps) {
     const parsed: Record<string, string> = parseSocialLinks(socialLinks);
     const [editing, setEditing] = useState(false);
     const [links, setLinks] = useState(parsed);
@@ -56,7 +58,15 @@ export default function SocialLinksEditor({ socialLinks, userId, onSaved }: Soci
     return (
         <div style={{ gridColumn: 'span 2' }}>
             <div style={{ fontSize: '0.6875rem', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: '4px' }}>Redes Sociais</div>
-            {editing ? (
+            {readOnly ? (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', minHeight: '32px', alignItems: 'center', padding: '6px 8px' }}>
+                    {Object.entries(parsed).length > 0 ? Object.entries(parsed).map(([k, v]) => (
+                        <a key={k} href={v} target="_blank" rel="noreferrer" style={{ fontSize: '0.75rem', color: 'var(--accent-text)', textDecoration: 'underline' }}>
+                            {socials.find(s => s.key === k)?.icon} {socials.find(s => s.key === k)?.label || k}
+                        </a>
+                    )) : <span style={{ color: 'var(--text-muted)', fontSize: '0.8125rem' }}>—</span>}
+                </div>
+            ) : editing ? (
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '6px' }}>
                     {socials.map(s => (
                         <input key={s.key} className="form-input" placeholder={`${s.icon} ${s.label}`} value={links[s.key] || ''}

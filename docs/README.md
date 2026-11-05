@@ -25,6 +25,7 @@ Para a operação do estúdio: agenda do dia, finanças, contratos, relatórios 
 - [Financeiro](guia-admin/financeiro.md)
 - [Relatórios](guia-admin/relatorios.md)
 - [Configurações](guia-admin/configuracoes.md)
+- [Equipe (administradores e colaboradores)](guia-admin/equipe.md)
 
 ## ⚙️ Documentação técnica
 Para desenvolvedores: arquitetura, setup, modelo de dados, API, deploy.
@@ -35,6 +36,7 @@ Para desenvolvedores: arquitetura, setup, modelo de dados, API, deploy.
 - [Modelo de dados](tecnico/modelo-de-dados.md)
 - [Referência da API](tecnico/api.md)
 - [Autenticação](tecnico/autenticacao.md)
+- [Equipe e permissões](tecnico/permissoes-equipe.md)
 - [Pagamentos (Stripe + Cora)](tecnico/pagamentos.md)
 - [Notificações](tecnico/notificacoes.md)
 - [Jobs e tarefas agendadas](tecnico/jobs-e-crons.md)

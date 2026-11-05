@@ -1,7 +1,12 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize } from '../../middleware/auth.js';
+import { authenticate } from '../../middleware/auth.js';
+import { requirePermission } from '../../middleware/permissions.js';
+
+// Permissões (equipe): serviços (GET /addons/all, PUT /addons, DELETE /addons/:key) → config.servicos;
+// formas de pagamento (GET /payment-methods/all, PUT /payment-methods, PUT /payment-methods/boleto) →
+// config.pagamentos. As leituras públicas (GET /addons, GET /payment-methods) seguem sem login.
 
 export function registerMethodsRoutes(router: Router) {
     // ─── GET /api/pricing/addons (public — active only) ─────
@@ -14,16 +19,16 @@ export function registerMethodsRoutes(router: Router) {
         res.json({ addons });
     });
 
-    // ─── GET /api/pricing/addons/all (ADMIN — includes inactive) ───
+    // ─── GET /api/pricing/addons/all (config.servicos — includes inactive) ───
 
-    router.get('/addons/all', authenticate, authorize('ADMIN'), async (_req: Request, res: Response) => {
+    router.get('/addons/all', authenticate, requirePermission('config.servicos'), async (_req: Request, res: Response) => {
         const addons = await prisma.addOnConfig.findMany({
             orderBy: [{ sortOrder: 'asc' }, { key: 'asc' }],
         });
         res.json({ addons });
     });
 
-    // ─── PUT /api/pricing/addons (ADMIN) — batch upsert (create + edit) ──
+    // ─── PUT /api/pricing/addons (config.servicos) — batch upsert (create + edit) ──
 
     const addonItemSchema = z.object({
         key: z.string().min(1).regex(/^[A-Z0-9_]+$/, 'Use apenas MAIÚSCULAS, números e _'),
@@ -45,7 +50,7 @@ export function registerMethodsRoutes(router: Router) {
     });
     const updateAddonsSchema = z.object({ addons: z.array(addonItemSchema) });
 
-    router.put('/addons', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+    router.put('/addons', authenticate, requirePermission('config.servicos'), async (req: Request, res: Response) => {
         try {
             const { addons } = updateAddonsSchema.parse(req.body);
 
@@ -69,12 +74,12 @@ export function registerMethodsRoutes(router: Router) {
         }
     });
 
-    // ─── DELETE /api/pricing/addons/:key (ADMIN) — soft-delete if referenced ──
+    // ─── DELETE /api/pricing/addons/:key (config.servicos) — soft-delete if referenced ──
     // Contract.addOns / Booking.addOns store keys by reference (no FK). Hard-deleting a
     // referenced service would orphan pricing/display lookups, so we soft-delete
     // (active=false) when anything points at it and only hard-delete when truly unused.
 
-    router.delete('/addons/:key', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+    router.delete('/addons/:key', authenticate, requirePermission('config.servicos'), async (req: Request, res: Response) => {
         const key = req.params.key as string;
         const existing = await prisma.addOnConfig.findUnique({ where: { key } });
         if (!existing) {
@@ -107,7 +112,7 @@ export function registerMethodsRoutes(router: Router) {
     // resposta traz também `boleto` — o que as telas usam para mostrar/esconder o boleto.
     // SEC-3: esta rota é PÚBLICA (sem login), então `boleto` vem SANEADO: só `available` diz algo
     // (`enabled`/`providerEnabled` = available; `reason`/`message` = null). A posição da chave, o estado
-    // da integração Cora e o texto de administração ficam só em GET /payment-methods/all e nos PUT (ADMIN).
+    // da integração Cora e o texto de administração ficam só em GET /payment-methods/all e nos PUT (config.pagamentos).
 
     router.get('/payment-methods', async (_req: Request, res: Response) => {
         try {
@@ -134,14 +139,14 @@ export function registerMethodsRoutes(router: Router) {
         }
     });
 
-    // ─── GET /api/pricing/payment-methods/all (ADMIN — includes inactive) ───
+    // ─── GET /api/pricing/payment-methods/all (config.pagamentos — includes inactive) ───
 
     // E3: devolve também `boleto` (estado COMPLETO da chave-mestra + Cora — getBoletoStatus) para o switch
     // "Aceitar pagamento por boleto" das Configurações e para as telas do admin: `enabled` = chave,
     // `providerEnabled` = Cora ativa, `available` = efetivo, `reason`/`message` = por que não. (SEC-3: a
     // rota pública devolve só a versão saneada.)
 
-    router.get('/payment-methods/all', authenticate, authorize('ADMIN'), async (_req: Request, res: Response) => {
+    router.get('/payment-methods/all', authenticate, requirePermission('config.pagamentos'), async (_req: Request, res: Response) => {
         try {
             const { getBoletoStatus } = await import('../../lib/paymentGateway.js');
             const methods = await prisma.paymentMethodConfig.findMany({
@@ -169,7 +174,7 @@ export function registerMethodsRoutes(router: Router) {
         }
     });
 
-    // ─── PUT /api/pricing/payment-methods (ADMIN) ───────────
+    // ─── PUT /api/pricing/payment-methods (config.pagamentos) ─
 
     const updatePaymentMethodsSchema = z.object({
         methods: z.array(z.object({
@@ -190,7 +195,7 @@ export function registerMethodsRoutes(router: Router) {
     // BOLETO_PROVIDER_DISABLED, e NADA do lote é gravado. Desligar é sempre permitido; um boleto que já
     // estava ligado e segue ligado não bloqueia o salvamento dos outros métodos (ele só não fica efetivo).
 
-    router.put('/payment-methods', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+    router.put('/payment-methods', authenticate, requirePermission('config.pagamentos'), async (req: Request, res: Response) => {
         try {
             const { methods } = updatePaymentMethodsSchema.parse(req.body);
             const { getBoletoStatus, BOLETO_PROVIDER_DISABLED_MESSAGE } = await import('../../lib/paymentGateway.js');
@@ -242,13 +247,13 @@ export function registerMethodsRoutes(router: Router) {
         }
     });
 
-    // ─── PUT /api/pricing/payment-methods/boleto (ADMIN) ────
+    // ─── PUT /api/pricing/payment-methods/boleto (config.pagamentos) ─
     // E3: chave-mestra "Aceitar pagamento por boleto" (salva na hora, sem reenviar a lista de métodos).
     // Ligar exige a integração Cora ativa (400 BOLETO_PROVIDER_DISABLED); desligar é sempre permitido.
 
     const boletoSwitchSchema = z.object({ enabled: z.boolean() });
 
-    router.put('/payment-methods/boleto', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+    router.put('/payment-methods/boleto', authenticate, requirePermission('config.pagamentos'), async (req: Request, res: Response) => {
         try {
             const { enabled } = boletoSwitchSchema.parse(req.body);
             const { getBoletoStatus, BOLETO_PROVIDER_DISABLED_MESSAGE } = await import('../../lib/paymentGateway.js');

@@ -166,9 +166,16 @@ export default function BookingModal({ isOpen = true, date, time, tier, price, o
         return cTier === slotTier;
     };
 
+    /**
+     * Sessões do plano já usadas. AUDFIN-05: no FIXO, a conta do servidor (planSessionsUsed — a mesma do POST /bookings:
+     * Reservado conta, a sessão EXTRA não); sem o campo (resposta antiga), a conta de antes.
+     */
+    const planUsed = (c: ContractWithStats): number =>
+        c.type === 'FIXO' && c.planSessionsUsed != null ? c.planSessionsUsed : c.completedBookings;
+
     const hasCredits = (c: ContractWithStats): boolean => {
         if (c.type === 'CUSTOM') return (c.customCreditsRemaining || 0) > 0;
-        return c.completedBookings < c.totalBookings;
+        return planUsed(c) < c.totalBookings;
     };
 
     const compatibleContracts = contracts.filter(c => isCompatible(c) && hasCredits(c));
@@ -292,7 +299,7 @@ export default function BookingModal({ isOpen = true, date, time, tier, price, o
                                                 <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '2px' }}>
                                                     {c.type === 'CUSTOM'
                                                         ? `Saldo: ${c.customCreditsRemaining} reagendamento(s) livre(s)`
-                                                        : `Saldo: ${c.totalBookings - c.completedBookings} gravações disponíveis de ${c.totalBookings}`
+                                                        : `Saldo: ${c.totalBookings - planUsed(c)} gravações disponíveis de ${c.totalBookings}`
                                                     }
                                                 </div>
                                             </div>

@@ -1,6 +1,7 @@
 import BottomSheetModal from '../BottomSheetModal';
 import InlineCheckout from '../InlineCheckout';
 import { ignoreMultiClick } from '../../hooks/useWizardStep';
+import { usePermission } from '../../hooks/usePermission';
 
 type ChargeMethod = 'CARTAO' | 'PIX' | 'BOLETO';
 
@@ -55,6 +56,10 @@ interface ChargeNowSheetProps {
  *
  * Erros: só dentro do InlineCheckout (uma mensagem, limpa ao trocar de aba). O `onError` segue avisando
  * o pai, mas o sheet não repete o alerta.
+ *
+ * Equipe (D2): cobrar exige `cobrancas.cobrar` — os chamadores só abrem o sheet com ela. Se mesmo assim
+ * abrir sem a chave (permissão retirada com a tela aberta), mostra o aviso em vez de um checkout que daria
+ * 403. O cartão salvo do cliente fica a cargo do InlineCheckout (`cobrancas.cartao_salvo`).
  */
 export default function ChargeNowSheet({
     paymentId,
@@ -72,6 +77,8 @@ export default function ChargeNowSheet({
     dismissLabel = 'Deixar pendente (cliente paga depois)',
     client,
 }: ChargeNowSheetProps) {
+    const { can } = usePermission();
+    const canCharge = can('cobrancas.cobrar');
     return (
         <BottomSheetModal isOpen onClose={onDismiss} hideHeader size="sm" className="admin-sheet" title={title}>
             <div style={{ padding: '24px 28px' }}>
@@ -79,6 +86,11 @@ export default function ChargeNowSheet({
                 <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', margin: '0 0 16px' }}>
                     {subtitle}
                 </p>
+                {!canCharge ? (
+                    <div className="admin-alert admin-alert--warning" role="note">
+                        Você não tem a permissão “Cobrar o cliente”. A cobrança continua pendente: o cliente paga pelo app.
+                    </div>
+                ) : (
                 <InlineCheckout
                     amount={amount}
                     paymentId={paymentId}
@@ -94,6 +106,7 @@ export default function ChargeNowSheet({
                     onError={onError}
                     onCancel={onDismiss}
                 />
+                )}
                 <button key="charge-dismiss" type="button" onClick={ignoreMultiClick(onDismiss)} className="btn-admin-ghost" style={{ marginTop: 12, width: '100%' }}>
                     {dismissLabel}
                 </button>

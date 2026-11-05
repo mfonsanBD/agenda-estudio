@@ -1,13 +1,17 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize } from '../../middleware/auth.js';
+import { authenticate } from '../../middleware/auth.js';
+import { requirePermission, requireAllPermissions, enforceRuleResult, can, denyPermission } from '../../middleware/permissions.js';
+import { requiredForContractPatch, requiredForContractCancel } from '../../lib/permissionRules.js';
+import { getStaffRecipientIds } from '../../lib/staffRecipients.js';
+import { requirePermissionIfStaff, routeActor } from '../bookings/permissionGuards.js';
 import { BookingStatus, Prisma } from '../../generated/prisma/client.js';
 import { getBasePriceDynamic, applyDiscount, calculateEndTime, getPackageSlots, getSlotDuration, studioDateTime } from '../../utils/pricing.js';
 import { getConfig } from '../../lib/businessConfig.js';
 import { getProviderForMethod, getBoletoStatus } from '../../lib/paymentGateway.js';
 import { saoPauloParts } from '../../lib/spTime.js';
-import { updateContractSchema, resolveCancellationSchema } from './validators.js';
+import { updateContractSchema, resolveCancellationSchema, renewContractSchema } from './validators.js';
 import { createSlotClaimer, DELETED_CLIENT_ERROR } from './contract.creation.js';
 import { notifyEvent } from '../notifications/notificationService.js';
 import {
@@ -16,6 +20,10 @@ import {
     effectiveCancellationBasis, loadFineBasisPayments, isUnpaidPlanInstallment, isCancellationFine,
 } from '../../lib/cancellationFine.js';
 import { acquireMutexBlocking, releaseMutex } from '../../lib/redis.js';
+import {
+    fixoCapUsageWhere, FIXO_EXTRA_MARK_WHERE, OPEN_CHARGE_STATUSES, NO_OPEN_CHARGE_BOOKING_WHERE, SESSION_CHARGE_MARK_WHERE,
+} from '../bookings/booking.service.js';
+import type { Actor } from '../../middleware/permissions.js';
 
 /** 'YYYY-MM-DD' + n dias (UTC). */
 const addDaysYmd = (ds: string, n: number): string => {
@@ -175,9 +183,10 @@ async function loadRenewals(contractIds: string[]): Promise<Map<string, string>>
 }
 
 /**
- * Avisa os admins (persistida + push) de um pedido de cancelamento recém-feito. A dedup é POR PEDIDO
- * (`requestedAt`): um contrato reaberto pelo admin e pedido de novo no mesmo dia avisa outra vez.
- * Nunca lança.
+ * Avisa a equipe (persistida + push) de um pedido de cancelamento recém-feito: ADMIN ativo + COLABORADOR
+ * ativo com a permissão do evento (`contratos.multa` — STAFF_EVENT_PERMISSIONS); nunca BLOCKED nem
+ * excluído. A dedup é POR PEDIDO (`requestedAt`): um contrato reaberto e pedido de novo no mesmo dia
+ * avisa outra vez. Nunca lança.
  */
 async function notifyAdminsCancellationRequested(
     contract: { id: string; name: string },
@@ -185,30 +194,34 @@ async function notifyAdminsCancellationRequested(
     fine: { fineAmount: number; requestedAt: Date },
 ): Promise<void> {
     try {
-        const admins = await prisma.user.findMany({ where: { role: 'ADMIN', deletedAt: null }, select: { id: true } });
-        for (const admin of admins) {
+        const staffIds = await getStaffRecipientIds('admin_cancellation_requested');
+        for (const staffId of staffIds) {
             await notifyEvent('admin_cancellation_requested', {
-                userId: admin.id,
+                userId: staffId,
                 vars: { cliente: clientName, contrato: contract.name, valor: formatBRL(fine.fineAmount) },
                 entityType: 'CONTRACT',
                 entityId: contract.id,
-                dedupKey: `cancel-request:${contract.id}:${fine.requestedAt.getTime()}:${admin.id}`,
+                dedupKey: `cancel-request:${contract.id}:${fine.requestedAt.getTime()}:${staffId}`,
             }).catch(() => '');
         }
     } catch (err) {
-        console.error('[cancellation] Falha ao avisar os admins do pedido de cancelamento:', err);
+        console.error('[cancellation] Falha ao avisar a equipe do pedido de cancelamento:', err);
     }
 }
 
 /**
- * Remove o aviso persistido "pedido de cancelamento" dos admins quando o pedido deixa de estar em
- * análise (resolvido, cancelado ou contrato reaberto): sem isto ele reapareceria no sino assim que o
- * alerta computado "Cancelamento pendente" some. Nunca lança.
+ * Remove o aviso persistido "pedido de cancelamento" da EQUIPE (ADMIN e COLABORADOR — inclusive de quem
+ * perdeu a permissão depois de receber) quando o pedido deixa de estar em análise (resolvido, cancelado
+ * ou contrato reaberto): sem isto ele reapareceria no sino assim que o alerta computado "Cancelamento
+ * pendente" some. Nunca lança.
  */
 async function clearAdminCancellationRequestNotices(contractId: string): Promise<void> {
     try {
         await prisma.notification.deleteMany({
-            where: { type: 'CANCELLATION_PENDING', entityType: 'CONTRACT', entityId: contractId, user: { role: 'ADMIN' } },
+            where: {
+                type: 'CANCELLATION_PENDING', entityType: 'CONTRACT', entityId: contractId,
+                user: { role: { in: ['ADMIN', 'COLABORADOR'] } },
+            },
         });
     } catch (err) {
         console.error('[cancellation] Falha ao limpar o aviso do pedido de cancelamento:', err);
@@ -296,14 +309,102 @@ const cancellationNotPendingBody = (status: string | null | undefined) => ({
     code: 'CANCELLATION_NOT_PENDING' as const,
 });
 
+// ─── Anular cobrança em aberto é da baixa (R5) — caminhos do CONTRATO (conserto 5) ─────
+
+/**
+ * Cobranças EM ABERTO (PENDING/FAILED) por contrato — um groupBy só (lista da equipe). A tela usa no AVULSO, em que o
+ * contrato é a própria sessão: sem a baixa, "Cancelar contrato" não aparece com cobrança em aberto (ATU5-03).
+ */
+async function openChargeCountsByContract(contractIds: readonly string[]): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    if (contractIds.length === 0) return out;
+    const rows = await prisma.payment.groupBy({
+        by: ['contractId'],
+        where: { contractId: { in: [...contractIds] }, status: { in: OPEN_CHARGE_STATUSES } },
+        _count: { _all: true },
+    });
+    for (const r of rows) if (r.contractId) out.set(r.contractId, r._count._all);
+    return out;
+}
+
+/**
+ * Cancelar o contrato — DELETE, PATCH status=CANCELLED e a DECISÃO do pedido de cancelamento (resolve-cancellation) —
+ * anula as cobranças em aberto dele. A parte que é cobrança de SESSÃO segue o princípio "anular cobrança em aberto é da
+ * baixa" (o mesmo do DELETE /bookings/:id): sem cobrancas.baixa → 403 antes de qualquer escrita. Qual parte é essa:
+ *  • AVULSO (ATU5-03): o contrato É a sessão → toda cobrança em aberto dele (a da sessão e a dos extras dela);
+ *  • qualquer outro tipo — SERVIÇO, FIXO, FLEX, Personalizado (AUDFIN6-01/ATU6-02): a cobrança PRÓPRIA de uma gravação
+ *    (Payment com bookingId e a marca sessionCharge — gravação vinculada a um SERVIÇO, sessão EXTRA do FIXO, sessão
+ *    cobrada à parte dentro do plano) em aberto (PENDING/FAILED), inclusive a de uma gravação já feita (a anulação do
+ *    contrato não olha o status da sessão).
+ * As PARCELAS do contrato (sem bookingId) e os serviços extras de sessão de plano continuam anulados só com
+ * contratos.cancelar / contratos.multa (decisão do dono, D2). ADMIN e quem tem a baixa seguem como antes.
+ */
+export function contractCancelBaixaChargeWhere(contract: { id: string; type: string }): Prisma.PaymentWhereInput {
+    const open: Prisma.PaymentWhereInput = { contractId: contract.id, status: { in: OPEN_CHARGE_STATUSES } };
+    return contract.type === 'AVULSO' ? open : { ...open, bookingId: { not: null }, ...SESSION_CHARGE_MARK_WHERE };
+}
+
+export const AVULSO_CANCEL_OPEN_CHARGE_NEEDS_BAIXA = {
+    error: 'Este avulso tem cobrança em aberto: cancelar o contrato anula a cobrança da sessão, e isso exige a permissão “Marcar como pago, anular ou estornar”. Peça a quem pode dar baixa.',
+    code: 'PERMISSION_DENIED',
+    permission: 'cobrancas.baixa',
+} as const;
+
+/** AUDFIN6-01/ATU6-02: o mesmo 403 (code/permission) fora do avulso, com o texto do caso — a cobrança própria de uma gravação. */
+export const SESSION_CHARGE_CANCEL_NEEDS_BAIXA = {
+    error: 'Uma gravação deste contrato tem cobrança própria em aberto (a da sessão, cobrada à parte): cancelar o contrato anula essa cobrança, e isso exige a permissão “Marcar como pago, anular ou estornar”. Peça a quem pode dar baixa.',
+    code: 'PERMISSION_DENIED',
+    permission: 'cobrancas.baixa',
+} as const;
+
+/** O corpo do 403 quando o ator não pode cancelar este contrato sem a baixa, ou null quando pode. */
+async function contractCancelNeedsBaixa(
+    contract: { id: string; type: string },
+    actor: Actor,
+): Promise<typeof AVULSO_CANCEL_OPEN_CHARGE_NEEDS_BAIXA | typeof SESSION_CHARGE_CANCEL_NEEDS_BAIXA | null> {
+    if (can(actor, 'cobrancas.baixa')) return null;
+    if ((await prisma.payment.count({ where: contractCancelBaixaChargeWhere(contract) })) === 0) return null;
+    return contract.type === 'AVULSO' ? AVULSO_CANCEL_OPEN_CHARGE_NEEDS_BAIXA : SESSION_CHARGE_CANCEL_NEEDS_BAIXA;
+}
+
+/**
+ * Por contrato, quantas cobranças em aberto o cancelamento só anula COM a baixa (contractCancelBaixaChargeWhere): no
+ * avulso, todas as em aberto (= openChargeCount); nos outros tipos, a cobrança própria marcada de uma gravação. Dois
+ * groupBy (lista da equipe) — a tela sabe, sem outra chamada, que "Cancelar contrato" / a decisão do pedido pedem a baixa.
+ */
+async function sessionChargeCountsByContract(contractIds: readonly string[]): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    if (contractIds.length === 0) return out;
+    const rows = await prisma.payment.groupBy({
+        by: ['contractId'],
+        where: { contractId: { in: [...contractIds] }, status: { in: OPEN_CHARGE_STATUSES }, bookingId: { not: null }, ...SESSION_CHARGE_MARK_WHERE },
+        _count: { _all: true },
+    });
+    for (const r of rows) if (r.contractId) out.set(r.contractId, r._count._all);
+    return out;
+}
+
+/**
+ * AUDFIN-03: pausar o FIXO cancela as gravações futuras do plano (a retomada as recria) — cancelar uma sessão com
+ * cobrança em aberto (extra contratado nela) a anula, e anular é da baixa. Sem cobrancas.baixa → 403 antes de
+ * qualquer escrita. A sessão EXTRA (fixoExtra, cobrada à parte) não é cancelada pela pausa.
+ */
+const PAUSE_OPEN_CHARGE_NEEDS_BAIXA = {
+    error: 'Uma gravação que a pausa cancelaria tem cobrança em aberto: cancelar anula a cobrança, e isso exige a permissão “Marcar como pago, anular ou estornar”. Peça a quem pode dar baixa.',
+    code: 'PERMISSION_DENIED',
+    permission: 'cobrancas.baixa',
+} as const;
+
 /** `kind` (ex.: 'CANCELLATION_FINE') exposto ao lado de cada cobrança — as telas não leem o metadata. */
 const withPaymentKind = <T extends { metadata?: unknown }>(p: T): T & { kind: string | null } => ({ ...p, kind: paymentKind(p.metadata) });
 
 export function registerLifecycleRoutes(router: Router) {
 
-// ─── GET /api/contracts (ADMIN) ─────────────────────────
+// ─── GET /api/contracts (equipe) ─────────────────────────
+// Tela Contratos (`contratos.ver`) e o seletor de plano do "Novo agendamento" (`agendamentos.criar` —
+// CreateBookingModal lista os planos do cliente; proposta §2.5).
 
-router.get('/', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.get('/', authenticate, requirePermission('contratos.ver', 'agendamentos.criar'), async (req: Request, res: Response) => {
     // Bounded by default (no full-table scan); accepts optional ?page/?limit/?status without
     // breaking the existing `{ contracts }` response shape (adds an optional `pagination` block).
     const limit = Math.min(500, Math.max(1, parseInt(String(req.query.limit ?? ''), 10) || 200));
@@ -331,16 +432,23 @@ router.get('/', authenticate, authorize('ADMIN'), async (req: Request, res: Resp
     // data do pedido/cancelamento, multa gerada — e o botão "Renovar" sabe se o contrato já foi renovado.
     // Consultas em lote (nº fixo, seja qual for o tamanho da página).
     const ids = contracts.map(c => c.id);
-    const [cancellation, renewals] = await Promise.all([loadCancellationInfo(contracts), loadRenewals(ids)]);
+    const [cancellation, renewals, openCharges, sessionCharges] = await Promise.all([
+        loadCancellationInfo(contracts), loadRenewals(ids), openChargeCountsByContract(ids), sessionChargeCountsByContract(ids),
+    ]);
     const now = new Date();
     const enriched = contracts.map(c => {
         const renewedToId = renewals.get(c.id) ?? null;
+        const openChargeCount = openCharges.get(c.id) ?? 0;
         return {
             ...c,
             ...cancellation.get(c.id),
             alreadyRenewed: !!renewedToId,
             renewedToId,
             ...renewalState(c, !!renewedToId, now),
+            // ATU5-03: cobranças em aberto do contrato (PENDING/FAILED) — no avulso, as da própria sessão.
+            openChargeCount,
+            // AUDFIN6-01/ATU6-02: as que cancelar o contrato (ou decidir o pedido) só anula com a baixa — a conta do 403.
+            openSessionChargeCount: c.type === 'AVULSO' ? openChargeCount : (sessionCharges.get(c.id) ?? 0),
         };
     });
 
@@ -390,6 +498,11 @@ router.get('/my', authenticate, async (req: Request, res: Response) => {
         loadCancellationInfo(contracts),
         loadRenewals(contracts.map(c => c.id)),
     ]);
+
+    // AUDFIN-05: vagas do plano FIXO usadas pela MESMA regra do servidor (fixoCapUsageWhere — a do POST / do cliente):
+    // RESERVED também ocupa e a sessão EXTRA (fixoExtra) não. `completedBookings` segue como estava (outros leitores).
+    const fixoUsed = new Map(await Promise.all(contracts.filter(c => c.type === 'FIXO').map(async c =>
+        [c.id, await prisma.booking.count({ where: fixoCapUsageWhere(c.id) })] as const)));
 
     // Enrich with completed bookings count and addon usage
     const sessionsPerMonthMy = await getConfig('sessions_per_month');
@@ -449,6 +562,7 @@ router.get('/my', authenticate, async (req: Request, res: Response) => {
             alreadyRenewed: renewals.has(c.id),
             completedBookings,
             totalBookings,
+            ...(c.type === 'FIXO' ? { planSessionsUsed: fixoUsed.get(c.id) ?? 0 } : {}),
             ...(addonUsage ? { addonUsage } : {})
         };
         return result;
@@ -458,20 +572,24 @@ router.get('/my', authenticate, async (req: Request, res: Response) => {
 });
 
 // ─── GET /api/contracts/:id ─────────────────────────────
+// Rota MISTA: o cliente lê o próprio contrato; a equipe lê qualquer um com `contratos.ver` (sem ela,
+// 403 — nunca o ramo do cliente).
 
-router.get('/:id', authenticate, async (req: Request, res: Response) => {
+router.get('/:id', authenticate, requirePermissionIfStaff('contratos.ver'), async (req: Request, res: Response) => {
     const id = req.params.id as string;
-    const isAdmin = req.user!.role === 'ADMIN';
+    const actor = await routeActor(req, res);
+    if (!actor) return;
+    const isStaff = actor.isStaff; // equipe já conferida pela guarda (contratos.ver)
 
     const contract = await prisma.contract.findFirst({
         where: {
             id,
-            ...(isAdmin ? {} : { userId: req.user!.userId }),
+            ...(isStaff ? {} : { userId: req.user!.userId }),
         },
         include: {
-            // deletedAt: selo "Cliente excluído" (D3). cpfCnpj SÓ para o admin (E1): o "Cobrar" do detalhe
-            // usa o CPF do CLIENTE no PIX — nunca o do admin logado.
-            user: { select: { id: true, name: true, email: true, deletedAt: true, cpfCnpj: isAdmin } },
+            // deletedAt: selo "Cliente excluído" (D3). cpfCnpj SÓ para a equipe (E1): o "Cobrar" do detalhe
+            // usa o CPF do CLIENTE no PIX — nunca o de quem está logado.
+            user: { select: { id: true, name: true, email: true, deletedAt: true, cpfCnpj: isStaff } },
             bookings: {
                 orderBy: [{ date: 'asc' }, { startTime: 'asc' }],
                 select: {
@@ -483,8 +601,8 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
                     tierApplied: true,
                     price: true,
                     clientNotes: true,
-                    // E11: nota interna e nome do operador só para o admin (a rota também atende o dono do contrato).
-                    adminNotes: isAdmin,
+                    // E11: nota interna e nome do operador só para a equipe (a rota também atende o dono do contrato).
+                    adminNotes: isStaff,
                     platforms: true,
                     platformLinks: true,
                     addOns: true,
@@ -495,7 +613,7 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
                     isLivestream: true,
                     streamMetrics: true,
                     recordingStartedAt: true,
-                    recordingStartedByName: isAdmin,
+                    recordingStartedByName: isStaff,
                     statusReason: true,
                     originalDate: true,
                     makeupStatus: true,
@@ -530,9 +648,14 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
     });
 });
 
-// ─── PATCH /api/contracts/:id (ADMIN update) ────────────
+// ─── PATCH /api/contracts/:id (equipe) ────────────
+// Rota multiuso: permissão por VALOR alterado (DECISÕES D3 / crítica F3-F4 — o "Editar" reenvia endDate e
+// os créditos atuais do FLEX): status CANCELLED → contratos.cancelar; ACTIVE/COMPLETED/EXPIRED, endDate,
+// contractUrl, paymentMethod → contratos.editar; flexCreditsRemaining, addOns, boletoAllowed →
+// contratos.condicoes; contrato em PENDING_CANCELLATION com mudança de status (cancelar = isentar a
+// multa; reabrir = recusar o pedido) → também contratos.multa. Regras em lib/permissionRules.
 
-router.patch('/:id', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.patch('/:id', authenticate, requirePermission('contratos.editar', 'contratos.cancelar', 'contratos.condicoes'), async (req: Request, res: Response) => {
     let cancelLock: string | null = null;
     try {
         const id = req.params.id as string;
@@ -543,6 +666,10 @@ router.patch('/:id', authenticate, authorize('ADMIN'), async (req: Request, res:
             res.status(404).json({ error: 'Contrato não encontrado.' });
             return;
         }
+        // Permissão por valor alterado, ANTES de qualquer efeito (a linha completa do Prisma é o registro atual).
+        if (!(await enforceRuleResult(req, res, requiredForContractPatch(data, contract)))) return;
+        const actor = await routeActor(req, res);
+        if (!actor) return;
         // D3: contrato de cliente excluído não volta a valer (reativar recriaria obrigação para uma
         // conta anonimizada). Encerrar/ajustar link, forma e datas continua permitido (o "Editar" da
         // lista reenvia os créditos atuais do FLEX — só uma MUDANÇA conta).
@@ -570,7 +697,9 @@ router.patch('/:id', authenticate, authorize('ADMIN'), async (req: Request, res:
         }
 
         const updateData: any = {};
-        if (data.status) updateData.status = data.status;
+        // Só uma MUDANÇA de status é gravada: reenviar o status lido não pode sobrescrever um status novo
+        // gravado por outra tela no meio do caminho (ex.: PENDING_CANCELLATION do pedido do cliente).
+        if (data.status && data.status !== contract.status) updateData.status = data.status;
         if (data.endDate) updateData.endDate = new Date(data.endDate + 'T00:00:00');
         if (data.flexCreditsRemaining !== undefined) updateData.flexCreditsRemaining = data.flexCreditsRemaining;
         if (data.contractUrl !== undefined) updateData.contractUrl = data.contractUrl || null;
@@ -580,12 +709,30 @@ router.patch('/:id', authenticate, authorize('ADMIN'), async (req: Request, res:
         // addOns is NOT applied via updateData — it goes through applyContractServiceChange,
         // which also recomputes the future PENDING installments and future bookings' services.
 
-        // Recurring services edit (FIXO/FLEX ACTIVE only) — affects the FUTURE only.
-        if (data.addOns !== undefined) {
-            if (contract.status !== 'ACTIVE' || (contract.type !== 'FIXO' && contract.type !== 'FLEX')) {
-                res.status(400).json({ error: 'Serviços só podem ser editados em contratos Fixo/Flex ativos.' });
+        // Recurring services edit (FIXO/FLEX ACTIVE only) — validado ANTES de qualquer escrita.
+        if (data.addOns !== undefined && (contract.status !== 'ACTIVE' || (contract.type !== 'FIXO' && contract.type !== 'FLEX'))) {
+            res.status(400).json({ error: 'Serviços só podem ser editados em contratos Fixo/Flex ativos.' });
+            return;
+        }
+
+        // Mudança de status (fora do cancelamento, que tem trava e releitura próprias): gravada SÓ se o
+        // contrato ainda está no status LIDO — a permissão foi decidida sobre ele (se o cliente pediu o
+        // cancelamento entre a leitura e a escrita, reabrir passaria a exigir contratos.multa). Corrida →
+        // 409 sem efeito nenhum; o front recarrega.
+        if (updateData.status && updateData.status !== 'CANCELLED') {
+            const moved = await prisma.contract.updateMany({ where: { id, status: contract.status }, data: { status: updateData.status } });
+            if (moved.count === 0) {
+                res.status(409).json({
+                    error: 'O contrato mudou em outra tela (por exemplo, o cliente pediu o cancelamento). Atualize a lista e tente de novo.',
+                    code: 'CONTRACT_STATUS_CHANGED',
+                });
                 return;
             }
+            delete updateData.status; // já gravado acima
+        }
+
+        // Recurring services edit (FIXO/FLEX ACTIVE only) — affects the FUTURE only.
+        if (data.addOns !== undefined) {
             const { applyContractServiceChange } = await import('../../lib/paymentEffects.js');
             await applyContractServiceChange(id, data.addOns);
         }
@@ -607,6 +754,19 @@ router.patch('/:id', authenticate, authorize('ADMIN'), async (req: Request, res:
             }
             const fresh = await prisma.contract.findUnique({ where: { id }, select: { status: true } });
             cancelingViaPatch = !!fresh && fresh.status !== 'CANCELLED';
+            // F3 relido com a trava: o cliente pediu o cancelamento depois da leitura → cancelar agora
+            // isentaria a multa, decisão de contratos.multa (a trava é liberada no finally).
+            if (cancelingViaPatch && fresh!.status === 'PENDING_CANCELLATION' && !can(actor, 'contratos.multa')) {
+                denyPermission(res, 'contratos.multa');
+                return;
+            }
+            // ATU5-03/AUDFIN6-01: cancelar o contrato anula a cobrança de sessão em aberto (o avulso inteiro; nos outros
+            // tipos, a cobrança própria de uma gravação) — só com a baixa.
+            const needsBaixa = cancelingViaPatch ? await contractCancelNeedsBaixa(contract, actor) : null;
+            if (needsBaixa) {
+                res.status(403).json(needsBaixa);
+                return;
+            }
         }
         if (cancelingViaPatch) {
             // Versão detalhada: o que o provedor respondeu (cobrança já paga / não cancelável) volta ao
@@ -671,9 +831,11 @@ router.patch('/:id', authenticate, authorize('ADMIN'), async (req: Request, res:
     }
 });
 
-// ─── DELETE /api/contracts/:id (ADMIN cancel) ───────────
+// ─── DELETE /api/contracts/:id (equipe — cancelar) ───────────
+// contratos.cancelar; com pedido de cancelamento em análise (PENDING_CANCELLATION) cancelar por aqui
+// equivale a ISENTAR a multa → também contratos.multa (crítica F3).
 
-router.delete('/:id', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.delete('/:id', authenticate, requirePermission('contratos.cancelar'), async (req: Request, res: Response) => {
     const id = req.params.id as string;
 
     const contract = await prisma.contract.findUnique({ where: { id } });
@@ -686,6 +848,9 @@ router.delete('/:id', authenticate, authorize('ADMIN'), async (req: Request, res
         res.status(400).json({ error: 'Contrato já está cancelado.' });
         return;
     }
+    if (!(await enforceRuleResult(req, res, requiredForContractCancel(contract)))) return;
+    const actor = await routeActor(req, res);
+    if (!actor) return;
 
     // Serializado com a decisão do pedido e o PATCH status=CANCELLED: o status é RELIDO com a trava. Se
     // outra requisição cancelou no meio do caminho (ex.: a decisão que gerou a multa), este DELETE não
@@ -699,6 +864,18 @@ router.delete('/:id', authenticate, authorize('ADMIN'), async (req: Request, res
         const fresh = await prisma.contract.findUnique({ where: { id }, select: { status: true } });
         if (!fresh || fresh.status === 'CANCELLED') {
             res.status(400).json({ error: 'Contrato já está cancelado.' });
+            return;
+        }
+        // F3 relido com a trava: o pedido de cancelamento chegou depois da leitura → também contratos.multa.
+        if (fresh.status === 'PENDING_CANCELLATION' && !can(actor, 'contratos.multa')) {
+            denyPermission(res, 'contratos.multa');
+            return;
+        }
+        // ATU5-03/AUDFIN6-01: cancelar o contrato anula a cobrança de sessão em aberto (o avulso inteiro; nos outros tipos,
+        // a cobrança própria de uma gravação) — só com a baixa.
+        const needsBaixa = await contractCancelNeedsBaixa(contract, actor);
+        if (needsBaixa) {
+            res.status(403).json(needsBaixa);
             return;
         }
 
@@ -847,8 +1024,8 @@ router.post('/:id/request-cancellation', authenticate, async (req: Request, res:
     });
 });
 
-// ─── POST /api/contracts/:id/resolve-cancellation (ADMIN)
-router.post('/:id/resolve-cancellation', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+// ─── POST /api/contracts/:id/resolve-cancellation (equipe — contratos.multa)
+router.post('/:id/resolve-cancellation', authenticate, requirePermission('contratos.multa'), async (req: Request, res: Response) => {
     let cancelLock: string | null = null;
     try {
         const id = req.params.id as string;
@@ -879,6 +1056,17 @@ router.post('/:id/resolve-cancellation', authenticate, authorize('ADMIN'), async
         const fresh = await prisma.contract.findUnique({ where: { id }, select: { status: true } });
         if (fresh?.status !== 'PENDING_CANCELLATION') {
             res.status(409).json(cancellationNotPendingBody(fresh?.status));
+            return;
+        }
+        // ATU6-02/AUDFIN6-01: decidir o pedido (cobrar ou isentar a multa) cancela o contrato e anula o que ele tem em
+        // aberto — a cobrança de sessão (o avulso inteiro; nos outros tipos, a cobrança própria de uma gravação já feita
+        // ou em andamento, que o pedido não cancelou) só com a baixa. 403 antes de qualquer escrita (a base da multa de um
+        // pedido antigo é gravada logo abaixo); o contrato continua em análise.
+        const actor = await routeActor(req, res);
+        if (!actor) return;
+        const needsBaixa = await contractCancelNeedsBaixa(contract, actor);
+        if (needsBaixa) {
+            res.status(403).json(needsBaixa);
             return;
         }
 
@@ -1024,11 +1212,17 @@ router.post('/:id/resolve-cancellation', authenticate, authorize('ADMIN'), async
     }
 });
 
-// ─── POST /api/contracts/:id/renew (ADMIN) ──────────────
-router.post('/:id/renew', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+// ─── POST /api/contracts/:id/renew (equipe — contratos.criar E cobrancas.baixa) ─────────────────────────
+// A renovação cria o contrato novo ATIVO com as sessões (FIXO) ou os créditos (FLEX) e NENHUMA parcela:
+// na prática, um plano entregue sem cobrança. Pelo DECISOES D3/resposta 2 ("nada criado sem a baixa nasce
+// pago"), além de "Criar e renovar contratos" ela exige "Marcar como pago, anular ou estornar" — como a
+// parcela de valor zero no POST /contracts. O ADMIN passa sempre (comportamento dele não muda). Gerar as
+// parcelas PENDING na renovação (e voltar a bastar contratos.criar) depende de decisão do dono.
+router.post('/:id/renew', authenticate, requireAllPermissions('contratos.criar', 'cobrancas.baixa'), async (req: Request, res: Response) => {
     try {
         const id = req.params.id as string;
-        const { durationMonths = 3, tier, type, startDate: startStr } = req.body;
+        // Corpo validado ANTES de qualquer leitura: duração 3 ou 6, tipo FIXO/FLEX, faixa do enum.
+        const { durationMonths, tier, type, startDate: startStr } = renewContractSchema.parse(req.body ?? {});
 
         const original = await prisma.contract.findUnique({ where: { id }, include: { user: { select: { deletedAt: true } } } });
         if (!original) { res.status(404).json({ error: 'Contrato não encontrado.' }); return; }
@@ -1139,13 +1333,17 @@ router.post('/:id/renew', authenticate, authorize('ADMIN'), async (req: Request,
 
         res.status(201).json({ contract: renewed, message: `Contrato renovado com sucesso!${renewNote}` });
     } catch (err: any) {
+        if (err instanceof z.ZodError) {
+            res.status(400).json({ error: 'Dados inválidos.', details: err.errors });
+            return;
+        }
         console.error('[renew]', err);
         res.status(500).json({ error: err.message || 'Erro ao renovar contrato.' });
     }
 });
 
-// ─── PATCH /api/contracts/:id/pause (ADMIN) ─────────────
-router.patch('/:id/pause', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+// ─── PATCH /api/contracts/:id/pause (equipe — contratos.editar: "Editar, pausar e retomar") ─────────────
+router.patch('/:id/pause', authenticate, requirePermission('contratos.editar'), async (req: Request, res: Response) => {
     try {
         const id = req.params.id as string;
         const { reason, resumeDate } = req.body;
@@ -1166,11 +1364,41 @@ router.patch('/:id/pause', authenticate, authorize('ADMIN'), async (req: Request
         // pausar CUSTOM cancelava as sessões pré-geradas e o resume (só FIXO) não recriava nada
         // → o cliente perdia as gravações pagas. Para CUSTOM/FLEX preservamos as sessões agendadas
         // (e nenhum crédito é perdido). A extensão do endDate na retomada continua valendo p/ todos.
+        // AUDFIN-03 (conserto 5):
+        //  • a sessão EXTRA (marca fixoExtra — cobrada à parte, criada com o teto cheio) NÃO é cancelada: ela não é do
+        //    plano e a retomada não a recria (paga, sumiria sem estorno). Sessão viva de contrato pausado já é estado
+        //    suportado (FLEX/CUSTOM mantêm as deles);
+        //  • cancelar uma gravação com cobrança em aberto (extra contratado nela) a anula — sem cobrancas.baixa, 403
+        //    antes de qualquer escrita; com a baixa (e o ADMIN), as cobranças em aberto das gravações canceladas são
+        //    anuladas (aposentadas no provedor antes), como no pedido de cancelamento — nada fica preso e impagável.
+        let pauseCancelledIds: string[] = [];
+        let pauseWithBaixa = false;
         if (contract.type === 'FIXO') {
-            await prisma.booking.updateMany({
-                where: { contractId: id, status: { in: ['RESERVED', 'CONFIRMED'] }, date: { gte: now } },
-                data: { status: 'CANCELLED' },
-            });
+            const actor = await routeActor(req, res);
+            if (!actor) return;
+            pauseWithBaixa = can(actor, 'cobrancas.baixa');
+            const toCancelWhere: Prisma.BookingWhereInput = {
+                contractId: id, status: { in: ['RESERVED', 'CONFIRMED'] }, date: { gte: now },
+                payments: { none: FIXO_EXTRA_MARK_WHERE },
+            };
+            const toCancel = (await prisma.booking.findMany({ where: toCancelWhere, select: { id: true } })).map(b => b.id);
+            if (!pauseWithBaixa && toCancel.length > 0
+                && (await prisma.payment.count({ where: { bookingId: { in: toCancel }, status: { in: OPEN_CHARGE_STATUSES } } })) > 0) {
+                res.status(403).json(PAUSE_OPEN_CHARGE_NEEDS_BAIXA);
+                return;
+            }
+            if (toCancel.length > 0) {
+                // Sem a baixa: só as que continuam sem cobrança em aberto (uma criada no meio não é anulada por quem
+                // não pode — a gravação fica viva no contrato pausado).
+                await prisma.booking.updateMany({
+                    where: { ...toCancelWhere, id: { in: toCancel }, ...(pauseWithBaixa ? {} : NO_OPEN_CHARGE_BOOKING_WHERE) },
+                    data: { status: 'CANCELLED' },
+                });
+                pauseCancelledIds = (await prisma.booking.findMany({
+                    where: { id: { in: toCancel }, status: 'CANCELLED' },
+                    select: { id: true },
+                })).map(b => b.id);
+            }
         }
 
         const updated = await prisma.contract.update({
@@ -1178,18 +1406,32 @@ router.patch('/:id/pause', authenticate, authorize('ADMIN'), async (req: Request
             data: { status: 'PAUSED', pausedAt: now, pauseReason: reason || null, resumeDate: resume },
         });
 
+        // AUDFIN-03: com a baixa, a cobrança em aberto das gravações que a pausa cancelou deixa de ser devida (best-effort).
+        let pauseVoided = 0;
+        if (pauseWithBaixa && pauseCancelledIds.length > 0) {
+            try {
+                const { voidContractPendingPaymentsDetailed } = await import('../../lib/paymentEffects.js');
+                pauseVoided = (await voidContractPendingPaymentsDetailed(id, { bookingIds: pauseCancelledIds })).voided;
+            } catch (err) {
+                console.error(`[pause] Falha ao anular as cobranças das gravações canceladas pela pausa (contrato ${id}):`, err);
+            }
+        }
+
         const { logAudit } = await import('../../lib/audit.js');
         await logAudit('CONTRACT', id, 'PAUSED', req.user!.userId, { reason, resumeDate });
 
-        res.json({ contract: updated, message: 'Contrato pausado.' });
+        const pauseNote = pauseVoided > 0
+            ? ` ${plural(pauseVoided, 'cobrança em aberto das gravações canceladas foi anulada', 'cobranças em aberto das gravações canceladas foram anuladas')}.`
+            : '';
+        res.json({ contract: updated, message: `Contrato pausado.${pauseNote}`, ...(pauseVoided > 0 && { voidedCount: pauseVoided }) });
     } catch (err: any) {
         console.error('[pause]', err);
         res.status(500).json({ error: err.message || 'Erro ao pausar contrato.' });
     }
 });
 
-// ─── PATCH /api/contracts/:id/resume (ADMIN) ────────────
-router.patch('/:id/resume', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+// ─── PATCH /api/contracts/:id/resume (equipe — contratos.editar) ────────────
+router.patch('/:id/resume', authenticate, requirePermission('contratos.editar'), async (req: Request, res: Response) => {
     try {
         const id = req.params.id as string;
 

@@ -4,6 +4,7 @@ import { TicketPercent, CheckCircle, Clock, XCircle, Ban, TrendingUp, FilterX, S
 import { couponsApi, Coupon } from '../api/client';
 import { useUI } from '../context/UIContext';
 import { useAdminCoupons, CouponStatusFilter } from '../hooks/useAdminCoupons';
+import { usePermission } from '../hooks/usePermission';
 import AdminPageHeader from '../components/admin/AdminPageHeader';
 import CouponModal from '../components/admin/coupons/CouponModal';
 import { HeroSkeleton, TableSkeleton } from '../components/ui/SkeletonLoader';
@@ -35,6 +36,9 @@ function formatDateBR(iso: string): string {
 export default function AdminCouponsPage() {
     const { showToast, showConfirm, showAlert } = useUI();
     const { coupons, loading, statusFilter, setStatusFilter, reload } = useAdminCoupons();
+    // Equipe (D2): a página abre com cupons.ver; Novo, Editar, Ativar/Desativar e Excluir = cupons.editar.
+    const { can } = usePermission();
+    const canEditCoupons = can('cupons.editar');
 
     const [showCreate, setShowCreate] = useState(false);
     const [editCoupon, setEditCoupon] = useState<Coupon | null>(null);
@@ -135,11 +139,11 @@ export default function AdminCouponsPage() {
                 icon={TicketPercent}
                 title="Cupons"
                 subtitle="Cupons de desconto para pagamentos"
-                actions={
+                actions={canEditCoupons ? (
                     <button className="btn-admin-go" onClick={() => setShowCreate(true)}>
                         <span style={{ fontSize: '1.1rem' }} aria-hidden="true">+</span> Novo Cupom
                     </button>
-                }
+                ) : undefined}
             />
 
             {/* --- KPI CARDS --- */}
@@ -217,7 +221,8 @@ export default function AdminCouponsPage() {
                         <TicketPercent size={44} className="admin-empty__icon" aria-hidden="true" />
                         <div className="admin-empty__title">Nenhum cupom encontrado</div>
                         <div className="admin-empty__hint">
-                            {coupons.length === 0 ? 'Crie seu primeiro cupom de desconto' : 'Tente ajustar os filtros'}
+                            {coupons.length > 0 ? 'Tente ajustar os filtros'
+                                : canEditCoupons ? 'Crie seu primeiro cupom de desconto' : 'Ainda não há cupons cadastrados'}
                         </div>
                     </div>
                 ) : (
@@ -232,7 +237,7 @@ export default function AdminCouponsPage() {
                                     <th>Validade</th>
                                     <th style={{ textAlign: 'center' }}>Usos</th>
                                     <th>Status</th>
-                                    <th style={{ textAlign: 'center' }}>Ações</th>
+                                    {canEditCoupons && <th style={{ textAlign: 'center' }}>Ações</th>}
                                 </tr>
                             </thead>
                             <tbody>
@@ -348,7 +353,8 @@ export default function AdminCouponsPage() {
                                                 <StatusBadge meta={meta} />
                                             </td>
 
-                                            {/* Ações */}
+                                            {/* Ações (só com "Criar, editar, ativar e excluir cupons") */}
+                                            {canEditCoupons && (
                                             <td data-label="" style={{ textAlign: 'center' }}>
                                                 <div style={{ display: 'flex', gap: '4px', justifyContent: 'center' }}>
                                                     <Tooltip content="Editar cupom" describe={false}>
@@ -370,6 +376,7 @@ export default function AdminCouponsPage() {
                                                     </Tooltip>
                                                 </div>
                                             </td>
+                                            )}
                                         </tr>
                                     );
                                 })}
@@ -381,14 +388,14 @@ export default function AdminCouponsPage() {
             </div>
 
             {/* --- MODALS --- */}
-            {showCreate && (
+            {canEditCoupons && showCreate && (
                 <CouponModal
                     onClose={() => setShowCreate(false)}
                     onSaved={reload}
                 />
             )}
 
-            {editCoupon && (
+            {canEditCoupons && editCoupon && (
                 <CouponModal
                     coupon={editCoupon}
                     onClose={() => setEditCoupon(null)}

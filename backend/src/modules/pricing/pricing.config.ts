@@ -1,7 +1,13 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize } from '../../middleware/auth.js';
+import { authenticate } from '../../middleware/auth.js';
+import {
+    actorOrReply, can, missingRequirement, requireAdmin, requirePermission, requireStaff,
+    PERMISSION_DENIED_MESSAGE,
+} from '../../middleware/permissions.js';
+import { allPermissionKeys, moduleOf, permissionForConfigGroup, type PermissionKey } from '../../config/staffPermissions.js';
+import { requiredForBusinessConfig } from '../../lib/permissionRules.js';
 import { invalidateConfigCache, getConfig } from '../../lib/businessConfig.js';
 import type { FeeRate } from '../../lib/gatewayFees.js';
 import { BUSINESS_CONFIG_CATALOG, CONFIG_CATALOG_BY_KEY, DEPRECATED_CONFIG_KEYS, EMAIL_SECRET_KEYS } from '../../config/businessConfigCatalog.js';
@@ -23,6 +29,11 @@ const FEE_PROVIDERS: { provider: string; pctKey: string | null; fixedKey: string
 async function currentFeeRate(fp: { pctKey: string | null; fixedKey: string }): Promise<FeeRate> {
     return { pct: fp.pctKey ? await getConfig(fp.pctKey) : 0, fixedCents: await getConfig(fp.fixedKey) };
 }
+
+// Caixas de Configurações (todas as chaves delegáveis do módulo `config`) — qualquer uma abre
+// GET /business-config; a resposta vem filtrada por grupo. email (config.email) e gateway (config.taxas)
+// são exclusivos do ADMIN; grupo sem mapeamento → só ADMIN.
+const CONFIG_PERMISSIONS: readonly PermissionKey[] = allPermissionKeys().filter(k => moduleOf(k) === 'config');
 
 // Número submetido no payload; se ausente ou inválido, mantém o valor anterior (não versiona lixo).
 function submittedNumber(submitted: Map<string, string>, key: string | null, fallback: number): number {
@@ -54,10 +65,15 @@ export function registerConfigRoutes(router: Router) {
         }
     });
 
-    // ─── GET /api/pricing/business-config (ADMIN) ───────────
+    // ─── GET /api/pricing/business-config (equipe: qualquer config.*) ─
+    // Devolve SÓ os grupos que o ator pode ver (permissionForConfigGroup): ADMIN vê tudo; o colaborador
+    // nunca recebe `email` (segredos SMTP — quem controla recebe o código de login de qualquer conta),
+    // `gateway` (taxas) nem grupos fora do mapeamento ("outros").
 
-    router.get('/business-config', authenticate, authorize('ADMIN'), async (_req: Request, res: Response) => {
+    router.get('/business-config', authenticate, requirePermission(...CONFIG_PERMISSIONS), async (req: Request, res: Response) => {
         try {
+            const actor = await actorOrReply(req, res);
+            if (!actor) return;
             const rows = await prisma.businessConfig.findMany({ orderBy: { group: 'asc' } });
             const byKey = new Map(rows.map(r => [r.key, r]));
 
@@ -90,12 +106,15 @@ export function registerConfigRoutes(router: Router) {
                 })),
             ];
 
-            const grouped: Record<string, typeof merged> = {};
-            for (const row of merged) {
+            // Filtro por grupo (o ADMIN passa em todos).
+            const visible = actor.isAdmin ? merged : merged.filter(row => can(actor, permissionForConfigGroup(row.group)));
+
+            const grouped: Record<string, typeof visible> = {};
+            for (const row of visible) {
                 if (!grouped[row.group]) grouped[row.group] = [];
                 grouped[row.group].push(row);
             }
-            res.json({ configs: merged, grouped });
+            res.json({ configs: visible, grouped });
         } catch (err) {
             res.status(500).json({ error: 'Erro ao carregar configurações.' });
         }
@@ -113,9 +132,43 @@ export function registerConfigRoutes(router: Router) {
         })),
     });
 
-    router.put('/business-config', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+    // Equipe: TUDO OU NADA por grupo (requiredForBusinessConfig) — se o lote tiver UMA chave de grupo não
+    // permitido (ex.: email_smtp_host de quem só tem config.politicas), 403 com `deniedGroups` e NADA é
+    // gravado. Chave fora do catálogo: vale o grupo da linha no banco (ex.: `schedule` do seed); sem linha →
+    // "outros" → só ADMIN. Chaves aposentadas (DEPRECATED_CONFIG_KEYS) são ignoradas pelo handler e não contam.
+    router.put('/business-config', authenticate, requireStaff(), async (req: Request, res: Response) => {
         try {
             const { configs } = updateBusinessConfigSchema.parse(req.body);
+
+            const actor = await actorOrReply(req, res);
+            if (!actor) return;
+            if (!actor.isAdmin) {
+                const keys = [...new Set(configs.map(c => c.key).filter(k => !DEPRECATED_CONFIG_KEYS.has(k)))];
+                const outsideCatalog = keys.filter(k => !CONFIG_CATALOG_BY_KEY[k]);
+                const dbGroups: Record<string, string> = {};
+                if (outsideCatalog.length > 0) {
+                    const dbRows = await prisma.businessConfig.findMany({
+                        where: { key: { in: outsideCatalog } },
+                        select: { key: true, group: true },
+                    });
+                    for (const r of dbRows) dbGroups[r.key] = r.group;
+                }
+                const rule = requiredForBusinessConfig(keys, dbGroups);
+                const missing = missingRequirement(actor, rule.requirements);
+                if (missing) {
+                    const deniedGroups = Object.entries(rule.groups)
+                        .filter(([, perm]) => !can(actor, perm))
+                        .map(([group]) => group)
+                        .sort();
+                    res.status(403).json({
+                        error: PERMISSION_DENIED_MESSAGE,
+                        code: 'PERMISSION_DENIED',
+                        permission: missing,
+                        deniedGroups,
+                    });
+                    return;
+                }
+            }
 
             // Snapshot das taxas de gateway ANTES de aplicar (config atual no DB), para versionar mudanças.
             const feeBefore = new Map<string, FeeRate>();
@@ -190,9 +243,9 @@ export function registerConfigRoutes(router: Router) {
         }
     });
 
-    // ─── GET /api/pricing/business-config/fee-history (ADMIN) ───
+    // ─── GET /api/pricing/business-config/fee-history (só ADMIN: config.taxas) ───
     // Linha do tempo das taxas de gateway: cada mudança com a data em que passou a valer.
-    router.get('/business-config/fee-history', authenticate, authorize('ADMIN'), async (_req: Request, res: Response) => {
+    router.get('/business-config/fee-history', authenticate, requireAdmin(), async (_req: Request, res: Response) => {
         try {
             const rows = await prisma.gatewayFeeHistory.findMany({ orderBy: { effectiveFrom: 'asc' } });
             const history: Record<string, { effectiveFrom: string; feePct: number; feeFixedCents: number }[]> = {};
@@ -209,13 +262,13 @@ export function registerConfigRoutes(router: Router) {
         }
     });
 
-    // ─── POST /api/pricing/business-config/email/test (ADMIN) ──
+    // ─── POST /api/pricing/business-config/email/test (só ADMIN: config.email) ──
     // Sends the configured OTP e-mail (code 123456) to validate the provider setup.
     const emailTestSchema = z.object({
         to: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, 'E-mail inválido'),
     });
 
-    router.post('/business-config/email/test', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+    router.post('/business-config/email/test', authenticate, requireAdmin(), async (req: Request, res: Response) => {
         try {
             const { to } = emailTestSchema.parse(req.body);
             await deliverOtpEmail(to, 'Teste', '123456');

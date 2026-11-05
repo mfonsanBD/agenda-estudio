@@ -1,10 +1,11 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { useLocation, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { useNavigation } from '../context/NavigationContext';
 import Avatar from './Avatar';
 import { LucideIcon, ChevronRight, User, LogOut } from 'lucide-react';
-import { ADMIN_NAV, CLIENT_NAV, isNavItemActive } from '../config/nav';
+import { ADMIN_NAV, CLIENT_NAV, filterNav, isNavItemActive, type NavSubItem } from '../config/nav';
+import { usePermission } from '../hooks/usePermission';
 import Tooltip from './ui/Tooltip';
 
 interface NavItemProps {
@@ -58,7 +59,7 @@ interface ExpandableNavItemProps {
     icon: LucideIcon;
     label: string;
     collapsed: boolean;
-    subItems: { sec: string; label: string }[];
+    subItems: NavSubItem[];
 }
 
 /**
@@ -135,7 +136,12 @@ interface SidebarProps {
 export default function Sidebar({ collapsed }: SidebarProps) {
     const { user, logout } = useAuth();
     const { navigateTo } = useNavigation();
-    const isAdmin = user?.role === 'ADMIN';
+    // Equipe (ADMIN/COLABORADOR): menu administrativo filtrado pelas permissões; cliente: menu do cliente.
+    const { isAdmin, isStaff, can, roleLabel } = usePermission();
+    const navItems = useMemo(
+        () => (isStaff ? filterNav(ADMIN_NAV, can, isAdmin) : CLIENT_NAV),
+        [isStaff, isAdmin, can],
+    );
     const [menuOpen, setMenuOpen] = useState(false);
     const menuRef = useRef<HTMLDivElement>(null);
 
@@ -185,7 +191,7 @@ export default function Sidebar({ collapsed }: SidebarProps) {
                         <div className="sidebar-user-info">
                             <span className="sidebar-user-name">{user?.name}</span>
                             <span className="sidebar-user-role">
-                                {isAdmin ? 'Administrador' : 'Cliente'}
+                                {roleLabel}
                             </span>
                         </div>
                         {!collapsed && (
@@ -226,7 +232,7 @@ export default function Sidebar({ collapsed }: SidebarProps) {
             </div>
 
             <nav className="sidebar-nav">
-                {(isAdmin ? ADMIN_NAV : CLIENT_NAV).map((item, i, arr) => {
+                {navItems.map((item, i, arr) => {
                     const showDivider = !!item.section && item.section !== arr[i - 1]?.section;
                     return (
                         <React.Fragment key={item.to}>

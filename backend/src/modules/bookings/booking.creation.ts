@@ -1,7 +1,9 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize } from '../../middleware/auth.js';
+import { authenticate } from '../../middleware/auth.js';
+import { requirePermission, requireRole, actorOrReply, can, enforceRuleResult } from '../../middleware/permissions.js';
+import { requiredForAdminBookingCreate, ADMIN_BOOKING_DOWNGRADE_MESSAGE, adminPlanBookingReservedMessage } from '../../lib/permissionRules.js';
 import { acquireMultiSlotLock, releaseMultiSlotLock, acquireMutexBlocking, releaseMutex } from '../../lib/redis.js';
 import { stripeCreatePaymentIntent, stripeGetOrCreateCustomer, isStripeEnabled } from '../../lib/stripeService.js';
 import {
@@ -22,16 +24,46 @@ import { getConfig } from '../../lib/businessConfig.js';
 import { getErrorMessage } from '../../utils/errors.js';
 import { createBookingSchema, bulkBookingSchema, adminCreateBookingSchema } from './validators.js';
 import { CouponError, validateCoupon, reserveCouponUse, type CouponQuote } from '../../lib/couponService.js';
-import { hasBlockedConflict, avulsoContractName } from './booking.service.js';
+import {
+    hasBlockedConflict, avulsoContractName, deductCredit, restoreCredit,
+    fixoCapReached, fixoCapLockKey, tierNotAllowedBody, SESSION_CHARGE_METADATA, FIXO_EXTRA_METADATA, SESSION_PLAN_TYPES,
+} from './booking.service.js';
+// O teto do FIXO mora em booking.service.ts (também usado pelo PATCH /:id ao reabrir uma sessão); reexportado
+// aqui para quem já importava deste módulo.
+export { fixoCapReached, FIXO_CAP_STATUSES } from './booking.service.js';
 import { syncContractCompletion } from '../../lib/contractCompletion.js';
 import { resolvePixProvider } from '../../lib/pixGateway.js';
 import { getProviderForMethod } from '../../lib/paymentGateway.js';
 
+// ─── POST /admin: contrato vinculado (REG-1) ────────────
+/** Status em que a equipe agenda num contrato existente: ativo, ou concluído (D6 — a sessão nova o reabre). */
+const ADMIN_LINKABLE_CONTRACT_STATUSES: readonly string[] = ['ACTIVE', 'COMPLETED'];
+/** Como o status recusado aparece na mensagem ("ele está …"). */
+const CONTRACT_STATUS_PHRASE: Record<string, string> = {
+    AWAITING_PAYMENT: 'aguardando pagamento',
+    EXPIRED: 'expirado',
+    CANCELLED: 'cancelado',
+    PENDING_CANCELLATION: 'com o cancelamento solicitado',
+    PAUSED: 'pausado',
+};
+
+/**
+ * Sessão vinculada a um contrato que NÃO cobre a gravação, criada sem a baixa manual (REG-1): é cobrada como
+ * antes (nasce Reservada, aguardando pagamento) e a resposta diz por quê — o modal da equipe olha só o tipo do
+ * contrato e falaria em "coberta pelo plano".
+ */
+const ADMIN_LINKED_CHARGED_MESSAGE = {
+    SERVICO: 'Agendamento criado como Reservado, aguardando pagamento: contrato de serviço não inclui gravação, então a sessão é cobrada.',
+    FIXO_LIMIT: 'Agendamento criado como Reservado, aguardando pagamento: o plano fixo já usou todas as sessões, então esta sessão extra é cobrada.',
+} as const;
+
 export function registerCreationRoutes(router: Router) {
 
 // ─── POST /api/bookings ─────────────────────────────────
+// Autoatendimento: só CLIENTE (crítica S5). A equipe agenda para um cliente pelo POST /admin — uma
+// gravação em nome da conta da equipe ficaria órfã (fora de Clientes).
 
-router.post('/', authenticate, async (req: Request, res: Response) => {
+router.post('/', authenticate, requireRole('CLIENTE'), async (req: Request, res: Response) => {
     try {
         const data = createBookingSchema.parse(req.body);
         const userId = req.user!.userId;
@@ -40,8 +72,8 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
         const dayOfWeek = dateObj.getUTCDay();
 
         // Validate: minimum advance notice (studio timezone, consistent across server TZs).
-        // Admin (POST /admin) bypasses entirely; the role guard here is defense-in-depth.
-        if (req.user!.role !== 'ADMIN') {
+        // A equipe usa o POST /admin (só "não no passado"); aqui é sempre o cliente.
+        {
             const slotDateTime = studioDateTime(data.date, data.startTime);
             const minAdvanceHours = await getConfig('booking_min_advance_hours');
             const diffHours = (slotDateTime.getTime() - Date.now()) / (1000 * 60 * 60);
@@ -98,6 +130,22 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
                 return;
             }
 
+            // R3b: contrato de SERVIÇO (Gestão de Redes etc.) não inclui gravação. A tela do cliente nem o
+            // oferece, mas por chamada direta a sessão nascia sem cobrança (sem crédito, teto nem Payment).
+            if (contract.type === 'SERVICO') {
+                res.status(400).json({ error: 'Contrato de serviço não inclui gravação.' });
+                return;
+            }
+            // R4 (ATK-01/FIN-02): o micro-contrato AVULSO é a cobrança de UMA gravação. O crédito que o
+            // cancelamento (ou o Não realizado) devolve a ele não vira sessão nova por aqui: a sessão nascia sem
+            // hold e sem Payment, e a cobrança original ficava presa à reserva cancelada (gravação de graça). A
+            // tela do cliente nem oferece o avulso; remarcar o avulso é pela própria reserva (/:id/reschedule,
+            // /:id/makeup). Antes de qualquer trava ou escrita.
+            if (contract.type === 'AVULSO') {
+                res.status(400).json({ error: 'Gravação avulsa não se agenda pelo contrato. Para remarcar, use a remarcação da própria reserva.' });
+                return;
+            }
+
             // Tier hierarchy check
             if (!canAccessTier(contract.tier, slotTier)) {
                 res.status(403).json({
@@ -106,20 +154,24 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
                 return;
             }
 
-            // For Flex: check remaining credits
-            if (contract.type === 'FLEX' || contract.type === 'AVULSO') {
+            // For Flex: check remaining credits (o AVULSO já foi recusado acima)
+            if (contract.type === 'FLEX') {
                 if (!contract.flexCreditsRemaining || contract.flexCreditsRemaining <= 0) {
                     res.status(400).json({ error: 'Créditos esgotados neste ciclo.' });
                     return;
                 }
             } else if (contract.type === 'FIXO') {
-                const activeStatuses: BookingStatus[] = [BookingStatus.COMPLETED, BookingStatus.CONFIRMED, BookingStatus.FALTA, BookingStatus.RESERVED];
-                const usedBookings = contract.bookings.filter(b =>
-                    activeStatuses.includes(b.status)
-                ).length;
-                const sessionsPerMonthBooking = await getConfig('sessions_per_month');
-                if (usedBookings >= (contract.durationMonths * sessionsPerMonthBooking)) {
+                // Teto do plano: a MESMA conta de fixoCapReached (R5 — a sessão EXTRA, criada com o teto cheio, não ocupa).
+                // Reconferido sob a trava do contrato antes de criar (A8, abaixo).
+                if (await fixoCapReached(contract)) {
                     res.status(400).json({ error: 'Limite de agendamentos do plano fixo atingido.' });
+                    return;
+                }
+            } else if (contract.type === 'CUSTOM') {
+                // R3b: as sessões do Personalizado já nascem geradas com o contrato; o cliente só agenda
+                // aqui com crédito (sessão pulada). Sem crédito, a sessão saía de graça (nada a descontar).
+                if ((contract.customCreditsRemaining ?? 0) <= 0) {
+                    res.status(400).json({ error: 'Créditos esgotados neste plano.' });
                     return;
                 }
             }
@@ -253,6 +305,18 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
             if (existingHold) {
                 await releaseMultiSlotLock(data.date, packageSlots, userId);
 
+                // ATU-02: só o hold do avulso do próprio cliente (holdExpiresAt preenchido) é retomado aqui. Uma
+                // reserva SEM prazo — feita pela equipe (que não expira) ou sessão de plano — não ganha um hold de
+                // 10 min: a varredura dos holds a promoveria a Confirmada com qualquer parcela paga do contrato,
+                // com a cobrança da sessão ainda em aberto. Nada é escrito.
+                if (!existingHold.holdExpiresAt) {
+                    res.status(409).json({
+                        error: 'Você já tem uma reserva neste horário. Se ela tiver cobrança em aberto, pague em Meus pagamentos.',
+                        code: 'BOOKING_ALREADY_RESERVED',
+                    });
+                    return;
+                }
+
                 // Find existing pending payment
                 const existingPayment = await prisma.payment.findFirst({
                     where: { bookingId: existingHold.id, status: 'PENDING' },
@@ -354,7 +418,7 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
             // serializa o MESMO horário — requests concorrentes em horários DIFERENTES liam usedBookings
             // desatualizado e furavam o limite. Mutex por contrato + re-check ao vivo sob o mutex.
             if (contract?.type === 'FIXO') {
-                fixoLockKey = `booking:fixo-cap:${contractId}`;
+                fixoLockKey = fixoCapLockKey(contract.id);
                 const gotFixoLock = await acquireMutexBlocking(fixoLockKey, 20);
                 if (!gotFixoLock) {
                     fixoLockKey = null;
@@ -362,10 +426,7 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
                     res.status(409).json({ error: 'Muitas reservas simultâneas neste contrato. Tente novamente.' });
                     return;
                 }
-                const fixoActiveStatuses: BookingStatus[] = [BookingStatus.COMPLETED, BookingStatus.CONFIRMED, BookingStatus.FALTA, BookingStatus.RESERVED];
-                const usedNow = await prisma.booking.count({ where: { contractId, status: { in: fixoActiveStatuses } } });
-                const fixoCap = contract.durationMonths * (await getConfig('sessions_per_month'));
-                if (usedNow >= fixoCap) {
+                if (await fixoCapReached(contract)) {
                     await releaseMutex(fixoLockKey); fixoLockKey = null;
                     await releaseMultiSlotLock(data.date, packageSlots, userId);
                     res.status(400).json({ error: 'Limite de agendamentos do plano fixo atingido.' });
@@ -400,9 +461,11 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
                 finalContractId = newContract.id;
                 isAvulsoCreated = true;
             } else {
-                // Decrement credits based on contract type — VULN-M2 FIX: atomic operation
+                // Decrement credits based on contract type — VULN-M2 FIX: atomic operation.
+                // R3b: o desconto guardado (> 0) decide sozinho, sem pré-filtro pelo saldo relido — se outra reserva
+                // zerou o crédito depois da checagem lá de cima, é 400 (concorrência), nunca uma sessão sem desconto.
                 const contract = await prisma.contract.findUnique({ where: { id: finalContractId } });
-                if ((contract?.type === 'FLEX' || contract?.type === 'AVULSO') && (contract.flexCreditsRemaining || 0) > 0) {
+                if (contract?.type === 'FLEX') {
                     const decremented = await prisma.contract.updateMany({
                         where: { id: finalContractId, flexCreditsRemaining: { gt: 0 } },
                         data: { flexCreditsRemaining: { decrement: 1 } },
@@ -425,7 +488,7 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
                             });
                         }
                     }
-                } else if (contract?.type === 'CUSTOM' && (contract.customCreditsRemaining || 0) > 0) {
+                } else if (contract?.type === 'CUSTOM') {
                     const decremented = await prisma.contract.updateMany({
                         where: { id: finalContractId, customCreditsRemaining: { gt: 0 } },
                         data: { customCreditsRemaining: { decrement: 1 } },
@@ -692,7 +755,8 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
 
 // ─── POST /api/bookings/bulk ────────────────────────────
 
-router.post('/bulk', authenticate, async (req: Request, res: Response) => {
+// Autoatendimento (marcação em lote do FLEX do próprio cliente): só CLIENTE (crítica S5).
+router.post('/bulk', authenticate, requireRole('CLIENTE'), async (req: Request, res: Response) => {
     try {
         const data = bulkBookingSchema.parse(req.body);
         const userId = req.user!.userId;
@@ -716,7 +780,6 @@ router.post('/bulk', authenticate, async (req: Request, res: Response) => {
 
         const validBookings: Prisma.BookingCreateManyInput[] = [];
         const locksAcquired: { date: string; slots: string[] }[] = [];
-        const isAdmin = req.user!.role === 'ADMIN';
         const bulkMinHours = await getConfig('booking_min_advance_hours');
         const bulkSlotDur = await getSlotDuration(); // duração do pacote da config (consistente c/ disponibilidade)
 
@@ -725,8 +788,8 @@ router.post('/bulk', authenticate, async (req: Request, res: Response) => {
                 const dateObj = new Date(slot.date + 'T00:00:00');
                 const dayOfWeek = dateObj.getUTCDay();
 
-                // Validate: minimum advance notice (studio timezone). Admin bypasses.
-                if (!isAdmin) {
+                // Validate: minimum advance notice (studio timezone). Rota só do cliente (sem exceção).
+                {
                     const slotDateTime = studioDateTime(slot.date, slot.startTime);
                     const diffHours = (slotDateTime.getTime() - Date.now()) / (1000 * 60 * 60);
                     if (diffHours < bulkMinHours) {
@@ -798,35 +861,48 @@ router.post('/bulk', authenticate, async (req: Request, res: Response) => {
     }
 });
 
-// ─── POST /api/bookings/admin (ADMIN direct create) ─────
+// ─── POST /api/bookings/admin (equipe cria para um cliente) ─────
+// Permissão: agendamentos.criar. Sem `cobrancas.baixa` nada criado aqui nasce PAGO (DECISÕES D3/D7 —
+// "nasce aguardando pagamento"):
+//   • "Confirmado" vira RESERVED com o pagamento PENDING (não é 403; a resposta traz `downgraded`);
+//   • customPrice diferente do preço padrão da faixa (inclusive 0) → 403 cobrancas.baixa;
+//   • valor final zero (cupom 100%), que seria liquidado como PAGO → 403 cobrancas.baixa;
+//   • sessão de PLANO (FIXO/FLEX/Personalizado, ativo ou concluído, e no FIXO dentro do teto) sem a baixa: o
+//     plano já cobre a sessão — nenhuma cobrança do valor da sessão; só os serviços extras viram cobrança
+//     PENDING (REG-1, igual ao POST / do cliente). Contrato de SERVIÇO, avulso e FIXO com o teto já usado não
+//     cobrem a sessão: ela é cobrada como antes — e essa cobrança da SESSÃO leva metadata.sessionCharge (R4:
+//     o /confirm do cliente exige o pagamento dela; o PATCH de faixa a distingue da sessão de plano);
+//   • essa sessão de plano (coberta, sem a baixa) num horário de faixa que o plano não cobre
+//     (canAccessTier false) → 403 TIER_NOT_ALLOWED (R3b), antes de crédito ou escrita;
+//   • boleto (emitido no banco na hora) → 403 cobrancas.cobrar (lib/permissionRules).
+// Contrato vinculado fora de ACTIVE/COMPLETED (cancelado, expirado, aguardando pagamento, pausado, com o
+// cancelamento solicitado) → 400 CONTRACT_NOT_ACTIVE para todos, como o POST / do cliente.
+// Sessão de plano FLEX ou Personalizado consome 1 crédito na criação, como no POST / do cliente (DIN-01):
+// o cancelamento pela equipe devolve esse crédito — sem o desconto aqui, cancelar criava crédito do nada.
+// O RESERVED criado aqui NÃO expira como o hold de 10 min do cliente: não grava holdExpiresAt e o
+// micro-contrato avulso nasce ACTIVE (o cleanExpiredHolds só varre holdExpiresAt / AWAITING_PAYMENT).
 
-router.post('/admin', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.post('/admin', authenticate, requirePermission('agendamentos.criar'), async (req: Request, res: Response) => {
     try {
         const data = adminCreateBookingSchema.parse(req.body);
+        const actor = await actorOrReply(req, res);
+        if (!actor) return;
+        const canMarkPaid = can(actor, 'cobrancas.baixa');
         const dateObj = new Date(data.date + 'T00:00:00');
         const dayOfWeek = dateObj.getUTCDay();
 
+        // O alvo é sempre um CLIENTE (S5): gravação em nome de uma conta da equipe ficaria órfã (some de
+        // Clientes). Conta inexistente ou da equipe → 404, sem revelar qual.
         // D3: cliente EXCLUÍDO (soft delete/anonimizado) não ganha gravação nem cobrança nova — o
         // seletor do modal já o esconde; a trava real é aqui (lista aberta/antiga, chamada direta).
-        const targetClient = await prisma.user.findUnique({ where: { id: data.userId }, select: { deletedAt: true } });
-        if (targetClient?.deletedAt) {
-            res.status(409).json({ error: 'Este cliente foi excluído.', code: 'CLIENT_DELETED' });
+        const targetClient = await prisma.user.findUnique({ where: { id: data.userId }, select: { deletedAt: true, role: true } });
+        if (!targetClient || targetClient.role !== 'CLIENTE') {
+            res.status(404).json({ error: 'Cliente não encontrado.' });
             return;
         }
-
-        // E3: boleto só com a chave-mestra "Aceitar pagamento por boleto" ligada E a Cora habilitada
-        // (fonte única getBoletoStatus) — recusa ANTES de criar o agendamento.
-        if (data.paymentMethod === 'BOLETO') {
-            const { getBoletoStatus } = await import('../../lib/paymentGateway.js');
-            const boleto = await getBoletoStatus();
-            if (!boleto.available) {
-                res.status(400).json({
-                    error: boleto.message ?? 'O pagamento por boleto não está disponível.',
-                    code: 'BOLETO_UNAVAILABLE',
-                    reason: boleto.reason,
-                });
-                return;
-            }
+        if (targetClient.deletedAt) {
+            res.status(409).json({ error: 'Este cliente foi excluído.', code: 'CLIENT_DELETED' });
+            return;
         }
 
         // O admin NÃO pode agendar em data/horário que já passou (fuso do estúdio). O caminho do
@@ -864,7 +940,80 @@ router.post('/admin', authenticate, authorize('ADMIN'), async (req: Request, res
         const linkedContract = data.contractId
             ? await prisma.contract.findUnique({ where: { id: data.contractId } })
             : null;
+        // O plano informado precisa ser DESTE cliente: senão o desconto de fidelidade de outro cliente
+        // entraria no preço (e a sessão ficaria pendurada num contrato alheio).
+        if (data.contractId && (!linkedContract || linkedContract.userId !== data.userId)) {
+            res.status(404).json({ error: 'Contrato não encontrado para este cliente.' });
+            return;
+        }
+        // REG-1: só se agenda num contrato ATIVO ou CONCLUÍDO (D6: a sessão nova reabre o concluído — é o que o
+        // seletor do modal oferece). Fora disso → 400 para todos, inclusive o ADMIN, antes de qualquer crédito,
+        // cobrança ou escrita (como o POST / do cliente, que só aceita ACTIVE). Antes, a sessão ia para um plano
+        // sem parcela viva (sem a baixa, de graça) e, num FLEX cancelado, ainda comia o crédito que sobrou.
+        if (linkedContract && !ADMIN_LINKABLE_CONTRACT_STATUSES.includes(linkedContract.status)) {
+            res.status(400).json({
+                error: `Não é possível agendar neste contrato: ele está ${CONTRACT_STATUS_PHRASE[linkedContract.status] ?? 'inativo'}. Escolha um contrato ativo ou agende como avulso.`,
+                code: 'CONTRACT_NOT_ACTIVE',
+            });
+            return;
+        }
         const contractDiscountPct = linkedContract?.discountPct || 0;
+
+        // Permissões que dependem do corpo (lib/permissionRules): customPrice ≠ preço padrão exige
+        // cobrancas.baixa; sem ela, "Confirmado" é rebaixado para RESERVED (pagamento PENDING).
+        // Preço padrão = o que o servidor usaria sem customPrice (faixa; com plano, já com o desconto).
+        const standardPrice = linkedContract ? applyDiscount(basePrice, contractDiscountPct) : basePrice;
+        const createPlan = requiredForAdminBookingCreate(data, { standardPrice, canMarkPaid });
+        if (!(await enforceRuleResult(req, res, createPlan))) return;
+        const bookingStatus = createPlan.status;
+
+        // E3: boleto só com a chave-mestra "Aceitar pagamento por boleto" ligada E a Cora habilitada
+        // (fonte única getBoletoStatus) — recusa ANTES de criar o agendamento. Fica DEPOIS da permissão
+        // (boleto exige cobrancas.cobrar): quem não pode cobrar recebe o 403, não o estado da integração.
+        if (data.paymentMethod === 'BOLETO') {
+            const { getBoletoStatus } = await import('../../lib/paymentGateway.js');
+            const boleto = await getBoletoStatus();
+            if (!boleto.available) {
+                res.status(400).json({
+                    error: boleto.message ?? 'O pagamento por boleto não está disponível.',
+                    code: 'BOLETO_UNAVAILABLE',
+                    reason: boleto.reason,
+                });
+                return;
+            }
+        }
+
+        // REG-1: sessão de PLANO criada por quem não tem a baixa manual. Nasce RESERVED (D7: nada é registrado
+        // como pago), mas o valor da sessão NÃO vira cobrança — as parcelas do plano já o cobrem. Só os serviços
+        // extras (com o desconto do plano) viram uma cobrança PENDING, como no POST / do cliente; sem extras,
+        // nenhum Payment. Plano = FIXO, FLEX ou Personalizado (ativo ou concluído — conferido acima). NÃO cobrem
+        // a sessão, que então é cobrada como antes (PENDING do valor da sessão, com o desconto do contrato):
+        //   • o avulso e o contrato de SERVIÇO (Gestão de Redes etc. — não inclui gravação);
+        //   • o FIXO com o teto (meses × sessões/mês) já usado — a sessão é EXTRA (o POST / do cliente recusa
+        //     com "Limite atingido"; a equipe agenda, mas cobrando). Reconferido sob a trava do contrato abaixo.
+        // FLEX e Personalizado são limitados pelo crédito (NO_CREDITS, abaixo). Quem tem a baixa (e o ADMIN)
+        // segue como antes (Confirmado grava PAID; Reservado grava PENDING do valor da sessão).
+        // ATU5-02/TELA5-02 (conserto 5): o teto do FIXO é conferido para TODOS. A sessão criada com o teto já cheio é
+        // a EXTRA (marca fixoExtra, abaixo): não ocupa vaga do plano. A sessão que quem tem a baixa cria DENTRO do teto
+        // continua cobrada (comportamento antigo), mas OCUPA a vaga — sem a conferência, o "Confirmado" (PAID sem
+        // dinheiro) deixava a vaga livre para o cliente agendar de graça e o plano nunca concluía.
+        const isPlanContract = !!linkedContract && SESSION_PLAN_TYPES.includes(linkedContract.type);
+        const isFixoLinked = !!linkedContract && linkedContract.type === 'FIXO';
+        const fixoOverCap = isFixoLinked && await fixoCapReached(linkedContract!);
+        const planCovered = isPlanContract && !canMarkPaid && !fixoOverCap;
+        // R3b: a sessão coberta pelo plano só vale na faixa que o plano paga (a mesma hierarquia do POST / do
+        // cliente: canAccessTier). Sem a baixa, um horário de faixa acima do plano sairia de graça (e, no
+        // FLEX/Personalizado, comendo um crédito da faixa de baixo) → 403 antes de crédito, trava ou escrita.
+        // Quem tem a baixa (e o ADMIN) segue como antes: a sessão é cobrada pelo preço da faixa do horário.
+        // O FIXO com o teto usado não entra aqui: a sessão extra já é cobrada pelo preço da faixa do horário.
+        if (planCovered && !canAccessTier(linkedContract!.tier, slotTier)) {
+            res.status(403).json(tierNotAllowedBody(linkedContract!.tier, slotTier));
+            return;
+        }
+        // Vinculada a um contrato que não cobre a sessão, sem a baixa → a resposta explica a cobrança.
+        const chargedReason: keyof typeof ADMIN_LINKED_CHARGED_MESSAGE | null = !canMarkPaid && linkedContract
+            ? (linkedContract.type === 'SERVICO' ? 'SERVICO' : fixoOverCap ? 'FIXO_LIMIT' : null)
+            : null;
 
         let price: number;
         if (data.customPrice != null) {
@@ -879,6 +1028,7 @@ router.post('/admin', authenticate, authorize('ADMIN'), async (req: Request, res
         }
 
         let addonsTotal = 0;
+        let addonsCharge = 0; // serviços com o desconto do plano (avulso = 0%)
         if (data.addOns && data.addOns.length > 0) {
             const allAddons = await prisma.addOnConfig.findMany({
                 where: { key: { in: data.addOns } }
@@ -887,7 +1037,8 @@ router.post('/admin', authenticate, authorize('ADMIN'), async (req: Request, res
                 addonsTotal += add.price;
             }
             // Services inherit the contract loyalty discount (avulso = 0%), matching the client path.
-            price += applyDiscount(addonsTotal, contractDiscountPct);
+            addonsCharge = applyDiscount(addonsTotal, contractDiscountPct);
+            price += addonsCharge;
         }
 
         // Coupon (admin applies on behalf of the client — eligibility is the CLIENT's).
@@ -899,6 +1050,22 @@ router.post('/admin', authenticate, authorize('ADMIN'), async (req: Request, res
                 return;
             }
             adminCouponQuote = await validateCoupon({ code: data.couponCode, userId: data.userId, baseAmount: price });
+        }
+
+        // Valor final zero (cupom 100% / preço zerado) é liquidado como PAGO na hora (abaixo) — e nada
+        // criado por quem não tem a baixa manual nasce pago (D7). Recusa ANTES de gravar qualquer coisa.
+        // A sessão de plano sem a baixa (REG-1) não passa por aqui: ela nunca grava cobrança da sessão nem
+        // liquida nada como PAGO (só os extras, PENDING, quando houver).
+        const finalChargeAmount = adminCouponQuote ? adminCouponQuote.finalAmount : price;
+        // Valor da cobrança desta gravação: sessão de plano sem a baixa → só os extras (0 = nenhuma cobrança).
+        const adminChargeAmount = planCovered ? addonsCharge : finalChargeAmount;
+        if (finalChargeAmount <= 0 && !canMarkPaid && !planCovered) {
+            res.status(403).json({
+                error: 'Este agendamento ficaria com valor zero e seria registrado como pago — isso exige a permissão “Marcar como pago, anular ou estornar”.',
+                code: 'PERMISSION_DENIED',
+                permission: 'cobrancas.baixa',
+            });
+            return;
         }
 
         // Check for conflicts. FIX (B3): tranca o slot durante a checagem+escrita (mesmo lock do
@@ -935,6 +1102,49 @@ router.post('/admin', authenticate, authorize('ADMIN'), async (req: Request, res
             return;
         }
 
+        // REG-1: o teto do FIXO "coberto pelo plano" é reconferido sob a mesma trava por contrato do POST / do
+        // cliente (A8): duas criações concorrentes no último lugar do plano não saem as duas sem cobrança. Se o
+        // teto encheu entre a conta lá de cima e agora → 409; ao tentar de novo, a sessão sai cobrada como extra.
+        // ATU5-02: a sessão FIXO cobrada por quem tem a baixa também passa pela trava — a marca fixoExtra (EXTRA, fora
+        // do teto) é decidida com o teto relido aqui, e a reserva é gravada antes de a trava ser solta. Sem a baixa, a
+        // sessão cobrada acima do teto segue extra (a decisão lá de cima, a mesma da mensagem e do valor).
+        let fixoLockKey: string | null = null;
+        let fixoExtra = fixoOverCap;
+        if (isFixoLinked) {
+            fixoLockKey = fixoCapLockKey(linkedContract!.id);
+            if (!(await acquireMutexBlocking(fixoLockKey, 20))) {
+                await releaseMultiSlotLock(data.date, packageSlots, adminLockOwner);
+                res.status(409).json({ error: 'Muitas reservas simultâneas neste contrato. Tente novamente.' });
+                return;
+            }
+            const capReachedNow = await fixoCapReached(linkedContract!);
+            if (planCovered && capReachedNow) {
+                await releaseMutex(fixoLockKey);
+                await releaseMultiSlotLock(data.date, packageSlots, adminLockOwner);
+                res.status(409).json({
+                    error: 'O plano fixo acabou de usar todas as sessões. Tente de novo: esta sessão passa a ser cobrada como extra.',
+                    code: 'FIXO_LIMIT_REACHED',
+                });
+                return;
+            }
+            if (canMarkPaid) fixoExtra = capReachedNow;
+        }
+
+        // DIN-01: sessão de plano FLEX ou Personalizado consome 1 crédito, como no POST / do cliente
+        // (decremento atômico guardado por > 0, com o horário ainda trancado). O cancelamento devolve esse
+        // crédito (DELETE /:id → restoreCredit); sem o desconto aqui, criar e cancelar gerava crédito do nada.
+        // No FLEX o cron (flexCreditExpiryJob) já conta esta sessão como consumo — o desconto só antecipa o
+        // saldo canônico, nunca desconta em dobro. FIXO e avulso não têm crédito a descontar.
+        let creditDeducted = false;
+        if (linkedContract && (linkedContract.type === 'FLEX' || linkedContract.type === 'CUSTOM')) {
+            if (!(await deductCredit(linkedContract.id))) {
+                await releaseMultiSlotLock(data.date, packageSlots, adminLockOwner);
+                res.status(400).json({ error: 'Créditos esgotados neste plano.', code: 'NO_CREDITS' });
+                return;
+            }
+            creditDeducted = true;
+        }
+
         let finalContractId = data.contractId;
         let contract = linkedContract; // reuse the fetch from the pricing block above
 
@@ -962,22 +1172,36 @@ router.post('/admin', authenticate, authorize('ADMIN'), async (req: Request, res
             finalContractId = newContract.id;
         }
 
-        const booking = await prisma.booking.create({
-            data: {
-                userId: data.userId,
-                contractId: finalContractId,
-                date: dateObj,
-                startTime: data.startTime,
-                endTime,
-                status: data.status === 'CONFIRMED' ? BookingStatus.CONFIRMED : BookingStatus.RESERVED,
-                tierApplied: slotTier,
-                price,
-                addOns: contract ? Array.from(new Set([...(contract.addOns || []).filter(a => a !== 'GESTAO_SOCIAL'), ...(data.addOns || [])])) : (data.addOns || []),
-                ...(data.adminNotes ? { adminNotes: data.adminNotes } : {}),
-            },
-        });
+        let booking;
+        try {
+            booking = await prisma.booking.create({
+                data: {
+                    userId: data.userId,
+                    contractId: finalContractId,
+                    date: dateObj,
+                    startTime: data.startTime,
+                    endTime,
+                    // Status já decidido pela regra de permissão (CONFIRMED só com cobrancas.baixa).
+                    status: bookingStatus === 'CONFIRMED' ? BookingStatus.CONFIRMED : BookingStatus.RESERVED,
+                    tierApplied: slotTier,
+                    price,
+                    addOns: contract ? Array.from(new Set([...(contract.addOns || []).filter(a => a !== 'GESTAO_SOCIAL'), ...(data.addOns || [])])) : (data.addOns || []),
+                    ...(data.adminNotes ? { adminNotes: data.adminNotes } : {}),
+                },
+            });
+        } catch (createErr) {
+            // B25 (como no POST /): o crédito descontado acima não pode ficar consumido sem a gravação.
+            if (creditDeducted && data.contractId) {
+                await restoreCredit(data.contractId).catch((e) => console.error('[ADMIN-BOOKING] Falha ao devolver o crédito após erro de criação:', e));
+            }
+            if (fixoLockKey) await releaseMutex(fixoLockKey);
+            await releaseMultiSlotLock(data.date, packageSlots, adminLockOwner);
+            throw createErr;
+        }
 
-        // Slot já ocupado pela linha do booking — pode liberar o lock (o resto é pagamento/notif).
+        // Slot já ocupado pela linha do booking — pode liberar o lock (o resto é pagamento/notif). O teto do FIXO
+        // também já está garantido pela linha criada sob a trava do contrato.
+        if (fixoLockKey) await releaseMutex(fixoLockKey);
         await releaseMultiSlotLock(data.date, packageSlots, adminLockOwner);
 
         // D6: nova sessão num contrato existente reabre um contrato "Concluído" (volta a ACTIVE).
@@ -990,103 +1214,119 @@ router.post('/admin', authenticate, authorize('ADMIN'), async (req: Request, res
         let boletoUrl: string | null = null;
         let barcode: string | null = null;
         let boletoError: string | null = null;
-        try {
-            // PIX é dinâmico (Sicoob ou Cora, conforme o admin habilitou) — não mais 'CORA' fixo: o
-            // provider decide a taxa de gateway versionada e a conciliação. Boleto é sempre Cora.
-            const paymentProvider = data.paymentMethod === 'BOLETO'
-                ? 'CORA'
-                : (data.paymentMethod === 'PIX'
-                    ? ((await resolvePixProvider()) ?? getProviderForMethod('PIX'))
-                    : 'STRIPE');
-            const adminChargeAmount = adminCouponQuote ? adminCouponQuote.finalAmount : price;
-            const paymentRecord = await prisma.$transaction(async (tx) => {
-                const p = await tx.payment.create({
-                    data: {
-                        userId: data.userId,
-                        contractId: finalContractId,
-                        bookingId: booking.id,
-                        provider: paymentProvider as any,
-                        amount: adminChargeAmount,
-                        status: data.status === 'CONFIRMED' ? 'PAID' : 'PENDING',
-                        dueDate: dateObj,
-                        installments: 1,
-                        ...(data.status === 'CONFIRMED' ? { paidAt: new Date() } : {}),
-                        ...(adminCouponQuote ? {
-                            couponId: adminCouponQuote.coupon.id,
-                            couponCode: adminCouponQuote.coupon.code,
-                            discountAmount: adminCouponQuote.discountAmount,
-                        } : {}),
-                    },
-                });
-                if (adminCouponQuote) {
-                    await reserveCouponUse(tx, {
-                        couponId: adminCouponQuote.coupon.id,
-                        userId: data.userId,
-                        paymentId: p.id,
-                        originalAmount: price,
-                        discountAmount: adminCouponQuote.discountAmount,
-                        maxUsesPerUser: adminCouponQuote.coupon.maxUsesPerUser,
-                    });
-                    // Booking created directly as CONFIRMED+PAID → confirm the use
-                    // ATOMICALLY with the payment (same tx) so it can't be left RESERVED.
-                    if (data.status === 'CONFIRMED') {
-                        await tx.couponRedemption.updateMany({
-                            where: { paymentId: p.id, status: 'RESERVED' },
-                            data: { status: 'CONFIRMED', confirmedAt: new Date() },
-                        });
-                    }
-                }
-                return p;
-            });
-            createdPaymentId = paymentRecord.id;
-
-            // Cupom 100% / valor zero: nada a cobrar — liquida como PAID na hora (mesmos efeitos de um
-            // webhook: confirma a reserva e o uso do cupom). Uma cobrança de R$ 0 PENDENTE iria ao gateway
-            // (que recusa) e ao auto-charge (aviso de falha diário).
-            if (adminChargeAmount <= 0 && data.status !== 'CONFIRMED') {
-                const settled = await prisma.payment.updateMany({
-                    where: { id: paymentRecord.id, status: 'PENDING' },
-                    data: { status: 'PAID', paidAt: new Date() },
-                });
-                if (settled.count > 0) {
-                    const { onPaymentConfirmed } = await import('../../lib/paymentEffects.js');
-                    await onPaymentConfirmed(paymentRecord.id);
-                }
-            }
-
-            // Admin-only: generate BOLETO via Cora
-            if (data.paymentMethod === 'BOLETO' && data.status !== 'CONFIRMED' && adminChargeAmount > 0) {
-                try {
-                    const { createCoraPayment } = await import('../../lib/coraPaymentHelper.js');
-                    const coraRes = await createCoraPayment({
-                        userId: data.userId,
-                        amount: adminChargeAmount,
-                        description: `Boleto - ${data.startTime} ${data.date}`,
-                        withPixQrCode: false,
-                        dueDays: 3,
-                        idempotencyKey: paymentRecord.id,
-                    });
-                    boletoUrl = coraRes.boletoUrl;
-                    barcode = coraRes.barcode;
-                    await prisma.payment.update({
-                        where: { id: paymentRecord.id },
+        // REG-1: sessão de plano criada sem a baixa e SEM serviços extras → nenhum Payment (o plano já
+        // cobre a sessão; nada "aguardando pagamento" para o cliente nem na lista de vencidas).
+        if (!planCovered || adminChargeAmount > 0) {
+            try {
+                // PIX é dinâmico (Sicoob ou Cora, conforme o admin habilitou) — não mais 'CORA' fixo: o
+                // provider decide a taxa de gateway versionada e a conciliação. Boleto é sempre Cora.
+                const paymentProvider = data.paymentMethod === 'BOLETO'
+                    ? 'CORA'
+                    : (data.paymentMethod === 'PIX'
+                        ? ((await resolvePixProvider()) ?? getProviderForMethod('PIX'))
+                        : 'STRIPE');
+                const paymentRecord = await prisma.$transaction(async (tx) => {
+                    const p = await tx.payment.create({
                         data: {
-                            providerRef: coraRes.result.id,
-                            provider: 'CORA',
-                            boletoUrl: coraRes.boletoUrl,
+                            userId: data.userId,
+                            contractId: finalContractId,
+                            bookingId: booking.id,
+                            provider: paymentProvider as any,
+                            amount: adminChargeAmount,
+                            status: bookingStatus === 'CONFIRMED' ? 'PAID' : 'PENDING',
+                            dueDate: dateObj,
+                            installments: 1,
+                            ...(bookingStatus === 'CONFIRMED' ? { paidAt: new Date() } : {}),
+                            // R4 (ATK-03/FIN-05/FIN-03): a cobrança inclui o valor da PRÓPRIA sessão (avulso,
+                            // SERVIÇO, FIXO acima do teto, ou criada por quem tem a baixa) → marca. Só os extras
+                            // de uma sessão coberta pelo plano (planCovered) não levam a marca. ATU5-02: a sessão FIXO
+                            // criada com o teto já cheio leva também a fixoExtra (não ocupa vaga do plano).
+                            ...(!planCovered ? { metadata: { ...SESSION_CHARGE_METADATA, ...(fixoExtra ? FIXO_EXTRA_METADATA : {}) } } : {}),
+                            ...(adminCouponQuote ? {
+                                couponId: adminCouponQuote.coupon.id,
+                                couponCode: adminCouponQuote.coupon.code,
+                                discountAmount: adminCouponQuote.discountAmount,
+                            } : {}),
                         },
                     });
-                } catch (bErr: unknown) {
-                    // Surface the failure to the admin instead of silently returning a
-                    // 201 with no boleto — the booking still exists, but the admin must
-                    // know the boleto was NOT generated (e.g. client CPF inválido).
-                    console.error('[ADMIN-BOOKING] Boleto generation failed:', bErr);
-                    boletoError = bErr instanceof Error ? bErr.message : 'Falha ao gerar o boleto.';
+                    if (adminCouponQuote) {
+                        await reserveCouponUse(tx, {
+                            couponId: adminCouponQuote.coupon.id,
+                            userId: data.userId,
+                            paymentId: p.id,
+                            originalAmount: price,
+                            discountAmount: adminCouponQuote.discountAmount,
+                            maxUsesPerUser: adminCouponQuote.coupon.maxUsesPerUser,
+                        });
+                        // Booking created directly as CONFIRMED+PAID → confirm the use
+                        // ATOMICALLY with the payment (same tx) so it can't be left RESERVED.
+                        if (bookingStatus === 'CONFIRMED') {
+                            await tx.couponRedemption.updateMany({
+                                where: { paymentId: p.id, status: 'RESERVED' },
+                                data: { status: 'CONFIRMED', confirmedAt: new Date() },
+                            });
+                        }
+                    }
+                    return p;
+                });
+                createdPaymentId = paymentRecord.id;
+
+                // Cupom 100% / valor zero: nada a cobrar — liquida como PAID na hora (mesmos efeitos de um
+                // webhook: confirma a reserva e o uso do cupom). Uma cobrança de R$ 0 PENDENTE iria ao gateway
+                // (que recusa) e ao auto-charge (aviso de falha diário).
+                // (Só chega aqui com cobrancas.baixa — sem ela o valor zero é recusado antes de gravar.)
+                if (adminChargeAmount <= 0 && bookingStatus !== 'CONFIRMED') {
+                    const settled = await prisma.payment.updateMany({
+                        where: { id: paymentRecord.id, status: 'PENDING' },
+                        data: { status: 'PAID', paidAt: new Date() },
+                    });
+                    if (settled.count > 0) {
+                        const { onPaymentConfirmed } = await import('../../lib/paymentEffects.js');
+                        await onPaymentConfirmed(paymentRecord.id);
+                    }
                 }
+
+                // Admin-only: generate BOLETO via Cora
+                if (data.paymentMethod === 'BOLETO' && bookingStatus !== 'CONFIRMED' && adminChargeAmount > 0) {
+                    try {
+                        const { createCoraPayment } = await import('../../lib/coraPaymentHelper.js');
+                        const coraRes = await createCoraPayment({
+                            userId: data.userId,
+                            amount: adminChargeAmount,
+                            description: `Boleto - ${data.startTime} ${data.date}`,
+                            withPixQrCode: false,
+                            dueDays: 3,
+                            idempotencyKey: paymentRecord.id,
+                        });
+                        boletoUrl = coraRes.boletoUrl;
+                        barcode = coraRes.barcode;
+                        await prisma.payment.update({
+                            where: { id: paymentRecord.id },
+                            data: {
+                                providerRef: coraRes.result.id,
+                                provider: 'CORA',
+                                boletoUrl: coraRes.boletoUrl,
+                            },
+                        });
+                    } catch (bErr: unknown) {
+                        // Surface the failure to the admin instead of silently returning a
+                        // 201 with no boleto — the booking still exists, but the admin must
+                        // know the boleto was NOT generated (e.g. client CPF inválido).
+                        console.error('[ADMIN-BOOKING] Boleto generation failed:', bErr);
+                        boletoError = bErr instanceof Error ? bErr.message : 'Falha ao gerar o boleto.';
+                    }
+                }
+            } catch (payErr: unknown) {
+                console.error('[ADMIN-BOOKING] Payment creation failed:', payErr);
             }
-        } catch (payErr: unknown) {
-            console.error('[ADMIN-BOOKING] Payment creation failed:', payErr);
         }
+        const planReservedMessage = adminPlanBookingReservedMessage(planCovered && createdPaymentId !== null);
+        const chargedMessage = chargedReason ? ADMIN_LINKED_CHARGED_MESSAGE[chargedReason] : null;
+        // Aviso que o modal mostra no lugar do texto dele: "Confirmado" rebaixado (D7) e, sempre, a sessão
+        // vinculada que o contrato não cobre (REG-1 — senão o modal diria "coberta pelo plano").
+        const notice = planCovered
+            ? (createPlan.downgraded ? planReservedMessage : null)
+            : (chargedMessage ?? (createPlan.downgraded ? ADMIN_BOOKING_DOWNGRADE_MESSAGE : null));
 
         res.status(201).json({
             booking: {
@@ -1100,15 +1340,23 @@ router.post('/admin', authenticate, authorize('ADMIN'), async (req: Request, res
             },
             paymentId: createdPaymentId,
             ...(createdPaymentId ? {
-                paymentAmount: adminCouponQuote ? adminCouponQuote.finalAmount : price,
+                paymentAmount: adminChargeAmount,
                 ...(adminCouponQuote && { couponDiscount: adminCouponQuote.discountAmount }),
             } : {}),
             boletoUrl,
             barcode,
             ...(boletoError && { boletoError }),
+            // REG-1: sessão de plano criada sem a baixa — o plano cobre a sessão (só os extras são cobrados).
+            ...(planCovered && { coveredByPlan: true }),
+            // D7: "Confirmado" pedido por quem não tem a baixa manual → RESERVED (avulso: aguardando pagamento;
+            // plano: presença a confirmar).
+            downgraded: createPlan.downgraded,
+            ...(notice && { notice }),
             message: boletoError
                 ? 'Agendamento criado, mas o boleto NÃO foi gerado. Verifique o CPF do cliente e gere o boleto novamente.'
-                : 'Agendamento criado pelo administrador.',
+                : planCovered
+                    ? planReservedMessage
+                    : (chargedMessage ?? (createPlan.downgraded ? ADMIN_BOOKING_DOWNGRADE_MESSAGE : 'Agendamento criado pela equipe.')),
         });
     } catch (err) {
         if (err instanceof z.ZodError) {

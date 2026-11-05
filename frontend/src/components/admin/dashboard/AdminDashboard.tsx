@@ -15,11 +15,13 @@ import {
 } from 'lucide-react';
 import { TIER_META, BOOKING_STATUS_META, CONTRACT_TYPE_META, getMeta } from '../../../constants/adminMeta';
 import { isAvulsoContract, isBookingMakeupOpen } from '../../../utils/contractStatus';
-import { buildReasonUpdate, reasonToastMessage, makeupDeadlineDdmm } from '../../../utils/avulsoMakeup';
+import { buildReasonUpdate, reasonSaveFeedback, showReasonFeedback, makeupDeadlineDdmm } from '../../../utils/avulsoMakeup';
 import { useBusinessConfig } from '../../../hooks/useBusinessConfig';
 import { formatBRL, DAY_NAMES, getInitials } from '../../../utils/format';
 import { todayStrSaoPaulo } from '../../../utils/time';
 import { STUDIO_SLOTS } from '../../../constants/slots';
+import { usePermission } from '../../../hooks/usePermission';
+import { useBookingPermissions } from '../bookings/bookingPermissions';
 
 
 function getMonthRange(): { start: Date; end: Date } {
@@ -57,8 +59,16 @@ function daysUntil(dateStr: string): number {
 
 export default function AdminDashboard() {
     const navigate = useNavigate();
-    const { showToast, showConfirm } = useUI();
-    const { get: getRule } = useBusinessConfig();
+    const { showToast, showConfirm, showAlert } = useUI();
+    useBusinessConfig(); // pré-carrega as regras (prazo da remarcação) que o modal de motivo mostra
+    // Painel sem permissão própria (proposta §2.4): cada bloco segue o módulo de origem e cada carga só
+    // sai com a permissão dela — um 403 nunca derruba o painel inteiro.
+    const { can, canAny } = usePermission();
+    const bp = useBookingPermissions();
+    const canBookings = canAny('agendamentos.ver', 'hoje.ver');
+    const canContracts = can('contratos.ver');
+    const canClients = can('clientes.ver');
+    const canRevenue = can('financeiro.ver');
     const [allBookings, setAllBookings] = useState<BookingWithUser[]>([]);
     const [allContracts, setAllContracts] = useState<Contract[]>([]);
     const [allUsers, setAllUsers] = useState<UserSummary[]>([]);
@@ -66,27 +76,30 @@ export default function AdminDashboard() {
     const [reasonModal, setReasonModal] = useState<{ booking: BookingWithUser; kind: ReasonKind } | null>(null);
     const [savingReason, setSavingReason] = useState(false);
 
-    useEffect(() => { loadAll(); }, []);
+    useEffect(() => { loadAll(); }, [canBookings, canContracts, canClients]);
 
     const loadAll = async () => {
         setLoading(true);
         try {
-            const [bRes, cRes, uRes] = await Promise.all([
-                bookingsApi.getAll(),
-                contractsApi.getAll(),
-                usersApi.getAll(),
+            // Cargas condicionais e independentes (allSettled): sem a permissão, nem pede; uma falha
+            // (rede, 403 de permissão retirada) deixa só aquele bloco vazio.
+            const [bRes, cRes, uRes] = await Promise.allSettled([
+                canBookings ? bookingsApi.getAll() : Promise.resolve({ bookings: [] as BookingWithUser[] }),
+                canContracts ? contractsApi.getAll() : Promise.resolve({ contracts: [] as Contract[] }),
+                canClients ? usersApi.getAll() : Promise.resolve({ users: [] as UserSummary[] }),
             ]);
-            setAllBookings(bRes.bookings);
-            setAllContracts(cRes.contracts);
-            setAllUsers(uRes.users);
-        } catch (err) { console.error(err); }
-        finally { setLoading(false); }
+            if (bRes.status === 'fulfilled') setAllBookings(bRes.value.bookings); else console.error(bRes.reason);
+            if (cRes.status === 'fulfilled') setAllContracts(cRes.value.contracts); else console.error(cRes.reason);
+            if (uRes.status === 'fulfilled') setAllUsers(uRes.value.users); else console.error(uRes.reason);
+        } finally { setLoading(false); }
     };
 
     const handleQuickAction = async (id: string, action: 'checkin' | 'start' | 'complete') => {
         try {
             let res;
-            if (action === 'checkin') res = await bookingsApi.checkIn(id);
+            // Confirmar presença: o check-in exige hoje.presenca; quem só tem agendamentos.editar confirma
+            // pelo PATCH (RESERVED → CONFIRMED, mesma tabela de transições do servidor).
+            if (action === 'checkin') res = bp.canCheckIn ? await bookingsApi.checkIn(id) : await bookingsApi.update(id, { status: 'CONFIRMED' });
             else if (action === 'start') res = await bookingsApi.startRecording(id);
             else res = await bookingsApi.complete(id);
             showToast(res.message);
@@ -139,8 +152,9 @@ export default function AdminDashboard() {
         const isAvulso = booking.contract?.type === 'AVULSO';
         setSavingReason(true);
         try {
-            await bookingsApi.update(booking.id, buildReasonUpdate(kind, reason, { isAvulso, justified }));
-            showToast(reasonToastMessage(kind, { isAvulso, justified, bookingDate: booking.date, makeupDays: getRule('avulso_makeup_days') }));
+            const res = await bookingsApi.update(booking.id, buildReasonUpdate(kind, reason, { isAvulso, justified }));
+            // AUDFIN6-03: o retorno segue a RESPOSTA do servidor (a remarcação só é prometida se a janela abriu).
+            showReasonFeedback(reasonSaveFeedback(kind, { isAvulso, justified }, res), { showToast, showAlert });
             setReasonModal(null);
             await loadAll();
         } catch (err: unknown) { showToast(getErrorMessage(err) || 'Erro ao registrar.'); }
@@ -196,6 +210,8 @@ export default function AdminDashboard() {
         .slice(0, 5);
 
     // Churn risk: active contract clients who haven't booked in 14 days
+    // (precisa das três cargas: clientes, contratos e agendamentos — sem uma delas o bloco some).
+    const canChurn = canClients && canContracts && canBookings;
     const clientsWithActiveContracts = new Set(activeContracts.map(c => c.user?.id).filter(Boolean));
     const fourteenDaysAgo = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
     const churnRisk = allUsers
@@ -208,6 +224,56 @@ export default function AdminDashboard() {
         });
 
     const totalAlerts = expiringContracts.length + pendingCancellations.length + unconfirmedToday.length;
+    // Alertas: contratos (contratos.ver) e sessões sem confirmação (agenda).
+    const canAlerts = canContracts || canBookings;
+    // KPIs visíveis (cada um com a sua origem). A receita é consolidada: só com financeiro.ver
+    // (e depende das sessões, que vêm da agenda).
+    const kpis = [
+        ...(canRevenue && canBookings ? [{ label: 'Receita do Mês', value: formatBRL(monthRevenue), sub: `${monthBookings.length} agendamentos`, mod: ' admin-kpi-card--success' }] : []),
+        ...(canBookings ? [
+            { label: 'Ocupação Hoje', value: isSunday ? '—' : `${todaysBookings.length}/5`, sub: isSunday ? 'Fechado' : `${Math.round((todaysBookings.length / 5) * 100)}% dos slots`, mod: '' },
+            { label: 'Taxa de Presença', value: `${attendanceRate}%`, sub: `${completedThisMonth} concluídas, ${noShowsThisMonth} faltas`, mod: attendanceRate >= 80 ? ' admin-kpi-card--success' : ' admin-kpi-card--danger' },
+        ] : []),
+        ...(canContracts ? [{
+            label: 'Contratos Ativos', value: `${activeContracts.length}`,
+            sub: canClients
+                ? (() => { const n = allUsers.filter(u => u.role === 'CLIENTE').length; return `${n} cliente${n !== 1 ? 's' : ''} cadastrado${n !== 1 ? 's' : ''}`; })()
+                : 'contratos em andamento',
+            mod: ' admin-kpi-card--accent',
+        }] : []),
+        ...(!canContracts && canClients ? [{
+            label: 'Clientes', value: `${allUsers.filter(u => u.role === 'CLIENTE').length}`, sub: 'clientes cadastrados', mod: ' admin-kpi-card--accent',
+        }] : []),
+    ];
+    // Abrir o cliente: perfil com clientes.ver; senão, o contrato (alerta de contrato) ou nada.
+    const clientLink = (name: string, userId: string | undefined, sm?: boolean) => (userId && canClients ? (
+        <Tooltip content={`Abrir perfil de ${name}`}>
+            <button type="button" className={`dash-name-btn${sm ? ' dash-name-btn--sm dash-name-btn--ellipsis' : ''}`}
+                onClick={() => navigate(`/admin/clients/${userId}`)}>
+                {name}
+            </button>
+        </Tooltip>
+    ) : (
+        <span className={`dash-name-btn${sm ? ' dash-name-btn--sm dash-name-btn--ellipsis' : ''}`} style={{ cursor: 'inherit', display: 'inline-block' }}>{name}</span>
+    ));
+
+    // Nenhum bloco para este acesso (ex.: só "Financeiro e receita", que depende da agenda): estado vazio.
+    if (!canBookings && !canContracts && !canClients) {
+        return (
+            <div aria-label="Painel principal">
+                <AdminPageHeader
+                    icon={LayoutDashboard}
+                    title="Centro de Comando"
+                    subtitle={new Date().toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric' })}
+                />
+                <div className="admin-empty" role="status">
+                    <Target size={40} className="admin-empty__icon" aria-hidden="true" />
+                    <div className="admin-empty__title">O painel não tem blocos para o seu acesso</div>
+                    <div className="admin-empty__hint">Abra uma das áreas liberadas no menu. Para ver mais aqui, fale com o administrador.</div>
+                </div>
+            </div>
+        );
+    }
 
     // ── Slot enrichment for today ──
     const todaySlots = STUDIO_SLOTS.map(slot => {
@@ -223,7 +289,8 @@ export default function AdminDashboard() {
                 title="Centro de Comando"
                 subtitle={new Date().toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric' })}
             />
-            {/* ── SECTION 1: Agenda do Dia (Hero) ────────────────── */}
+            {/* ── SECTION 1: Agenda do Dia (Hero) — agenda (agendamentos.ver ou hoje.ver) ── */}
+            {canBookings && (
             <div className="admin-card admin-card--lg dash-agenda-card">
                 <div className="dash-card-head">
                     <div className="dash-card-head__title">
@@ -250,7 +317,9 @@ export default function AdminDashboard() {
                             const b = slot.booking;
                             const isPast = new Date(`${today}T${slot.end}:00`) < now;
                             return (
-                                <div key={slot.time} className={`dash-slot${b ? ' dash-slot--filled' : ''}${isPast && !b ? ' dash-slot--past' : ''}`}>
+                                // flexWrap + marginLeft:auto: no celular (375 px) as ações e o selo descem para a linha de
+                                // baixo, alinhados à direita, em vez de vazar do card (no desktop nada muda).
+                                <div key={slot.time} className={`dash-slot${b ? ' dash-slot--filled' : ''}${isPast && !b ? ' dash-slot--past' : ''}`} style={{ flexWrap: 'wrap' }}>
                                     {/* Time column */}
                                     <div className="dash-slot__time">{slot.label}</div>
 
@@ -261,12 +330,7 @@ export default function AdminDashboard() {
                                     <div className="dash-slot__main">
                                         {b ? (
                                             <>
-                                                <Tooltip content={`Abrir perfil de ${b.user.name}`}>
-                                                    <button type="button" className="dash-name-btn"
-                                                        onClick={() => navigate(`/admin/clients/${b.user.id}`)}>
-                                                        {b.user.name}
-                                                    </button>
-                                                </Tooltip>
+                                                {clientLink(b.user.name, b.user.id)}
                                                 <StatusBadge meta={getMeta(TIER_META, b.tierApplied)} />
                                                 <StatusBadge meta={getMeta(BOOKING_STATUS_META, b.status)} />
                                                 <span className="dash-slot__price">{formatBRL(b.price)}</span>
@@ -279,29 +343,33 @@ export default function AdminDashboard() {
                                     </div>
 
                                     {/* Quick Actions */}
-                                    {b && b.status === 'RESERVED' && !isPast && (
-                                        <div className="dash-slot__actions">
-                                            <Tooltip content="Confirmar presença (check-in)">
-                                                <button type="button" className="today-action-btn today-action-btn--info"
-                                                    onClick={() => handleQuickAction(b.id, 'checkin')}>
-                                                    <ClipboardCheck size={14} aria-hidden="true" /> Check-in
-                                                </button>
-                                            </Tooltip>
-                                            <Tooltip content="Registrar falta" describe={false}>
-                                                <button type="button" className="today-action-btn today-action-btn--danger"
-                                                    aria-label={`Registrar falta de ${b.user.name}`}
-                                                    onClick={() => setReasonModal({ booking: b, kind: 'FALTA' })}>
-                                                    <XCircle size={15} aria-hidden="true" />
-                                                </button>
-                                            </Tooltip>
+                                    {b && b.status === 'RESERVED' && !isPast && (bp.canConfirmPresence || bp.canFaltas) && (
+                                        <div className="dash-slot__actions" style={{ marginLeft: 'auto' }}>
+                                            {bp.canConfirmPresence && (
+                                                <Tooltip content="Confirmar presença (check-in)">
+                                                    <button type="button" className="today-action-btn today-action-btn--info"
+                                                        onClick={() => handleQuickAction(b.id, 'checkin')}>
+                                                        <ClipboardCheck size={14} aria-hidden="true" /> Check-in
+                                                    </button>
+                                                </Tooltip>
+                                            )}
+                                            {bp.canFaltas && (
+                                                <Tooltip content="Registrar falta" describe={false}>
+                                                    <button type="button" className="today-action-btn today-action-btn--danger"
+                                                        aria-label={`Registrar falta de ${b.user.name}`}
+                                                        onClick={() => setReasonModal({ booking: b, kind: 'FALTA' })}>
+                                                        <XCircle size={15} aria-hidden="true" />
+                                                    </button>
+                                                </Tooltip>
+                                            )}
                                         </div>
                                     )}
                                     {/* Sessão já INICIADA continua com Desfazer/Finalizar depois do fim do horário (senão o
                                         cliente ficaria vendo “AO VIVO” sem o operador ter onde finalizar). */}
-                                    {b && b.status === 'CONFIRMED' && (!isPast || !!b.recordingStartedAt) && (
-                                        <div className="dash-slot__actions">
+                                    {b && b.status === 'CONFIRMED' && (!isPast || !!b.recordingStartedAt) && (bp.canOperateRecording || (!isPast && bp.canFaltas)) && (
+                                        <div className="dash-slot__actions" style={{ marginLeft: 'auto' }}>
                                             {/* Iniciar Gravação é obrigatório antes de finalizar (registra o operador presente). */}
-                                            {!b.recordingStartedAt ? (
+                                            {!bp.canOperateRecording ? null : !b.recordingStartedAt ? (
                                                 <Tooltip content="Iniciar gravação">
                                                     <button type="button" className="today-action-btn today-action-btn--danger"
                                                         onClick={() => handleQuickAction(b.id, 'start')}>
@@ -326,7 +394,7 @@ export default function AdminDashboard() {
                                                     </Tooltip>
                                                 </>
                                             )}
-                                            {!isPast && (
+                                            {!isPast && bp.canFaltas && (
                                                 <Tooltip content="Registrar falta" describe={false}>
                                                     <button type="button" className="today-action-btn today-action-btn--danger"
                                                         aria-label={`Registrar falta de ${b.user.name}`}
@@ -339,10 +407,10 @@ export default function AdminDashboard() {
                                     )}
 
                                     {b && b.status === 'COMPLETED' && (
-                                        <span className="dash-status-chip dash-status-chip--success"><Flag size={13} aria-hidden="true" /> Concluído</span>
+                                        <span className="dash-status-chip dash-status-chip--success" style={{ marginLeft: 'auto' }}><Flag size={13} aria-hidden="true" /> Concluído</span>
                                     )}
                                     {b && b.status === 'FALTA' && (
-                                        <span className="dash-status-chip dash-status-chip--danger">
+                                        <span className="dash-status-chip dash-status-chip--danger" style={{ marginLeft: 'auto' }}>
                                             <XCircle size={13} aria-hidden="true" /> Falta
                                             {/* D4: falta justificada do avulso → remarcação sem novo pagamento em aberto. */}
                                             {isBookingMakeupOpen(b) && b.makeupDeadline ? ` · remarcável até ${makeupDeadlineDdmm(b.makeupDeadline)}` : ''}
@@ -350,7 +418,7 @@ export default function AdminDashboard() {
                                     )}
                                     {b && b.status === 'NAO_REALIZADO' && isBookingMakeupOpen(b) && b.makeupDeadline && (
                                         // D5: não realizada pelo estúdio → remarcação sem custo em aberto.
-                                        <span className="dash-status-chip" style={{ color: 'var(--warning)' }}>
+                                        <span className="dash-status-chip" style={{ color: 'var(--warning)', marginLeft: 'auto' }}>
                                             <AlertCircle size={13} aria-hidden="true" /> Não realizado · remarcável até {makeupDeadlineDdmm(b.makeupDeadline)}
                                         </span>
                                     )}
@@ -360,15 +428,12 @@ export default function AdminDashboard() {
                     </div>
                 )}
             </div>
+            )}
 
             {/* ── SECTION 2: KPIs (2 colunas mobile · 4 desktop; padrão .admin-kpi-card) ─── */}
+            {kpis.length > 0 && (
             <div className="dash-kpi-grid">
-                {[
-                    { label: 'Receita do Mês', value: formatBRL(monthRevenue), sub: `${monthBookings.length} agendamentos`, mod: ' admin-kpi-card--success' },
-                    { label: 'Ocupação Hoje', value: isSunday ? '—' : `${todaysBookings.length}/5`, sub: isSunday ? 'Fechado' : `${Math.round((todaysBookings.length / 5) * 100)}% dos slots`, mod: '' },
-                    { label: 'Taxa de Presença', value: `${attendanceRate}%`, sub: `${completedThisMonth} concluídas, ${noShowsThisMonth} faltas`, mod: attendanceRate >= 80 ? ' admin-kpi-card--success' : ' admin-kpi-card--danger' },
-                    { label: 'Contratos Ativos', value: `${activeContracts.length}`, sub: (() => { const n = allUsers.filter(u => u.role !== 'ADMIN').length; return `${n} cliente${n !== 1 ? 's' : ''} cadastrado${n !== 1 ? 's' : ''}`; })(), mod: ' admin-kpi-card--accent' },
-                ].map((kpi, i) => (
+                {kpis.map((kpi, i) => (
                     <div key={i} className={`admin-kpi-card${kpi.mod}`}>
                         <div className="admin-kpi-card__label">{kpi.label}</div>
                         <div className="admin-kpi-card__value admin-kpi-card__value--sm">{kpi.value}</div>
@@ -376,11 +441,14 @@ export default function AdminDashboard() {
                     </div>
                 ))}
             </div>
+            )}
 
-            {/* ── SECTION 3: Alertas + Ocupação Semanal ────────── */}
-            <div className="admin-grid-2" style={{ marginBottom: '24px' }}>
+            {/* ── SECTION 3: Alertas + Ocupação Semanal ────────── (um só ocupa a linha inteira) */}
+            {(canAlerts || canBookings) && (
+            <div className={canAlerts && canBookings ? 'admin-grid-2' : undefined} style={{ marginBottom: '24px' }}>
 
                 {/* Alerts */}
+                {canAlerts && (
                 <div className="admin-card dash-panel">
                     <h3 className="dash-panel__title">
                         <AlertTriangle size={18} style={{ color: 'var(--danger)' }} aria-hidden="true" /> Alertas
@@ -401,7 +469,8 @@ export default function AdminDashboard() {
                                     <AlertCircle size={18} className="dash-alert__icon" aria-hidden="true" />
                                     <div className="dash-alert__body">
                                         <div className="dash-alert__title">
-                                            Contrato de <button type="button" className="dash-inline-link" onClick={() => c.user?.id && navigate(`/admin/clients/${c.user.id}`)}>{c.user?.name}</button> {(() => { const d = daysUntil(c.endDate); return d === 0 ? 'expira hoje' : `expira em ${d} ${d === 1 ? 'dia' : 'dias'}`; })()}
+                                            {/* Com clientes.ver abre o perfil (como antes); sem, o detalhe do contrato (contratos.ver). */}
+                                            Contrato de <button type="button" className="dash-inline-link" onClick={() => (canClients && c.user?.id ? navigate(`/admin/clients/${c.user.id}`) : navigate(`/admin/contracts/${c.id}`))}>{c.user?.name}</button> {(() => { const d = daysUntil(c.endDate); return d === 0 ? 'expira hoje' : `expira em ${d} ${d === 1 ? 'dia' : 'dias'}`; })()}
                                         </div>
                                         <div className="dash-alert__sub">{getMeta(CONTRACT_TYPE_META, c.type).label} · {getMeta(TIER_META, c.tier).label}</div>
                                     </div>
@@ -428,17 +497,21 @@ export default function AdminDashboard() {
                                             {b.user.name} às {b.startTime} — ainda sem confirmação
                                         </div>
                                     </div>
-                                    <button className="today-action-btn today-action-btn--success"
-                                        onClick={() => handleQuickAction(b.id, 'checkin')}>
-                                        Confirmar
-                                    </button>
+                                    {bp.canConfirmPresence && (
+                                        <button className="today-action-btn today-action-btn--success"
+                                            onClick={() => handleQuickAction(b.id, 'checkin')}>
+                                            Confirmar
+                                        </button>
+                                    )}
                                 </div>
                             ))}
                         </div>
                     )}
                 </div>
+                )}
 
                 {/* Weekly Occupancy */}
+                {canBookings && (
                 <div className="admin-card dash-panel">
                     <h3 className="dash-panel__title"><TrendingUp size={18} style={{ color: 'var(--accent-text)' }} aria-hidden="true" /> Ocupação da Semana</h3>
                     <div className="dash-panel__list dash-panel__list--lg">
@@ -462,12 +535,16 @@ export default function AdminDashboard() {
                         ))}
                     </div>
                 </div>
+                )}
             </div>
+            )}
 
             {/* ── SECTION 4: Próximos Agendamentos + Churn Risk ── */}
-            <div className="admin-grid-2">
+            {(canBookings || canChurn) && (
+            <div className={canBookings && canChurn ? 'admin-grid-2' : undefined}>
 
                 {/* Next Bookings */}
+                {canBookings && (
                 <div className="admin-card dash-panel">
                     <h3 className="dash-panel__title"><CalendarClock size={18} style={{ color: 'var(--accent-text)' }} aria-hidden="true" /> Próximos Agendamentos</h3>
                     {futureBookings.length === 0 ? (
@@ -487,12 +564,7 @@ export default function AdminDashboard() {
                                     </div>
                                     <div className="dash-row__time">{b.startTime}</div>
                                     <div className="dash-row__body">
-                                        <Tooltip content={`Abrir perfil de ${b.user.name}`}>
-                                            <button type="button" className="dash-name-btn dash-name-btn--sm dash-name-btn--ellipsis"
-                                                onClick={() => navigate(`/admin/clients/${b.user.id}`)}>
-                                                {b.user.name}
-                                            </button>
-                                        </Tooltip>
+                                        {clientLink(b.user.name, b.user.id, true)}
                                     </div>
                                     <StatusBadge meta={getMeta(TIER_META, b.tierApplied)} size="sm" />
                                 </div>
@@ -500,8 +572,10 @@ export default function AdminDashboard() {
                         </div>
                     )}
                 </div>
+                )}
 
                 {/* Churn Risk */}
+                {canChurn && (
                 <div className="admin-card dash-panel">
                     <h3 className="dash-panel__title">
                         <AlertTriangle size={18} style={{ color: 'var(--warning)' }} aria-hidden="true" /> Clientes em Risco
@@ -539,7 +613,9 @@ export default function AdminDashboard() {
                         </div>
                     )}
                 </div>
+                )}
             </div>
+            )}
 
             <StatusReasonModal
                 isOpen={!!reasonModal}

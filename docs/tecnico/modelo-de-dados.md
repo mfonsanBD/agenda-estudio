@@ -74,7 +74,7 @@ erDiagram
 
 | Enum | Valores |
 | --- | --- |
-| `Role` | `ADMIN`, `CLIENTE` |
+| `Role` | `ADMIN`, `CLIENTE`, `COLABORADOR` (nov/2026 — equipe com permissões por módulo; ver [permissoes-equipe.md](permissoes-equipe.md)) |
 | `ContractType` | `FIXO`, `FLEX`, `SERVICO`, `CUSTOM`, `AVULSO` |
 | `Tier` | `COMERCIAL`, `AUDIENCIA`, `SABADO` |
 | `BookingStatus` | `RESERVED`, `CONFIRMED`, `HELD`, `COMPLETED`, `FALTA`, `NAO_REALIZADO`, `CANCELLED` |
@@ -94,7 +94,7 @@ erDiagram
 ## Modelos
 
 ### User (`users`)
-Conta de cliente ou admin. Campos principais: `email`/`phone`/`googleId` (todos únicos e opcionais — login por e-mail, telefone ou Google), `passwordHash`, `role`, `cpfCnpj` (necessário para PIX), `address`/`city`/`state`, `tags[]`, `socialLinks` (JSON), `clientStatus` (`ACTIVE`/`INACTIVE`/`BLOCKED`), `stripeCustomerId`, `autoChargeEnabled` (cobrança automática no cartão), `essentialNotificationsOnly` (só notificações críticas), `notes` (observações internas do admin), `deletedAt` (soft delete com anonimização do cliente que tem vínculos; `null` = conta ativa — os dados pessoais viram `null`, o que libera e-mail/CPF para um novo cadastro).
+Conta de cliente ou da equipe (ADMIN/COLABORADOR; em equipe, `clientStatus = BLOCKED` = acesso desativado). O que é só da equipe fica em `StaffProfile` (abaixo). Campos principais: `email`/`phone`/`googleId` (todos únicos e opcionais — login por e-mail, telefone ou Google), `passwordHash`, `role`, `cpfCnpj` (necessário para PIX), `address`/`city`/`state`, `tags[]`, `socialLinks` (JSON), `clientStatus` (`ACTIVE`/`INACTIVE`/`BLOCKED`), `stripeCustomerId`, `autoChargeEnabled` (cobrança automática no cartão), `essentialNotificationsOnly` (só notificações críticas), `notes` (observações internas do admin), `deletedAt` (soft delete com anonimização do cliente que tem vínculos; `null` = conta ativa — os dados pessoais viram `null`, o que libera e-mail/CPF para um novo cadastro).
 
 ### Contract (`contracts`)
 Plano contratado. Campos comuns: `name`, `type`, `tier`, `durationMonths` (3 ou 6), `discountPct` (30 ou 40), `startDate`/`endDate`, `status`, `addOns[]`, `paymentMethod`, `paymentPlan` (`MONTHLY` ou `FULL`), `boletoAllowed`.
@@ -119,11 +119,12 @@ Remarcação do avulso (set/2026 — `lib/avulsoMakeup.ts`): `makeupStatus` (`Ma
 Índices: `(date, startTime, status)`, `userId`, `contractId`, `date`, `status`, `(makeupStatus, makeupDeadline)`.
 
 ### Payment (`payments`)
-Cobrança. `provider` (`STRIPE`/`CORA`/`SICOOB`), `providerRef` (id da transação no gateway), `amount`, `status`, `dueDate`, `pixString`/`boletoUrl`/`paymentUrl`, `pixExpiresAt` (validade do QR/cobrança PIX atual; `null` = registro antigo ou sem PIX), `installments`, `paymentType` (`DEBIT`/`CREDIT`), `stripeSubscriptionId`, `metadata` (JSON — guarda dados do contrato pendente, add-ons, etc.), `paidAt`. Relaciona-se a `user` e, opcionalmente, a `contract` e `booking`.
+Cobrança. `provider` (`STRIPE`/`CORA`/`SICOOB`), `providerRef` (id da transação no gateway), `amount`, `status`, `dueDate`, `pixString`/`boletoUrl`/`paymentUrl`, `pixExpiresAt` (validade do QR/cobrança PIX atual; `null` = registro antigo ou sem PIX), `installments`, `paymentType` (`DEBIT`/`CREDIT`), `stripeSubscriptionId`, `metadata` (JSON — guarda dados do contrato pendente, add-ons, etc.; `sessionCharge: true` marca a cobrança da própria sessão criada pelo `POST /bookings/admin`, e `fixoExtra: true`, junto dela, a sessão FIXO criada com o teto do plano já cheio — a única que não ocupa vaga do plano; ver [permissoes-equipe.md](permissoes-equipe.md#pagamento-da-sessão-e-teto-do-fixo)), `paidAt`. Na compra de serviço extra, `paymentUrl` guarda as chaves em JSON (`{ addonKeys: [...] }`); é por elas que o sistema distingue o extra da cobrança da gravação ([Pagamento da sessão](permissoes-equipe.md#pagamento-da-sessão-e-teto-do-fixo)). Relaciona-se a `user` e, opcionalmente, a `contract` e `booking`.
 
 Índices: `userId`, `contractId`, `bookingId`, `providerRef`, `status`, `stripeSubscriptionId`, `dueDate`.
 
 ### Configuração e apoio
+- **StaffProfile (`staff_profiles`, nov/2026):** 1:1 com `users` (`user_id` PK/FK, `ON DELETE CASCADE`), `title` (cargo, opcional) e `permissions` (`TEXT[]`, as chaves do COLABORADOR; o ADMIN grava `[]`). Migrations `20261104000000_add_role_colaborador` (só o `ALTER TYPE`) e `20261104000100_add_staff_profiles`.
 - **SavedPaymentMethod (`saved_payment_methods`):** cartões salvos na Stripe (`stripePaymentMethodId`, `brand`, `last4`, `expMonth/Year`, `isDefault`).
 - **BlockedSlot (`blocked_slots`):** horários bloqueados pelo admin (`date`, `startTime`, `endTime`, `reason`).
 - **PricingConfig (`pricing_config`):** preço por `tier` (chave única), `label`, `description`.

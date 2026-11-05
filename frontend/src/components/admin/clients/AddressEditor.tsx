@@ -14,7 +14,7 @@ const fromUser = (u: UserDetail): AddressValues => ({
  * Endereço no perfil do cliente: estado local espelha o usuário, cada campo persiste
  * no blur (só quando muda) e o autopreenchimento por CEP salva o grupo de uma vez.
  */
-export default function AddressEditor({ user, onSaved }: { user: UserDetail; onSaved: () => void }) {
+export default function AddressEditor({ user, onSaved, readOnly = false }: { user: UserDetail; onSaved: () => void; readOnly?: boolean }) {
     const { showToast } = useUI();
     const [form, setForm] = useState<AddressValues>(() => fromUser(user));
     // Só reinicializa quando troca de cliente (user.id). Reagir a cada novo objeto `user`
@@ -36,6 +36,7 @@ export default function AddressEditor({ user, onSaved }: { user: UserDetail; onS
         <AddressFields
             values={form}
             onChange={patch => setForm(f => ({ ...f, ...patch }))}
+            disabled={readOnly}
             onFieldBlur={saveField}
             onCepFilled={patch => persist({
                 zipCode: patch.zipCode || null, address: patch.address || null,

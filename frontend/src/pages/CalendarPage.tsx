@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import HeroAmbient from '../components/client/HeroAmbient';
-import { bookingsApi, blockedSlotsApi, pricingApi, contractsApi, Slot, BookingWithUser, MyBookingSlot, PricingConfig, AddOnConfig, ContractWithStats, type ClientBooking } from '../api/client';
+import { bookingsApi, blockedSlotsApi, pricingApi, contractsApi, usersApi, Slot, BookingWithUser, MyBookingSlot, PricingConfig, AddOnConfig, ContractWithStats, type ClientBooking, type UserSummary } from '../api/client';
 import { useAuth } from '../context/AuthContext';
 import { useUI } from '../context/UIContext';
 import { useNavigate } from 'react-router-dom';
@@ -23,6 +23,8 @@ import { peekPendingIntent, clearPendingIntent, type PendingIntent } from '../ut
 import type { ContractWizardPrefill } from '../components/ContractWizard';
 import { LIVE_BADGE_LABEL, hasOpenSessionToday, isRecordingLive, sessionEndMs, useRecordingWatch } from '../utils/recording';
 import { TIER_META, getMeta } from '../constants/adminMeta';
+import { usePermission } from '../hooks/usePermission';
+import CreateBookingModal from '../components/admin/bookings/CreateBookingModal';
 
 /**
  * Data/dia iniciais da agenda. No domingo a grade Seg–Sáb da semana corrente
@@ -31,7 +33,7 @@ import { TIER_META, getMeta } from '../constants/adminMeta';
  * D16: com um horário escolhido na landing (`focusDate`), a PRIMEIRA carga já é a
  * semana dele e o mobile abre no dia (sem buscar a semana corrente antes).
  */
-function initialCalendarStart(isAdmin: boolean, focusDate?: string | null): { base: Date; dayIndex: number } {
+function initialCalendarStart(isStaff: boolean, focusDate?: string | null): { base: Date; dayIndex: number } {
     if (focusDate) {
         const d = new Date(`${focusDate}T12:00:00`);
         if (!Number.isNaN(d.getTime())) {
@@ -39,7 +41,7 @@ function initialCalendarStart(isAdmin: boolean, focusDate?: string | null): { ba
         }
     }
     const now = new Date();
-    if (!isAdmin && now.getDay() === 0) {
+    if (!isStaff && now.getDay() === 0) {
         const d = new Date(now);
         d.setDate(d.getDate() + 1);
         return { base: d, dayIndex: 0 };
@@ -50,7 +52,15 @@ function initialCalendarStart(isAdmin: boolean, focusDate?: string | null): { ba
 export default function CalendarPage() {
     const { user } = useAuth();
     const navigate = useNavigate();
-    const isAdmin = user?.role === 'ADMIN';
+    // Agenda em modo EQUIPE (ADMIN ou COLABORADOR com agendamentos.ver/hoje.ver — guarda da rota): grade
+    // do estúdio com os nomes dos clientes. O autoatendimento (BookingModal → POST /bookings) é só do
+    // CLIENTE (S5): na equipe, clicar num horário livre abre o "Novo agendamento" do admin, com data e
+    // hora preenchidas, e só com agendamentos.criar. (As views ainda chamam a prop de `isAdmin` = modo equipe.)
+    const { isStaff, can } = usePermission();
+    const canCreateForClient = isStaff && can('agendamentos.criar');
+    const [staffCreate, setStaffCreate] = useState<{ date: string; startTime: string } | null>(null);
+    const [staffClients, setStaffClients] = useState<UserSummary[] | null>(null);
+    const [staffClientsLoading, setStaffClientsLoading] = useState(false);
     const isMobile = useIsMobile();
     const { get: getConfigNum, loaded: configLoaded } = useBusinessConfig();
     // Minimum advance notice for clients (admin books any time). Slots closer than this
@@ -61,7 +71,7 @@ export default function CalendarPage() {
     // D16: horário escolhido na landing antes do login — lido UMA vez (só cliente). Fica em estado
     // desta instância; o sessionStorage é limpo quando a retomada é tratada ou ao sair da página.
     const [resumeIntent] = useState<PendingIntent | null>(() => (user && user.role === 'CLIENTE' ? peekPendingIntent() : null));
-    const initialStart = useRef(initialCalendarStart(isAdmin, resumeIntent?.date)).current;
+    const initialStart = useRef(initialCalendarStart(isStaff, resumeIntent?.date)).current;
     const [currentWeek, setCurrentWeek] = useState(initialStart.base);
     const [weekDates, setWeekDates] = useState<Date[]>(getWeekDates(initialStart.base));
 
@@ -130,10 +140,10 @@ export default function CalendarPage() {
     // Load addons and contracts once on mount so the detail modal has full context
     useEffect(() => {
         pricingApi.getAddons().then(res => setAllAddons(res.addons)).catch(() => {});
-        if (!isAdmin) {
+        if (!isStaff) {
             contractsApi.getMy().then(res => setContracts(res.contracts)).catch(() => {});
         }
-    }, [isAdmin]);
+    }, [isStaff]);
 
     const loadWeekData = useCallback(async (dates: Date[]) => {
         setIsFetchingWeek(true);
@@ -157,7 +167,7 @@ export default function CalendarPage() {
             setMyBookingsMap(prev => ({ ...prev, ...newMyBookingsMap }));
             setWeekFetchedAt(prev => ({ ...prev, ...newFetchedAt }));
 
-            if (isAdmin) {
+            if (isStaff) {
                 const bookingResults = await Promise.all(
                     dates.map(d => bookingsApi.getAll(formatDate(d)))
                 );
@@ -172,16 +182,16 @@ export default function CalendarPage() {
             setLoading(false);
             setIsFetchingWeek(false);
         }
-    }, [isAdmin]);
+    }, [isStaff]);
 
     // Lista completa do cliente — silenciosa (a galeria não pisca); uma falha mantém o que já estava.
     const loadMyBookings = useCallback(() => {
-        if (isAdmin) return;
+        if (isStaff) return;
         const startedAt = Date.now();
         bookingsApi.getMy()
             .then(res => setAllMy(prev => (startedAt >= prev.at ? { list: res.bookings, at: startedAt } : prev)))
             .catch(err => console.error('Failed to fetch all bookings', err));
-    }, [isAdmin]);
+    }, [isStaff]);
 
     useEffect(() => {
         const dates = getWeekDates(currentWeek);
@@ -238,7 +248,7 @@ export default function CalendarPage() {
                 }
                 map[b.startTime] = { label: `${user?.name?.split(' ')[0] || 'Eu'}`, tier: b.tierApplied.toLowerCase(), isMine: true, myBooking: b };
             }
-            if (isAdmin && bookingsMap[date]) {
+            if (isStaff && bookingsMap[date]) {
                 for (const b of bookingsMap[date]) {
                     if (b.status === 'RESERVED' && b.holdExpiresAt && new Date(b.holdExpiresAt).getTime() <= Date.now()) {
                         continue;
@@ -249,7 +259,7 @@ export default function CalendarPage() {
             lookups[date] = map;
         }
         return lookups;
-    }, [myBookingsMap, bookingsMap, isAdmin, user?.name]);
+    }, [myBookingsMap, bookingsMap, isStaff, user?.name]);
 
     // Reagenda um refetch para o instante da expiração de hold mais próxima —
     // sem isso, um hold que caduca enquanto o cliente navega ficaria preso no
@@ -267,11 +277,11 @@ export default function CalendarPage() {
             }
         };
         Object.values(myBookingsMap).forEach(scan);
-        if (isAdmin) Object.values(bookingsMap).forEach(scan);
+        if (isStaff) Object.values(bookingsMap).forEach(scan);
         if (earliest === Infinity) return;
         const timer = setTimeout(() => loadWeekData(weekDates), earliest - now + 500);
         return () => clearTimeout(timer);
-    }, [myBookingsMap, bookingsMap, isAdmin, weekDates, loadWeekData]);
+    }, [myBookingsMap, bookingsMap, isStaff, weekDates, loadWeekData]);
 
     const buildBookingLookup = useCallback(
         (date: string): BookingLookup => bookingLookups[date] || {},
@@ -282,11 +292,33 @@ export default function CalendarPage() {
         setDetailBooking({ booking: b, date });
     }, []);
 
+    // Equipe: "Novo agendamento" (CreateBookingModal) com data e hora do horário clicado. A lista de
+    // clientes só é buscada aqui (a Agenda não precisa dela para mostrar a grade).
+    const openStaffCreate = useCallback((date: string, startTime: string) => {
+        setStaffCreate({ date, startTime });
+        if (staffClients || staffClientsLoading) return;
+        setStaffClientsLoading(true);
+        usersApi.getAll()
+            .then(res => setStaffClients(res.users))
+            .catch(err => { console.error(err); setStaffClients(null); })
+            .finally(() => setStaffClientsLoading(false));
+    }, [staffClients, staffClientsLoading]);
+
+    // Horário passado: o aviso "não dá para agendar" só faz sentido para quem agenda.
+    const handlePastSlot = useCallback(() => {
+        if (!isStaff || canCreateForClient) setShowPastSlotAlert(true);
+    }, [isStaff, canCreateForClient]);
+
     const handleSlotClick = useCallback((date: string, time: string, slot: Slot, info?: { isMine: boolean; myBooking?: MyBookingSlot }) => {
+        if (isStaff) {
+            // S5: a equipe nunca usa o autoatendimento do cliente (POST /bookings é só CLIENTE).
+            if (canCreateForClient && slot.available && slot.tier) openStaffCreate(date, time);
+            return;
+        }
         if (info?.isMine && info.myBooking) { openDetailModal(info.myBooking, date); return; }
         if (!slot.available || !slot.tier || !slot.price) return;
         setSelectedSlot({ date, time, tier: slot.tier, price: slot.price });
-    }, [openDetailModal]);
+    }, [openDetailModal, isStaff, canCreateForClient, openStaffCreate]);
 
     // ─── D16: retomar o horário escolhido na landing ───
     // A semana/dia iniciais já são os da intenção (initialCalendarStart). Espera a 1ª carga dessa
@@ -337,7 +369,7 @@ export default function CalendarPage() {
     const weekSummary = (() => {
         let booked = 0, available = 0, total = 0;
         // Clients must respect the minimum advance notice; admin can book any time.
-        const cutoffMs = Date.now() + (isAdmin ? 0 : minAdvanceHours * 60 * 60 * 1000);
+        const cutoffMs = Date.now() + (isStaff ? 0 : minAdvanceHours * 60 * 60 * 1000);
         weekDates.forEach(d => {
             const dateStr = formatDate(d);
             const slots = slotsMap[dateStr] || [];
@@ -402,7 +434,7 @@ export default function CalendarPage() {
     // E11: enquanto houver sessão de hoje em aberto (reservada, confirmada ou já em gravação), recarrega a lista de
     // tempos em tempos — o selo "AO VIVO" liga quando o estúdio inicia e a sessão sai de "Agendados"
     // quando ele finaliza. (A volta para a aba já é tratada pelo handler de visibilidade acima.)
-    useRecordingWatch(!isAdmin && hasOpenSessionToday(allMy.list), loadMyBookings, { onVisible: false });
+    useRecordingWatch(!isStaff && hasOpenSessionToday(allMy.list), loadMyBookings, { onVisible: false });
 
     // ─── Derive upcoming bookings from allMy (GET /my) + myBookingsMap (semana) ───
     const DAY_NAMES_FULL = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
@@ -441,7 +473,7 @@ export default function CalendarPage() {
     return (
         <div>
             {/* ─── CLIENT HERO ─── */}
-            {!isAdmin && (
+            {!isStaff && (
                 <div className="client-hero client-hero--default animate-card-enter">
                     <HeroAmbient variant="agenda" />
                     <div className="client-hero__header" style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '20px' }}>
@@ -484,7 +516,7 @@ export default function CalendarPage() {
                 </div>
             )}
             
-            {isAdmin && (
+            {isStaff && (
                 <AdminPageHeader
                     icon={CalendarDays}
                     title="Agenda"
@@ -524,7 +556,7 @@ export default function CalendarPage() {
                         </button>
                     </div>
                 )}
-                {(!isAdmin && activeTab === 'agendados') ? (
+                {(!isStaff && activeTab === 'agendados') ? (
                     // ─── UPCOMING BOOKINGS TAB (client only) ───
                     <div key="agendados" className="fade-in-view">
                         {!loading && upcomingBookings.length === 0 ? (
@@ -590,7 +622,8 @@ export default function CalendarPage() {
                     <div key="agendar" className="fade-in-view">
             {isMobile ? (
                 <CalendarMobileView
-                    isAdmin={isAdmin}
+                    isAdmin={isStaff}
+                    canCreate={!isStaff || canCreateForClient}
                     minAdvanceHours={minAdvanceHours}
                     loading={loading}
                     weekDates={weekDates}
@@ -609,11 +642,12 @@ export default function CalendarPage() {
                     buildBookingLookup={buildBookingLookup}
                     onSlotClick={handleSlotClick}
                     onOpenDetail={openDetailModal}
-                    onPastSlot={() => setShowPastSlotAlert(true)}
+                    onPastSlot={handlePastSlot}
                 />
             ) : (
                 <CalendarDesktopView
-                    isAdmin={isAdmin}
+                    isAdmin={isStaff}
+                    canCreate={!isStaff || canCreateForClient}
                     userFirstName={user?.name?.split(' ')[0] || 'Eu'}
                     minAdvanceHours={minAdvanceHours}
                     loading={loading}
@@ -623,7 +657,7 @@ export default function CalendarPage() {
                     slotsMap={slotsMap}
                     buildBookingLookup={buildBookingLookup}
                     onSlotClick={handleSlotClick}
-                    onPastSlot={() => setShowPastSlotAlert(true)}
+                    onPastSlot={handlePastSlot}
                     onHoldExpire={() => loadWeekData(weekDates)}
                     goToday={goToday}
                     navigateWeek={navigateWeek}
@@ -642,7 +676,7 @@ export default function CalendarPage() {
                         <span style={{ color: meta.color }}>{meta.label}</span>
                     </div>
                 ))}
-                {!isAdmin && (
+                {!isStaff && (
                     <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.6875rem', fontWeight: 600 }}>
                         <span style={{ width: 10, height: 10, borderRadius: 3, border: '2px solid var(--success)', background: 'rgba(52,211,153,0.2)', display: 'inline-block' }} />
                         <span style={{ color: 'var(--success)' }}>Meu Agendamento</span>
@@ -658,7 +692,21 @@ export default function CalendarPage() {
         </div>
 
             {/* ─── MODALS ─── */}
-            {(selectedSlot || lastSelectedSlot.current) && (
+            {/* Equipe: "Novo agendamento" para um cliente, com o horário clicado (montado só enquanto aberto). */}
+            {isStaff && staffCreate && (
+                <CreateBookingModal
+                    key={`${staffCreate.date}-${staffCreate.startTime}`}
+                    isOpen
+                    prefill={staffCreate}
+                    users={staffClients ?? []}
+                    usersLoading={staffClientsLoading}
+                    onClose={() => setStaffCreate(null)}
+                    onCreated={() => loadWeekData(weekDates)}
+                />
+            )}
+
+            {/* Autoatendimento do CLIENTE (POST /bookings): nunca para a equipe (S5). */}
+            {!isStaff && (selectedSlot || lastSelectedSlot.current) && (
                 <BookingModal 
                     isOpen={!!selectedSlot}
                     date={(selectedSlot || lastSelectedSlot.current)?.date || ''}
@@ -723,7 +771,9 @@ export default function CalendarPage() {
                         <Clock size={48} strokeWidth={1.5} />
                     </div>
                     <p style={{ color: 'var(--text-secondary)', lineHeight: 1.5, marginBottom: '10px', fontSize: '0.9375rem', maxWidth: '300px' }}>
-                        Não é possível agendar um horário no passado, ou com menos de {minAdvanceHours} hora{minAdvanceHours !== 1 ? 's' : ''} de antecedência.
+                        {isStaff
+                            ? 'Não é possível agendar um horário que já passou.'
+                            : <>Não é possível agendar um horário no passado, ou com menos de {minAdvanceHours} hora{minAdvanceHours !== 1 ? 's' : ''} de antecedência.</>}
                     </p>
                 </div>
             </BottomSheetModal>

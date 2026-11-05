@@ -1,7 +1,9 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize } from '../../middleware/auth.js';
+import { authenticate } from '../../middleware/auth.js';
+import { requirePermission, requireRole, actorOrReply, can, type Actor } from '../../middleware/permissions.js';
+import { requirePermissionIfStaff, routeActor } from '../bookings/permissionGuards.js';
 import { ContractStatus, BookingStatus } from '../../generated/prisma/client.js';
 import {
     getBasePriceDynamic, applyDiscount, calculateEndTime, studioDateTime, getPackageSlots, getSlotDuration,
@@ -212,13 +214,38 @@ const CLIENT_BOLETO_ERROR = {
     code: 'BOLETO_NOT_ALLOWED_HERE',
 };
 
+/**
+ * 403 quando a equipe criaria um contrato com parcela de valor ZERO (cupom 100% / valor ≥ total): essa
+ * parcela é liquidada como PAGA na hora, e nada criado por quem não tem a baixa manual nasce pago
+ * (DECISÕES D3/D7). Mesmo formato do 403 padrão (code/permission), com o motivo no texto.
+ */
+export const STAFF_ZERO_INSTALLMENT_DENIED = Object.freeze({
+    error: 'Este contrato teria parcela com valor zero, que seria registrada como paga — isso exige a permissão “Marcar como pago, anular ou estornar”.',
+    code: 'PERMISSION_DENIED',
+    permission: 'cobrancas.baixa',
+});
+
+/** O alvo de uma criação pela equipe precisa ser um CLIENTE (S5) — conta da equipe ficaria órfã (fora de Clientes). */
+async function loadClientTarget(userId: string) {
+    const target = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { role: true, deletedAt: true },
+    });
+    return target && target.role === 'CLIENTE' ? target : null;
+}
+
 export function registerCreationRoutes(router: Router) {
 
-// ─── POST /api/contracts (ADMIN) ────────────────────────
+// ─── POST /api/contracts (equipe — contratos.criar) ────────────────────────
+// Nasce ATIVO com as parcelas EM ABERTO (nunca AWAITING_PAYMENT, que expira em 10 min). Parcela de valor
+// zero (liquidada como PAGA) só com cobrancas.baixa (D3).
 
-router.post('/', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.post('/', authenticate, requirePermission('contratos.criar'), async (req: Request, res: Response) => {
     try {
         const data = createContractSchema.parse(req.body);
+        const actor = await actorOrReply(req, res);
+        if (!actor) return;
+        const canMarkPaid = can(actor, 'cobrancas.baixa');
 
         // Validate Fixo requires day and time
         if (data.type === 'FIXO' && (!data.fixedDayOfWeek || !data.fixedTime)) {
@@ -240,8 +267,9 @@ router.post('/', authenticate, authorize('ADMIN'), async (req: Request, res: Res
             }
         }
 
-        // D3: nada novo para um cliente excluído (soft delete / anonimizado).
-        const target = await prisma.user.findUnique({ where: { id: data.userId }, select: { deletedAt: true } });
+        // D3: nada novo para um cliente excluído (soft delete / anonimizado). Alvo que não é CLIENTE
+        // (conta da equipe) → 404, como o inexistente (S5).
+        const target = await loadClientTarget(data.userId);
         if (!target) {
             res.status(404).json({ error: 'Cliente não encontrado.' });
             return;
@@ -416,6 +444,14 @@ router.post('/', authenticate, authorize('ADMIN'), async (req: Request, res: Res
             }
         }
         const schedule = discountSchedule(adminCoupon, adminPlan.scheduleDueDates.map(() => perInstallmentBase));
+        // D3/D7: parcela de valor zero é liquidada como PAGA logo abaixo — só com cobrancas.baixa. Sem ela,
+        // desfaz o que este pedido gravou (mesma reversão do cupom recusado) e responde 403.
+        if (!canMarkPaid && schedule.some(s => s.amount <= 0)) {
+            await prisma.booking.deleteMany({ where: { contractId: contract.id } }).catch(() => {});
+            await prisma.contract.delete({ where: { id: contract.id } }).catch(() => {});
+            res.status(403).json(STAFF_ZERO_INSTALLMENT_DENIED);
+            return;
+        }
         // E2: TODA cobrança à vista (PIX, Cartão ou Boleto) leva a marca `pixDiscount` com os DOIS preços
         // (cartão e PIX, mesmo cupom em R$): criada no PIX o amount já é o preço PIX; criada no
         // Cartão/Boleto o amount é o de cartão e o PIX ganha o desconto na emissão do QR (issuePixCharge).
@@ -541,8 +577,9 @@ router.post('/', authenticate, authorize('ADMIN'), async (req: Request, res: Res
 // ─── POST /api/contracts/self (CLIENT) ──────────────────
 // Phase 1: Creates ONLY the first payment with contract data in metadata.
 // Contract + bookings are created AFTER payment is confirmed (via webhook/verify).
+// Autoatendimento: só CLIENTE (crítica S5) — a equipe cria contratos para clientes pelo POST /.
 
-router.post('/self', authenticate, async (req: Request, res: Response) => {
+router.post('/self', authenticate, requireRole('CLIENTE'), async (req: Request, res: Response) => {
     try {
         const data = selfContractSchema.parse(req.body);
         const userId = req.user!.userId;
@@ -576,9 +613,9 @@ router.post('/self', authenticate, async (req: Request, res: Response) => {
             return;
         }
 
-        // Minimum advance notice (studio timezone). Same rule as avulso; admin contract
-        // creation uses a separate endpoint and bypasses entirely.
-        if (req.user!.role !== 'ADMIN') {
+        // Minimum advance notice (studio timezone). Same rule as avulso; a criação pela equipe usa
+        // outra rota (POST /) — aqui é sempre o cliente.
+        {
             const minAdvanceHours = await getConfig('booking_min_advance_hours');
             const firstSlotDateTime = studioDateTime(data.firstBookingDate, data.firstBookingTime);
             const diffHours = (firstSlotDateTime.getTime() - Date.now()) / (1000 * 60 * 60);
@@ -611,7 +648,7 @@ router.post('/self', authenticate, async (req: Request, res: Response) => {
         // Trocas aceitas no modal de conflitos (check-fixo): o check só sugere outro horário no mesmo dia
         // ou o dia livre mais próximo (até ±7 dias, nunca antes do início). Uma troca para o passado, para
         // hoje ou para longe da ocorrência original só chega por chamada direta à API → 400.
-        if (req.user!.role !== 'ADMIN' && data.resolvedConflicts?.length) {
+        if (data.resolvedConflicts?.length) {
             const tomorrowSp = tomorrowInSaoPaulo();
             const WEEK_MS = 7 * 86_400_000;
             const bad = data.resolvedConflicts.find(rc => {
@@ -816,14 +853,16 @@ router.post('/self', authenticate, async (req: Request, res: Response) => {
     }
 });
 
-// ─── POST /api/contracts/custom (CLIENT + ADMIN) ────────
+// ─── POST /api/contracts/custom (CLIENTE + equipe) ────────
 // "Monte Seu Plano" — multi-day custom contract
-// Admin can pass userId to create on behalf of a client
+// Rota MISTA: a equipe precisa de `contratos.criar` (sem ela, 403 — nunca o ramo do cliente) e SEMPRE
+// informa o cliente em `userId` (S5: nunca para a própria conta; alvo que não é CLIENTE → 404).
 //
 // D9 — pagamento:
-//  - ADMIN: o contrato nasce ACTIVE (como FIXO/FLEX do admin), sessões CONFIRMED (PROGRESSIVE:
+//  - EQUIPE: o contrato nasce ACTIVE (como FIXO/FLEX da equipe), sessões CONFIRMED (PROGRESSIVE:
 //    ciclos 2+ RESERVED) e TODAS as parcelas PENDING, SEM chamar o gateway — a cobrança sai pelo
-//    ChargeNowSheet (/stripe/create-payment, com o gate de CPF do cliente) ou fica pendente.
+//    ChargeNowSheet (/stripe/create-payment, com o gate de CPF do cliente) ou fica pendente. Parcela
+//    de valor zero (liquidada como PAGA) só com cobrancas.baixa (D3/D7).
 //  - CLIENTE: contrato AWAITING_PAYMENT com paymentDeadline = agora + lockTtlSeconds (10 min),
 //    sessões RESERVED (ocupam a agenda), parcelas PENDING e SÓ a 1ª cobrada no gateway agora
 //    (PIX/boleto; cartão segue pelo checkout inline). Pagou → paymentEffects ativa o contrato e
@@ -839,9 +878,11 @@ const CLIENT_CUSTOM_DURATIONS = [1, 3, 6, 9, 12];
 // Uma criação de personalizado por cliente-alvo por vez (trava Redis por usuário, sem espera): o descarte
 // da tentativa anterior e a gravação nunca rodam em paralelo para o mesmo cliente (clique duplo, duas abas,
 // admin e cliente ao mesmo tempo). As travas por SLOT (createSlotClaimer) cuidam de clientes diferentes.
-router.post('/custom', authenticate, async (req: Request, res: Response) => {
+router.post('/custom', authenticate, requirePermissionIfStaff('contratos.criar'), async (req: Request, res: Response) => {
+    const actor = await routeActor(req, res);
+    if (!actor) return;
     const bodyUserId = req.body && typeof req.body.userId === 'string' ? req.body.userId : undefined;
-    const lockUserId = req.user!.role === 'ADMIN' && bodyUserId ? bodyUserId : req.user!.userId;
+    const lockUserId = actor.isStaff && bodyUserId ? bodyUserId : req.user!.userId;
     const lockKey = customUserLockKey(lockUserId);
     try {
         if (!(await acquireMutex(lockKey, CUSTOM_USER_LOCK_TTL_SECONDS))) {
@@ -854,23 +895,28 @@ router.post('/custom', authenticate, async (req: Request, res: Response) => {
         return;
     }
     try {
-        await createCustomContract(req, res);
+        await createCustomContract(req, res, actor);
     } finally {
         await releaseMutex(lockKey).catch(() => {});
     }
 });
 
-async function createCustomContract(req: Request, res: Response): Promise<void> {
+async function createCustomContract(req: Request, res: Response, actor: Actor): Promise<void> {
     try {
         const data = customContractSchema.parse(req.body);
-        const isAdmin = req.user!.role === 'ADMIN';
-        // Admin can create on behalf of a client
-        const userId = (isAdmin && data.userId) ? data.userId : req.user!.userId;
+        // Equipe (ADMIN ou COLABORADOR com contratos.criar — conferido pela guarda da rota). Papel do BANCO.
+        const isStaff = actor.isStaff;
+        // S5: a equipe cria SEMPRE para um cliente — nunca para a própria conta (ficaria órfão).
+        if (isStaff && !data.userId) {
+            res.status(400).json({ error: 'Informe o cliente do contrato.', code: 'CLIENT_REQUIRED' });
+            return;
+        }
+        const userId = isStaff ? data.userId! : req.user!.userId;
 
         // E3: o personalizado do CLIENTE tem prazo de 10 minutos para pagar → boleto nunca entra. O do
         // admin (contrato já ativo, cobrança pelo painel) aceita boleto quando ele está EFETIVO — a
         // validatePaymentMethod abaixo usa a fonte única (chave-mestra + Cora).
-        if (!isAdmin && data.paymentMethod === 'BOLETO') {
+        if (!isStaff && data.paymentMethod === 'BOLETO') {
             res.status(400).json(CLIENT_BOLETO_ERROR);
             return;
         }
@@ -890,7 +936,7 @@ async function createCustomContract(req: Request, res: Response): Promise<void> 
 
         // ─── Restrições do CLIENTE (D7) — o admin mantém todas as opções ──
         const tomorrowSp = tomorrowInSaoPaulo();
-        if (!isAdmin) {
+        if (!isStaff) {
             if (frequency !== 'WEEKLY') {
                 res.status(400).json({ error: 'No plano personalizado a frequência disponível é semanal.' });
                 return;
@@ -905,7 +951,7 @@ async function createCustomContract(req: Request, res: Response): Promise<void> 
                 return;
             }
         }
-        const startDateStr = isAdmin ? (data.startDate ?? tomorrowSp) : tomorrowSp;
+        const startDateStr = isStaff ? (data.startDate ?? tomorrowSp) : tomorrowSp;
 
         // ─── Estrutura + grade de horários (D8) ─────────────
         if (frequency === 'CUSTOM' ? !(data.customDates && data.customDates.length > 0) : data.schedule.length === 0) {
@@ -922,7 +968,7 @@ async function createCustomContract(req: Request, res: Response): Promise<void> 
 
         // D7: no CLIENTE a troca aceita no modal de conflitos só muda o HORÁRIO, no MESMO dia (é o que o
         // /custom/check sugere), dentro do período e a partir de amanhã — nunca passado, hoje ou fora da vigência.
-        if (!isAdmin && data.resolvedConflicts?.length) {
+        if (!isStaff && data.resolvedConflicts?.length) {
             const endStr = addMonthsYmd(startDateStr, data.durationMonths);
             const bad = data.resolvedConflicts.find(rc =>
                 rc.newDate !== rc.originalDate || rc.newDate < tomorrowSp || rc.newDate >= endStr);
@@ -936,8 +982,9 @@ async function createCustomContract(req: Request, res: Response): Promise<void> 
         }
 
         // D3: cliente-alvo existe e não foi excluído (soft delete) — antes de descartar/criar qualquer coisa.
-        const userInfo = await prisma.user.findUnique({ where: { id: userId }, select: { name: true, email: true, cpfCnpj: true, deletedAt: true } });
-        if (!userInfo) {
+        // S5: pela equipe, o alvo precisa ser um CLIENTE (conta da equipe → 404, como a inexistente).
+        const userInfo = await prisma.user.findUnique({ where: { id: userId }, select: { name: true, email: true, cpfCnpj: true, deletedAt: true, role: true } });
+        if (!userInfo || (isStaff && userInfo.role !== 'CLIENTE')) {
             res.status(404).json({ error: 'Cliente não encontrado.' });
             return;
         }
@@ -951,7 +998,7 @@ async function createCustomContract(req: Request, res: Response): Promise<void> 
         //  - CLIENTE: a nova tentativa substitui a anterior, viva ou vencida (D2/D9). Se a anterior foi paga
         //    ou tem pagamento em andamento → 409 (nada é criado).
         //  - ADMIN: só as VENCIDAS do cliente-alvo — nunca apaga uma tentativa viva do cliente.
-        if (!isAdmin) {
+        if (!isStaff) {
             const prev = await discardClientCustomAttempts(userId);
             if (prev !== 'ok') {
                 res.status(409).json(previousCustomAttemptError(prev));
@@ -1065,9 +1112,16 @@ async function createCustomContract(req: Request, res: Response): Promise<void> 
         }
         const customSchedule2 = discountSchedule(customCoupon, perInstallmentBases);
 
+        // D3/D7: pela equipe, parcela de valor zero é liquidada como PAGA (abaixo) — só com cobrancas.baixa.
+        // Recusa ANTES de gravar qualquer coisa. (O cliente com cupom 100% segue como sempre.)
+        if (isStaff && !can(actor, 'cobrancas.baixa') && customSchedule2.some(s => s.amount <= 0)) {
+            res.status(403).json(STAFF_ZERO_INSTALLMENT_DENIED);
+            return;
+        }
+
         // D9: o CLIENTE paga a 1ª parcela agora; por PIX/boleto o gateway exige CPF/CNPJ válido →
         // 400 claro ANTES de criar contrato/sessões (antes virava 502 com rollback).
-        const awaitingPayment = !isAdmin;
+        const awaitingPayment = !isStaff;
         const firstChargeAmount = customSchedule2[0]?.amount ?? 0;
         const chargesGatewayNow = awaitingPayment && data.paymentMethod !== 'CARTAO' && firstChargeAmount > 0;
         if (chargesGatewayNow && !isValidCpfCnpj(userInfo.cpfCnpj)) {

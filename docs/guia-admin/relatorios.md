@@ -1,6 +1,6 @@
 # Relatórios
 
-> Rota: **`/admin/reports`** · Menu: **Relatórios** · Acesso: Admin
+> Rota: **`/admin/reports`** · Menu: **Relatórios** · Acesso: administrador e colaborador com **Ver relatórios**
 
 Análises de uso e desempenho do estúdio.
 
@@ -47,7 +47,12 @@ Os dados vêm dos endpoints `GET /api/reports/{summary,occupancy,tiers,audience,
 ## Dicas
 
 - **"Receita" aqui é o valor das sessões agendadas** (não canceladas) no período — não é o que entrou no caixa. O recebido de fato está em [Financeiro](financeiro.md).
-- As métricas de **audiência** dependem das gravações finalizadas com dados de transmissão (ver [Hoje → Finalizar gravação](hoje.md#finalizar-gravacao-metricas-de-transmissao)).
+- As métricas de **audiência** dependem das gravações finalizadas com dados de transmissão (ver [Hoje → Finalizar gravação](hoje.md#finalizar-gravação-métricas-de-transmissão)).
+
+## Colaboradores
+
+- A tela abre com **Ver relatórios**. A **receita** só aparece para quem também tem **Ver o financeiro e a receita**. Sem ela: some o cartão "Receita", o "· R$" das faixas e a coluna "Receita" do ranking, que passa a se chamar **Top 10 por Sessões** (ordenado por sessões); o CSV sai sem as colunas e a linha de receita.
+- O nome do cliente no ranking só vira link para o perfil com **Ver clientes**.
 
 ## Ver também
 

@@ -5,7 +5,8 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize } from '../../middleware/auth.js';
+import { authenticate } from '../../middleware/auth.js';
+import { actorOrReply, can, denyPermission, requirePermission, requireRole } from '../../middleware/permissions.js';
 import {
     stripeGetPublishableKey,
     stripeGetOrCreateCustomer,
@@ -31,6 +32,14 @@ import { planPaymentBlockedByPendingCancellation, cancellationPendingBody } from
 
 const router = Router();
 
+// Permissões (equipe — config/staffPermissions.ts):
+//   • autoatendimento do cliente (POST /setup-intent, PUT /auto-charge): só CLIENTE (requireRole);
+//   • GET /payment-methods/for-payment/:id: cobrancas.cobrar; os cartões salvos só com
+//     cobrancas.cartao_salvo (sem ela, `paymentMethods: []`);
+//   • rotas MISTAS (create-payment, installment-plans com paymentId, verify-payment): o cliente segue só
+//     as próprias cobranças; a equipe cobra qualquer uma com cobrancas.cobrar (sem ela → 403 explícito,
+//     nunca o ramo do cliente) e debita o cartão salvo (savedPaymentMethodId) só com cobrancas.cartao_salvo.
+
 /** PaymentIntent cujo dinheiro já entrou / está a caminho (o mesmo conjunto 'in_flight' de settleExistingCardIntent). */
 const CARD_INTENT_MONEY_IN_FLIGHT = new Set(['succeeded', 'processing', 'requires_capture']);
 
@@ -54,7 +63,8 @@ router.get('/publishable-key', authenticate, async (_req: Request, res: Response
 
 // ─── POST /api/stripe/setup-intent ──────────────────────
 // Creates a SetupIntent for saving a card without charging
-router.post('/setup-intent', authenticate, async (req: Request, res: Response) => {
+// Autoatendimento: só CLIENTE (a equipe não tem cartão próprio no app — crítica S5).
+router.post('/setup-intent', authenticate, requireRole('CLIENTE'), async (req: Request, res: Response) => {
     try {
         const userId = req.user!.userId;
         const customerId = await stripeGetOrCreateCustomer(userId);
@@ -197,11 +207,16 @@ router.post('/setup-intent/confirm', authenticate, async (req: Request, res: Res
     }
 });
 
-// ─── GET /api/stripe/payment-methods/for-payment/:paymentId (ADMIN) ──
+// ─── GET /api/stripe/payment-methods/for-payment/:paymentId (equipe: cobrancas.cobrar) ──
 // E1: cartões salvos do CLIENTE dono do pagamento — o admin cobra o cartão do cliente, nunca o próprio.
 // Traz também o pagador (nome e CPF/CNPJ): o CPF exigido no PIX é o do dono do pagamento.
-router.get('/payment-methods/for-payment/:paymentId', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+// Os cartões só vêm para quem tem cobrancas.cartao_salvo (sem ela: `paymentMethods: []`, sem consultar o
+// Stripe, e `canUseSavedCards: false`) — o CPF/CNPJ do pagador continua (cobrar no PIX exige o dele).
+router.get('/payment-methods/for-payment/:paymentId', authenticate, requirePermission('cobrancas.cobrar'), async (req: Request, res: Response) => {
     try {
+        const actor = await actorOrReply(req, res);
+        if (!actor) return;
+        const canUseSavedCards = can(actor, 'cobrancas.cartao_salvo');
         const paymentId = req.params.paymentId as string;
         if (!z.string().uuid().safeParse(paymentId).success) {
             res.status(400).json({ error: 'Pagamento inválido.' });
@@ -219,15 +234,17 @@ router.get('/payment-methods/for-payment/:paymentId', authenticate, authorize('A
             return;
         }
         const owner = payment.user;
-        const saved = await prisma.savedPaymentMethod.findMany({
-            where: { userId: owner.id },
-            orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }],
-        });
+        const saved = canUseSavedCards
+            ? await prisma.savedPaymentMethod.findMany({
+                where: { userId: owner.id },
+                orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }],
+            })
+            : [];
 
         // Fonte = o Stripe (traz `funding` e os cartões ainda não sincronizados); sem Stripe ou numa
         // falha de consulta, cai para os cartões do banco (funding desconhecido). NUNCA cria Customer aqui.
         let stripeCards: Awaited<ReturnType<typeof stripeListPaymentMethods>> | null = null;
-        if (owner.stripeCustomerId && (await isStripeEnabled().catch(() => false))) {
+        if (canUseSavedCards && owner.stripeCustomerId && (await isStripeEnabled().catch(() => false))) {
             try {
                 stripeCards = await stripeListPaymentMethods(owner.stripeCustomerId);
             } catch (err) {
@@ -262,6 +279,7 @@ router.get('/payment-methods/for-payment/:paymentId', authenticate, authorize('A
 
         res.json({
             paymentMethods,
+            canUseSavedCards,
             autoChargeEnabled: owner.autoChargeEnabled,
             payer: {
                 id: owner.id,
@@ -449,9 +467,21 @@ const createPaymentSchema = z.object({
 
 router.post('/create-payment', authenticate, async (req: Request, res: Response) => {
     try {
+        // Rota MISTA: a equipe cobra pelo cliente só com cobrancas.cobrar (403 explícito sem ela — nunca o
+        // ramo do cliente); debitar o cartão SALVO exige também cobrancas.cartao_salvo. ANTES de qualquer efeito.
+        const actor = await actorOrReply(req, res);
+        if (!actor) return;
+        const staffOk = actor.isStaff;
+        if (staffOk && !can(actor, 'cobrancas.cobrar')) {
+            denyPermission(res, 'cobrancas.cobrar');
+            return;
+        }
         const data = createPaymentSchema.parse(req.body);
+        if (staffOk && data.savedPaymentMethodId && !can(actor, 'cobrancas.cartao_salvo')) {
+            denyPermission(res, 'cobrancas.cartao_salvo');
+            return;
+        }
         const userId = req.user!.userId;
-        const isAdmin = req.user!.role === 'ADMIN';
 
         // Global guard: reject if the payment method is disabled by admin.
         // E3: o boleto segue a MESMA fonte única (chave-mestra "Aceitar pagamento por boleto" + Cora
@@ -481,10 +511,10 @@ router.post('/create-payment', authenticate, async (req: Request, res: Response)
             }
         }
 
-        // Get our internal payment. Admins may act on ANY payment (charge on behalf of the
-        // client, e.g. card-present); clients only on their own.
+        // Get our internal payment. Staff with cobrancas.cobrar may act on ANY payment (charge on
+        // behalf of the client, e.g. card-present); clients only on their own.
         const payment = await prisma.payment.findFirst({
-            where: { id: data.paymentId, ...(isAdmin ? {} : { userId }) },
+            where: { id: data.paymentId, ...(staffOk ? {} : { userId }) },
             include: { contract: true, booking: { select: { status: true, holdExpiresAt: true } } },
         });
 
@@ -516,9 +546,9 @@ router.post('/create-payment', authenticate, async (req: Request, res: Response)
         }
 
         // E13: cancelamento em análise (PENDING_CANCELLATION) → o CLIENTE não paga parcelas do plano até o
-        // estúdio decidir (a base da multa está congelada). O admin continua podendo cobrar; extras de uma
-        // gravação e a multa seguem pagáveis. Recusa ANTES de qualquer efeito (reabrir FAILED, emitir QR/PI).
-        if (planPaymentBlockedByPendingCancellation(payment, isAdmin)) {
+        // estúdio decidir (a base da multa está congelada). A equipe (com cobrancas.cobrar) continua podendo
+        // cobrar; extras de uma gravação e a multa seguem pagáveis. Recusa ANTES de qualquer efeito.
+        if (planPaymentBlockedByPendingCancellation(payment, staffOk)) {
             res.status(409).json(cancellationPendingBody());
             return;
         }
@@ -543,7 +573,7 @@ router.post('/create-payment', authenticate, async (req: Request, res: Response)
             const card = await resolveUserCard(payerUserId, data.savedPaymentMethodId);
             if (!card) {
                 res.status(400).json({
-                    error: isAdmin && payerUserId !== userId
+                    error: staffOk && payerUserId !== userId
                         ? 'Este cartão não pertence ao cliente desta cobrança. Escolha um cartão salvo do cliente ou cadastre um novo.'
                         : 'Cartão salvo não encontrado. Escolha outro cartão ou cadastre um novo.',
                     code: 'CARD_NOT_FOUND',
@@ -676,7 +706,7 @@ router.post('/create-payment', authenticate, async (req: Request, res: Response)
                 // E1: o CPF/CNPJ exigido no PIX é o do DONO do pagamento (o cliente), nunca o do admin.
                 if (/^CPF\/CNPJ/.test(msg)) {
                     res.status(400).json({
-                        error: isAdmin && payerUserId !== userId
+                        error: staffOk && payerUserId !== userId
                             ? 'O cliente não tem CPF/CNPJ válido no cadastro. Informe o CPF/CNPJ do cliente para gerar o PIX.'
                             : msg,
                         code: 'CPF_CNPJ_REQUIRED',
@@ -758,7 +788,7 @@ router.post('/create-payment', authenticate, async (req: Request, res: Response)
                 const msg = e instanceof Error ? e.message : 'Erro ao gerar boleto.';
                 if (/^CPF\/CNPJ/.test(msg)) {
                     res.status(400).json({
-                        error: isAdmin && payerUserId !== userId
+                        error: staffOk && payerUserId !== userId
                             ? 'O cliente não tem CPF/CNPJ válido no cadastro. Informe o CPF/CNPJ do cliente para gerar o boleto.'
                             : msg,
                         code: 'CPF_CNPJ_REQUIRED',
@@ -881,7 +911,8 @@ router.post('/create-payment', authenticate, async (req: Request, res: Response)
         // SEC-4: trilha de QUEM cobrou — o admin cobrando o cartão do cliente (salvo: debitado na hora, sem
         // o cliente presente; novo: PaymentIntent aberto no Customer do cliente). Marca o INÍCIO da cobrança
         // (a aprovação segue vindo do webhook/verify). logAudit engole erros: nunca quebra a cobrança.
-        if (isAdmin && payerUserId !== userId) {
+        // Vale para toda a equipe (ADMIN ou COLABORADOR com a permissão): performedBy = quem cobrou.
+        if (staffOk && payerUserId !== userId) {
             await logAudit('PAYMENT', payment.id, savedCardPmId ? 'ADMIN_CHARGED_SAVED_CARD' : 'ADMIN_CHARGE_STARTED', userId, {
                 payerUserId, paymentIntentId: result.paymentIntentId, amount, installments, method: 'cartao',
             });
@@ -930,8 +961,16 @@ router.post('/installment-plans', authenticate, async (req: Request, res: Respon
         // when a paymentId is given; otherwise treat it as an à-vista (FULL) preview over the
         // given duration (used by the wizards before a payment exists).
         if (data.paymentId) {
+            // Rota MISTA (com paymentId): equipe lê qualquer cobrança só com cobrancas.cobrar; cliente, só a dele.
+            const actor = await actorOrReply(req, res);
+            if (!actor) return;
+            const staffOk = actor.isStaff;
+            if (staffOk && !can(actor, 'cobrancas.cobrar')) {
+                denyPermission(res, 'cobrancas.cobrar');
+                return;
+            }
             const payment = await prisma.payment.findFirst({
-                where: { id: data.paymentId, ...(req.user!.role === 'ADMIN' ? {} : { userId: req.user!.userId }) },
+                where: { id: data.paymentId, ...(staffOk ? {} : { userId: req.user!.userId }) },
                 include: { contract: true },
             });
             if (!payment) {
@@ -1015,7 +1054,9 @@ const autoChargeSchema = z.object({
     enabled: z.boolean(),
 });
 
-router.put('/auto-charge', authenticate, async (req: Request, res: Response) => {
+// Autoatendimento: só CLIENTE (crítica S5). A equipe liga/desliga a do cliente por
+// PATCH /api/users/:id/auto-charge (cobrancas.automatica).
+router.put('/auto-charge', authenticate, requireRole('CLIENTE'), async (req: Request, res: Response) => {
     try {
         const { enabled } = autoChargeSchema.parse(req.body);
         const userId = req.user!.userId;
@@ -1062,12 +1103,21 @@ const verifyPaymentSchema = z.object({
 
 router.post('/verify-payment', authenticate, async (req: Request, res: Response) => {
     try {
+        // Rota MISTA: a equipe confere qualquer cobrança só com cobrancas.cobrar (403 explícito sem ela);
+        // o cliente, só as dele.
+        const actor = await actorOrReply(req, res);
+        if (!actor) return;
+        const staffOk = actor.isStaff;
+        if (staffOk && !can(actor, 'cobrancas.cobrar')) {
+            denyPermission(res, 'cobrancas.cobrar');
+            return;
+        }
         const data = verifyPaymentSchema.parse(req.body);
         const userId = req.user!.userId;
 
-        // Admins may verify any payment (charged on behalf of a client); clients only their own.
+        // Staff (cobrancas.cobrar) may verify any payment (charged on behalf of a client); clients only their own.
         const payment = await prisma.payment.findFirst({
-            where: { id: data.paymentId, ...(req.user!.role === 'ADMIN' ? {} : { userId }) },
+            where: { id: data.paymentId, ...(staffOk ? {} : { userId }) },
         });
         if (!payment) {
             res.status(404).json({ error: 'Pagamento não encontrado.' });

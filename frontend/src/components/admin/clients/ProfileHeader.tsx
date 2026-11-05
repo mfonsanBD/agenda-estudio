@@ -1,12 +1,7 @@
 import { useState, useEffect } from 'react';
 import { UserDetail } from '../../../api/client';
-import { ShieldCheck, UserRound, Mail, Phone, IdCard, UserX } from 'lucide-react';
+import { UserRound, Mail, Phone, IdCard, UserX } from 'lucide-react';
 import { maskPhone } from '../../../utils/mask';
-
-const ROLE_META: Record<string, { icon: typeof ShieldCheck; label: string }> = {
-    ADMIN: { icon: ShieldCheck, label: 'Administrador' },
-    CLIENTE: { icon: UserRound, label: 'Cliente' },
-};
 
 /** Cabeçalho do perfil do cliente: foto (com fallback p/ iniciais), nome,
  *  contatos e badges de papel/status/tags. Cliente EXCLUÍDO (D3, `deletedAt`): os dados
@@ -70,8 +65,9 @@ export default function ProfileHeader({ user }: { user: UserDetail }) {
                         </>)}
                     </div>
                     <div style={{ marginTop: '8px', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
-                        <span className={`badge ${user.role === 'ADMIN' ? 'badge-sabado' : 'badge-comercial'}`} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                            {(() => { const RI = (ROLE_META[user.role] || ROLE_META.CLIENTE).icon; return <RI size={12} aria-hidden="true" />; })()} {(ROLE_META[user.role] || ROLE_META.CLIENTE).label}
+                        {/* /api/users/:id só abre CLIENTE (D1): a equipe vive na tela Equipe. */}
+                        <span className="badge badge-comercial" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                            <UserRound size={12} aria-hidden="true" /> Cliente
                         </span>
                         {isDeleted ? (
                             <span className="badge" style={{ background: 'var(--danger-bg)', color: 'var(--danger)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>

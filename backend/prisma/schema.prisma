@@ -9,9 +9,12 @@ datasource db {
 
 // ─── Enums ──────────────────────────────────────────────
 
+// COLABORADOR (equipe com permissões por módulo — tela Equipe) fica no FIM: é onde o
+// `ALTER TYPE ... ADD VALUE` do Postgres coloca o valor (mesma ordem no banco e no schema).
 enum Role {
   ADMIN
   CLIENTE
+  COLABORADOR
 }
 
 enum ContractType {
@@ -155,8 +158,25 @@ model User {
   notifications       Notification[]
   couponEligibilities CouponEligibleUser[]
   couponRedemptions   CouponRedemption[]
+  // Só equipe (ADMIN/COLABORADOR) tem linha aqui — cliente nunca. Ver StaffProfile.
+  staffProfile        StaffProfile?
 
   @@map("users")
+}
+
+/// Dados exclusivos de quem é da EQUIPE (1:1 com users). Cliente nunca tem linha aqui.
+/// `permissions` = chaves do catálogo (src/config/staffPermissions.ts), normalizadas ao salvar;
+/// só valem para COLABORADOR — o ADMIN tem acesso total e a lista é ignorada.
+model StaffProfile {
+  userId      String   @id @map("user_id")
+  title       String?  // cargo exibido na tela Equipe (ex.: "Recepção")
+  permissions String[] @default([])
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("staff_profiles")
 }
 
 model PushSubscription {

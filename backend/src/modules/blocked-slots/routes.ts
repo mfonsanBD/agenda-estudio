@@ -1,9 +1,14 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize } from '../../middleware/auth.js';
+import { authenticate } from '../../middleware/auth.js';
+import { requirePermission, requireStaff } from '../../middleware/permissions.js';
+import { logAudit } from '../../lib/audit.js';
 
 const router = Router();
+// Router 100% administrativo (crítica E4): login de EQUIPE em tudo + permissão fina por rota (módulo
+// "Agenda e Agendamentos"): ver bloqueios → agendamentos.ver; bloquear/desbloquear → agendamentos.editar.
+router.use(authenticate, requireStaff());
 
 // ─── Validation Schema ──────────────────────────────────
 
@@ -14,9 +19,9 @@ const blockSlotSchema = z.object({
     reason: z.string().optional(),
 });
 
-// ─── POST /api/blocked-slots (ADMIN) ────────────────────
+// ─── POST /api/blocked-slots (equipe — agendamentos.editar) ────────────────────
 
-router.post('/', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.post('/', requirePermission('agendamentos.editar'), async (req: Request, res: Response) => {
     try {
         const data = blockSlotSchema.parse(req.body);
 
@@ -28,6 +33,10 @@ router.post('/', authenticate, authorize('ADMIN'), async (req: Request, res: Res
                 reason: data.reason,
                 createdBy: req.user!.userId,
             },
+        });
+
+        await logAudit('BLOCKED_SLOT', slot.id, 'CREATED', req.user!.userId, {
+            date: data.date, startTime: data.startTime, endTime: data.endTime, reason: data.reason ?? null,
         });
 
         res.status(201).json({
@@ -43,9 +52,9 @@ router.post('/', authenticate, authorize('ADMIN'), async (req: Request, res: Res
     }
 });
 
-// ─── GET /api/blocked-slots?date=YYYY-MM-DD ─────────────
+// ─── GET /api/blocked-slots?date=YYYY-MM-DD (equipe — agendamentos.ver) ─────────────
 
-router.get('/', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.get('/', requirePermission('agendamentos.ver'), async (req: Request, res: Response) => {
     const { date } = req.query;
 
     const where: any = {};
@@ -64,12 +73,24 @@ router.get('/', authenticate, authorize('ADMIN'), async (req: Request, res: Resp
     res.json({ blockedSlots: slots });
 });
 
-// ─── DELETE /api/blocked-slots/:id (ADMIN) ──────────────
+// ─── DELETE /api/blocked-slots/:id (equipe — agendamentos.editar) ──────────────
 
-router.delete('/:id', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.delete('/:id', requirePermission('agendamentos.editar'), async (req: Request, res: Response) => {
     const id = req.params.id as string;
 
-    await prisma.blockedSlot.delete({ where: { id } });
+    // Id inexistente → 404 (antes o delete lançava dentro do handler async, sem resposta clara).
+    const existing = await prisma.blockedSlot.findUnique({ where: { id } });
+    if (!existing) {
+        res.status(404).json({ error: 'Bloqueio não encontrado.' });
+        return;
+    }
+    const removed = await prisma.blockedSlot.deleteMany({ where: { id } });
+    if (removed.count > 0) {
+        await logAudit('BLOCKED_SLOT', id, 'DELETED', req.user!.userId, {
+            date: existing.date.toISOString().slice(0, 10), startTime: existing.startTime, endTime: existing.endTime,
+            reason: existing.reason ?? null, createdBy: existing.createdBy,
+        });
+    }
     res.json({ message: 'Bloqueio removido.' });
 });
 

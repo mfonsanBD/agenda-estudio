@@ -53,6 +53,11 @@ export function buildDeletionConsequences(p: UserDeletionPreview): string[] {
     return out;
 }
 
+/** AUDFIN-04: a prévia diz que falta ao acesso a chave de algo que a exclusão anularia (o DELETE daria 403). */
+export function blockedByPermissions(p: Pick<UserDeletionPreview, 'missingPermissions'>): boolean {
+    return (p.missingPermissions?.length ?? 0) > 0;
+}
+
 /**
  * Fluxo "Excluir cliente" (D3), usado na lista de clientes e na Zona de perigo do perfil:
  * busca a prévia → abre o diálogo de perigo (digitar EXCLUIR) → DELETE. Erro da prévia (400/409)
@@ -80,6 +85,13 @@ export function useDeleteClient() {
         } finally {
             inFlight.current = false;
             setPreviewingId(null);
+        }
+
+        // AUDFIN-04: a exclusão anularia algo cuja chave o acesso não tem (cancelar contrato, decidir a multa, dar baixa)
+        // — o DELETE responderia 403. A prévia já diz isso: o diálogo de perigo nem abre.
+        if (blockedByPermissions(preview)) {
+            showAlert({ type: 'error', title: 'Não é possível excluir', message: preview.blockedMessage || 'Excluir este cliente exige outras permissões.' });
+            return;
         }
 
         const name = preview.name || target.name;

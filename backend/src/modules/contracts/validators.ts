@@ -145,6 +145,18 @@ export const updateContractSchema = z.object({
     addOns: z.array(z.string()).optional(),
 });
 
+// ─── RENEW (equipe) ─────────────────────────────────────
+// POST /contracts/:id/renew. Antes o corpo entrava cru: `durationMonths: 24` gerava 24 × sessions_per_month
+// sessões, e `type`/`tier` fora do enum davam 500 (ou um tipo sem renovação passava). Agora: duração 3 ou 6,
+// tipo só FIXO/FLEX, faixa pelo enum. `startDate` segue com a checagem AAAA-MM-DD da rota (mensagem própria).
+
+export const renewContractSchema = z.object({
+    durationMonths: z.union([z.literal(3), z.literal(6)]).default(3),
+    type: z.enum([ContractType.FIXO, ContractType.FLEX]).optional(),
+    tier: z.nativeEnum(Tier).optional(),
+    startDate: z.string().nullable().optional(),
+});
+
 // ─── RESOLVE CANCELLATION ───────────────────────────────
 
 export const resolveCancellationSchema = z.object({

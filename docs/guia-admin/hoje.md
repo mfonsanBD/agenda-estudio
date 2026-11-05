@@ -1,6 +1,6 @@
 # Hoje (agenda do dia)
 
-> Rota: **`/admin/today`** · Menu: **Hoje** · Acesso: Admin
+> Rota: **`/admin/today`** · Menu: **Hoje** · Acesso: administrador e colaborador com **Ver a operação do dia** (os botões seguem as permissões — ver [Colaboradores](#colaboradores))
 
 A tela do dia a dia da operação. Mostra as sessões da semana em uma grade e dá as ações rápidas para conduzir cada gravação: confirmar presença, concluir e registrar as métricas, ou marcar falta.
 
@@ -34,12 +34,12 @@ Na gravação **avulsa** (paga à parte), o estúdio decide se a falta dá direi
 
 - **Falta sem justificativa** (padrão): o cliente perde o valor na hora e o contrato avulso fica **Concluído**.
 - **Falta justificada** (marque a opção no modal de Falta): o cliente pode **remarcar uma única vez, sem pagar de novo**, para uma data até o fim do **7º dia** após a gravação perdida (dia D+7, horário de Brasília; o prazo é a configuração *Prazo para Remarcar Falta Justificada — Avulso*). Ele recebe um aviso na hora e lembretes nos 2 últimos dias. Se o prazo passar sem remarcar, o valor é perdido e o contrato fica **Concluído**. Só dá para justificar enquanto o prazo não venceu; desmarcar a justificativa (enquanto a janela estiver aberta) retira o direito.
-- **Não realizado** (culpa do estúdio): a mesma janela de 7 dias abre **automaticamente**. Se o cliente não remarcar, ele **não perde** o valor: o contrato continua ativo e todos os admins recebem um aviso para combinar com o cliente. O admin pode remarcar essa gravação **mesmo depois do prazo**.
-- A remarcação reaproveita a **mesma reserva e o mesmo pagamento** (sem nova cobrança), no mesmo tipo de horário (faixa) da gravação original. Quando o cliente remarca, os admins são avisados.
+- **Não realizado** (culpa do estúdio): a mesma janela de 7 dias abre **automaticamente**, desde que a gravação esteja **paga** (a cobrança da própria gravação; um serviço extra pago não conta) e o contrato esteja ativo ou concluído. Se o cliente não remarcar, ele **não perde** o valor: o contrato continua ativo e a equipe (os administradores e quem tem **Registrar falta ou não realizado**) recebe um aviso para combinar com o cliente. O admin pode remarcar essa gravação **mesmo depois do prazo**. Sem a gravação paga, a janela não abre e a remarcação sem custo não vale (nem para o admin).
+- A remarcação reaproveita a **mesma reserva e o mesmo pagamento** (sem nova cobrança), no mesmo tipo de horário (faixa) da gravação original. Quando a gravação é remarcada, a equipe (os administradores e quem vê a operação do dia) é avisada; quem remarcou não recebe o aviso.
 
 **Na tela:**
 
-- **Modal de Falta** (Hoje, Centro de Comando, Agendamentos e Editar agendamento): na gravação avulsa aparece a opção **"Falta justificada — o cliente pode remarcar sem novo pagamento até DD/MM"**, desmarcada por padrão. Ela fica desativada, com o motivo, quando o prazo já venceu ou a gravação já usou a remarcação. O modal de **Não realizado** avisa que a remarcação sem custo abre sozinha.
+- **Modal de Falta** (Hoje, Centro de Comando, Agendamentos e Editar agendamento): na gravação avulsa aparece a opção **"Falta justificada — o cliente pode remarcar sem novo pagamento até DD/MM"**, desmarcada por padrão. Ela fica desativada, com o motivo, quando o prazo já venceu ou a gravação já usou a remarcação. O modal de **Não realizado** avisa que a remarcação sem custo abre sozinha **se a gravação estiver paga**. Depois de salvar, a tela diz o que o sistema fez: "remarcação sem custo liberada ao cliente até DD/MM", que o prazo já passou (use **Remarcar**) ou, num aviso que fica na tela, "A remarcação sem custo não foi liberada ao cliente." com o motivo (gravação não paga, cobrança anulada ou estornada, contrato cancelado ou encerrado).
 - **Bloco "Remarcação"** no painel da gravação (Hoje) e em cada gravação do **Detalhe do Contrato**: mostra *Remarcação liberada até DD/MM*, *Remarcada (falta em DD/MM)*, *Prazo encerrado — valor retido* (falta) ou *Prazo encerrado — resolver com o cliente* (não realizado), com os botões:
   - **Justificar falta** — para falta avulsa ainda sem justificativa, dentro do prazo (pede confirmação);
   - **Remarcar** — abre a escolha de dia e horário livre da mesma faixa. Num **não realizado**, o admin pode remarcar mesmo depois do prazo e sem limite de data (há o campo **Outra data**).
@@ -68,9 +68,26 @@ Ao concluir uma sessão, registre os dados da gravação:
 - Depois de uma ação a agenda continua na tela e mostra "Atualizando…" no topo enquanto recarrega.
 - **"A gravação foi alterada em outra tela…"** ao finalizar: outro operador desfez o início ou mudou o status enquanto você finalizava. Nada foi gravado; a agenda (Hoje, Centro de Comando ou Detalhe do Contrato) recarrega sozinha por trás — confira a sessão e, se for o caso, inicie de novo antes de finalizar.
 - **Marcar falta por engano:** corrija pela tela de [Agendamentos](agendamentos.md) (editar status). Voltar para "Confirmado" reabre o contrato; "Não realizado" devolve o crédito Flex/Personalizado.
+- **Cancelou ou marcou "Não realizado" por engano:** corrija também em [Agendamentos](agendamentos.md#editar-um-agendamento). Reabrir uma sessão **cancelada** exige **Marcar como pago, anular ou estornar** (o cancelamento anulou a cobrança em aberto dela e liberou crédito ou vaga). Se o cancelamento anulou a cobrança da própria sessão (avulso ou serviço ainda não pago), ela não volta com a reabertura: a sessão não pode voltar a Reservado ou Confirmado, nem pelo administrador. Para gravar, crie um novo agendamento no mesmo horário, que gera a cobrança de novo; se a sessão aconteceu, ela pode ir para **Concluído**, sem cobrança (e de lá também não volta a Reservado ou Confirmado). Tirar de **Não realizado** sem essa permissão só funciona se o plano ainda tiver o crédito (Flex, Personalizado, avulso) ou a vaga (Fixo) que o "Não realizado" devolveu.
+- **Cancelar indisponível:** a sessão tem cobrança em aberto (da sessão ou de um serviço extra) e o seu acesso não tem **Marcar como pago, anular ou estornar**, porque cancelar anularia essa cobrança. O botão **Cancelar** aparece apagado; passar o mouse ou tocar mostra o motivo. Se o cliente não veio, use **Falta**: a cobrança continua devida.
 - **Contrato "Concluído":** ao finalizar a última gravação (ou quando o avulso fica em falta sem direito a remarcar), o contrato vira **Concluído** sozinho. Reabrir a gravação o devolve para **Ativo**.
 - **Métricas por rede só aparecem** se "transmissão ao vivo" estiver marcado.
 - O cliente só vê o gráfico quando houver `streamMetrics` salvos.
+
+## Colaboradores
+
+O colaborador abre esta tela com **Ver a operação do dia** (a mesma permissão abre a Agenda). Cada botão aparece só com a permissão dele; se não sobrar nenhum, a barra de ações some e a sessão fica só para consulta.
+
+| Na tela | Permissão |
+|---|---|
+| **Check-in** / **Confirmar presença** | **Confirmar presença (check-in)** ou **Mudar data, horário e status** |
+| **Iniciar gravação**, **Desfazer início**, **Finalizar gravação**, **Dados da transmissão** | **Operar a gravação** |
+| **Falta**, **Não realizado**, **Justificar falta** e **Remarcar** (avulso) | **Registrar falta ou não realizado** |
+| **Cancelar** | **Cancelar sessão** (sessão com cobrança em aberto: também **Marcar como pago, anular ou estornar**) |
+| Editar notas e métricas | **Operar a gravação** ou **Mudar data, horário e status** (sem elas: "Somente leitura") |
+| Nome do cliente e **Ver Perfil** | **Ver clientes** (sem ela, o nome aparece como texto) |
+
+Os mesmos botões no **Centro de Comando** (painel) e no **Detalhe do Contrato** seguem as mesmas permissões. Avisos do dia (sessão confirmada ou cancelada pelo cliente, gravação remarcada) chegam a quem vê a operação do dia; "sessão não confirmada" chega a quem confirma presença.
 
 ## Ver também
 

@@ -14,18 +14,40 @@ cleanupOutdatedCaches();
 
 // ─── Runtime Caching Strategies ───
 
-// API calls — NetworkFirst (try network, fallback to cached response)
+// API — S2 (equipe): SÓ os GETs PÚBLICOS (sem login, iguais para todo mundo) vão para o cache, para a
+// landing e os preços abrirem offline. Nada de /api/auth/* nem rotas da área administrativa ou do
+// cliente: antes, TODO GET /api/* ficava 1 h no Cache Storage — num computador de recepção
+// compartilhado, quem viesse depois lia o que o administrador carregou (financeiro, clientes com CPF…)
+// e, com rede lenta, recebia o /auth/me do usuário anterior. As demais chamadas vão direto à rede.
+// O app ainda apaga estes caches no login e no logout (clearApiCaches em api/client.ts).
+const PUBLIC_API_CACHE = 'api-public-cache';
+/** Cache antigo que guardava qualquer resposta da API (apagado na ativação deste service worker). */
+const LEGACY_API_CACHE = 'api-cache';
+const PUBLIC_API_PATHS: ReadonlySet<string> = new Set([
+    '/api/pricing',
+    '/api/pricing/business-config/public',
+    '/api/pricing/payment-methods',
+    '/api/pricing/addons',
+]);
+
 registerRoute(
-    ({ url }) => url.pathname.startsWith('/api/'),
+    ({ url, request, sameOrigin }) =>
+        sameOrigin && request.method === 'GET' && PUBLIC_API_PATHS.has(url.pathname.replace(/\/+$/, '')),
     new NetworkFirst({
-        cacheName: 'api-cache',
+        cacheName: PUBLIC_API_CACHE,
         networkTimeoutSeconds: 8,
         plugins: [
-            new CacheableResponsePlugin({ statuses: [0, 200] }),
-            new ExpirationPlugin({ maxEntries: 100, maxAgeSeconds: 60 * 60 }), // 1 hour
+            new CacheableResponsePlugin({ statuses: [200] }),
+            new ExpirationPlugin({ maxEntries: 20, maxAgeSeconds: 60 * 60 }), // 1 hour
         ],
     }),
+    'GET',
 );
+
+// Apaga o api-cache legado (respostas autenticadas de versões anteriores) ao ativar esta versão.
+self.addEventListener('activate', (event) => {
+    event.waitUntil(caches.delete(LEGACY_API_CACHE).then(() => undefined, () => undefined));
+});
 
 // Google Fonts stylesheets — StaleWhileRevalidate
 registerRoute(

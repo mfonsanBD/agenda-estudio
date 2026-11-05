@@ -4,6 +4,7 @@ import { getPackageSlots } from '../utils/pricing.js';
 import { redis, releaseMultiSlotLock } from '../lib/redis.js';
 import { releaseCouponForPayments } from '../lib/couponService.js';
 import { activateAwaitingContract, onPaymentConfirmed } from '../lib/paymentEffects.js';
+import { sessionAwaitsOwnPayment } from '../modules/bookings/booking.service.js';
 
 /**
  * Devolve os usos de cupom RESERVED e remove as linhas de resgate (FK RESTRICT) dos pagamentos que
@@ -343,14 +344,20 @@ export async function cleanExpiredHolds() {
                     continue;
                 }
                 // A payment landed — promote rather than delete (repairs a webhook/cron race).
+                // ATU-02/R5: a reserva só vira Confirmada com a cobrança da GRAVAÇÃO paga (a mesma regra do /confirm:
+                // booking.service.sessionAwaitsOwnPayment). Se o PAID achado é de outra cobrança (extra, parcela do
+                // contrato) e a da sessão segue sem pagar, só tira o timer e mantém Reservada.
+                const sessionChargeOpen = await sessionAwaitsOwnPayment(booking);
                 await prisma.booking.updateMany({
                     where: { id: booking.id, status: { in: ['RESERVED', 'HELD'] } },
-                    data: { status: 'CONFIRMED', holdExpiresAt: null },
+                    data: { status: sessionChargeOpen ? 'RESERVED' : 'CONFIRMED', holdExpiresAt: null },
                 });
                 if (booking.contractId) {
                     await activateAwaitingContract(booking.contractId);
                 }
-                console.log(`[HOLD-CLEANUP] Booking ${booking.id} has a PAID payment — promoted to CONFIRMED (not cancelled)`);
+                console.log(sessionChargeOpen
+                    ? `[HOLD-CLEANUP] Booking ${booking.id} has a PAID payment but the session charge is open — hold cleared, kept RESERVED`
+                    : `[HOLD-CLEANUP] Booking ${booking.id} has a PAID payment — promoted to CONFIRMED (not cancelled)`);
                 continue;
             }
 
@@ -403,14 +410,17 @@ export async function cleanExpiredHolds() {
                 select: { id: true },
             });
             if (paidAfter) {
+                // ATU-02/R5: mesma regra da promoção acima (sessionAwaitsOwnPayment) — sem a cobrança da gravação
+                // paga, volta Reservada (sem o timer), nunca Confirmada.
+                const sessionChargeOpen = await sessionAwaitsOwnPayment(booking);
                 await prisma.booking.updateMany({
                     where: { id: booking.id, status: 'CANCELLED' },
-                    data: { status: 'CONFIRMED', holdExpiresAt: null },
+                    data: { status: sessionChargeOpen ? 'RESERVED' : 'CONFIRMED', holdExpiresAt: null },
                 });
                 if (booking.contractId) {
                     await activateAwaitingContract(booking.contractId);
                 }
-                console.log(`[HOLD-CLEANUP] Booking ${booking.id} foi pago na janela do cancel — restaurado para CONFIRMED (mantém o slot).`);
+                console.log(`[HOLD-CLEANUP] Booking ${booking.id} foi pago na janela do cancel — restaurado para ${sessionChargeOpen ? 'RESERVED (cobrança da sessão em aberto)' : 'CONFIRMED'} (mantém o slot).`);
                 continue;
             }
 

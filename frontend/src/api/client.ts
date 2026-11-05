@@ -1,3 +1,5 @@
+import type { AdminOnlyPermissionKey, PermissionKey, PermissionModuleKey } from '../constants/permissions';
+
 const API_BASE = '/api';
 
 export class ApiError extends Error {
@@ -29,7 +31,20 @@ export class ApiError extends Error {
     }
 }
 
-let refreshPromise: Promise<boolean> | null = null;
+/**
+ * Resultado da renovação da sessão (POST /auth/refresh):
+ *  - 'ok'          → tokens novos; a requisição original é repetida;
+ *  - 'refused'     → o servidor RECUSOU (401/403 em JSON: sessão encerrada, token inválido ou ausente,
+ *                    conta desativada/excluída) — a sessão acabou de verdade;
+ *  - 'unavailable' → falha passageira (rede caiu, 5xx/503, 429 do limitador, resposta que não é do
+ *                    servidor): NÃO é fim de sessão; nada desloga (NS-3 — "não desloga em erro de rede/503").
+ */
+type RefreshOutcome = 'ok' | 'refused' | 'unavailable';
+
+let refreshPromise: Promise<RefreshOutcome> | null = null;
+
+/** Mensagem do erro lançado quando a sessão não pôde ser renovada por falha passageira (NS-3). */
+export const SESSION_REFRESH_UNAVAILABLE_MESSAGE = 'Não foi possível renovar a sessão agora. Tente novamente em instantes.';
 
 /**
  * D3: disparado em `window` quando o refresh responde 401 de conta inexistente/excluída
@@ -38,7 +53,65 @@ let refreshPromise: Promise<boolean> | null = null;
 export const AUTH_ACCOUNT_GONE_EVENT = 'auth:account-gone';
 const ACCOUNT_GONE_ERRORS = new Set(['Conta não encontrada.', 'Usuário não encontrado.']);
 
-async function tryRefresh(): Promise<boolean> {
+/**
+ * AUTH-01 / NS-2: a sessão TERMINOU — o refresh recusou com 401 que não é conta desativada nem
+ * excluída (sessão revogada pelo administrador ao trocar papel/e-mail/senha, troca da própria senha
+ * em outro aparelho, `code: 'SESSION_REVOKED'`, token inválido ou cookie ausente). CustomEvent com
+ * `detail: SessionEndedDetail`. O AuthContext escuta: com sessão na tela, apaga o cookie de refresh
+ * (logout), limpa os caches e leva ao /login com "Sua sessão terminou…"; sem sessão (boot de visitante
+ * ou cookie residual) só apaga o cookie, em silêncio. Sem isto o membro levava 401 a cada clique e
+ * nunca ia ao login, e o cookie de refresh ficava no navegador da recepção.
+ */
+export const AUTH_SESSION_ENDED_EVENT = 'auth:session-ended';
+export interface SessionEndedDetail {
+    /** `code` do servidor (ex.: 'SESSION_REVOKED'), quando veio. */
+    code: string | null;
+    /** false = o navegador nem tinha cookie de refresh ('Refresh token não encontrado.'): nada a apagar. */
+    hadRefreshCookie: boolean;
+}
+const REFRESH_COOKIE_MISSING_ERROR = 'Refresh token não encontrado.';
+
+/**
+ * Equipe (S3): conta DESATIVADA ou bloqueada. Disparado em `window` (CustomEvent com
+ * `detail: AccountDisabledDetail`) quando:
+ *  - qualquer rota responde 401 `code: 'ACCOUNT_DISABLED'` (getActor do backend: membro desativado/excluído);
+ *  - o refresh responde 401/403 com `code: 'ACCOUNT_DISABLED'` (conta bloqueada — `assertNotBlocked`).
+ *    Só o `code` decide (NS-3): um 403 sem ele (proxy, página HTML) não vira "acesso desativado".
+ * O AuthContext escuta: encerra a sessão e mostra a mensagem ("Seu acesso foi desativado…").
+ * Não dispara nas rotas de login/cadastro (lá o erro aparece no próprio formulário).
+ */
+export const AUTH_ACCOUNT_DISABLED_EVENT = 'auth:account-disabled';
+export interface AccountDisabledDetail {
+    /** Mensagem do servidor (pt-BR), ou o texto padrão quando o corpo não trouxe nenhuma. */
+    message: string;
+}
+export const ACCOUNT_DISABLED_DEFAULT_MESSAGE = 'Seu acesso foi desativado. Fale com o administrador.';
+
+/**
+ * Equipe (D6): o servidor recusou uma ação com 403 `code: 'PERMISSION_DENIED'` — as permissões que o
+ * front tem estão defasadas (o administrador mudou o acesso). CustomEvent com
+ * `detail: PermissionsStaleDetail`; o AuthContext recarrega as permissões (refreshPermissions) e avisa.
+ */
+export const AUTH_PERMISSIONS_STALE_EVENT = 'auth:permissions-stale';
+export interface PermissionsStaleDetail {
+    /** Chave exigida (`agendamentos.criar`…), ou 'ADMIN' / 'STAFF' / 'CLIENTE' quando é o papel. */
+    permission: string | null;
+    /** Método HTTP da requisição recusada (GET = leitura de fundo; os demais = ação do usuário). */
+    method: string;
+    path: string;
+}
+
+function emitWindowEvent<T>(name: string, detail: T): void {
+    try { window.dispatchEvent(new CustomEvent<T>(name, { detail })); } catch { /* ignore */ }
+}
+
+function emitAccountDisabled(message: unknown): void {
+    emitWindowEvent<AccountDisabledDetail>(AUTH_ACCOUNT_DISABLED_EVENT, {
+        message: typeof message === 'string' && message.trim() ? message : ACCOUNT_DISABLED_DEFAULT_MESSAGE,
+    });
+}
+
+async function tryRefresh(): Promise<RefreshOutcome> {
     // Deduplicate: all callers share the same in-flight refresh
     if (refreshPromise) return refreshPromise;
 
@@ -46,16 +119,32 @@ async function tryRefresh(): Promise<boolean> {
         method: 'POST',
         credentials: 'include',
     })
-        .then(async r => {
-            if (r.status === 401) {
-                const body = await r.json().catch(() => null) as { error?: unknown } | null;
-                if (body && typeof body.error === 'string' && ACCOUNT_GONE_ERRORS.has(body.error)) {
-                    try { window.dispatchEvent(new Event(AUTH_ACCOUNT_GONE_EVENT)); } catch { /* ignore */ }
-                }
+        .then(async (r): Promise<RefreshOutcome> => {
+            if (r.ok) return 'ok';
+            if (r.status !== 401 && r.status !== 403) {
+                // 5xx/503 (banco fora no refresh), 429 (limitador), 404 de proxy…: passageiro (NS-3).
+                return 'unavailable';
             }
-            return r.ok;
+            const body = await r.json().catch(() => null) as { error?: unknown; code?: unknown } | null;
+            if (!body) return 'unavailable'; // 401/403 sem JSON não veio do nosso servidor (proxy, página HTML).
+            if (body.code === 'ACCOUNT_DISABLED') {
+                // S3: conta BLOQUEADA (assertNotBlocked) — sem isto o desativado levava 401 a cada clique
+                // e nunca ia para o login.
+                emitAccountDisabled(body.error);
+                return 'refused';
+            }
+            if (typeof body.error === 'string' && ACCOUNT_GONE_ERRORS.has(body.error)) {
+                try { window.dispatchEvent(new Event(AUTH_ACCOUNT_GONE_EVENT)); } catch { /* ignore */ }
+                return 'refused';
+            }
+            if (r.status === 403) return 'unavailable'; // 403 sem ACCOUNT_DISABLED: não é recusa de sessão.
+            emitWindowEvent<SessionEndedDetail>(AUTH_SESSION_ENDED_EVENT, {
+                code: typeof body.code === 'string' ? body.code : null,
+                hadRefreshCookie: body.error !== REFRESH_COOKIE_MISSING_ERROR,
+            });
+            return 'refused';
         })
-        .catch(() => false)
+        .catch((): RefreshOutcome => 'unavailable') // rede caiu / fetch rejeitado
         .finally(() => { refreshPromise = null; });
 
     return refreshPromise;
@@ -64,6 +153,21 @@ async function tryRefresh(): Promise<boolean> {
 /** Corpo de erro como objeto simples (para ApiError.body); qualquer outra coisa vira undefined. */
 function errorBodyOf(body: unknown): Record<string, unknown> | undefined {
     return body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : undefined;
+}
+
+/** Lê o `code` do corpo JSON sem consumir a resposta (clone). */
+async function peekErrorCode(res: Response): Promise<string | undefined> {
+    try {
+        const body = await res.clone().json() as { code?: unknown };
+        return typeof body?.code === 'string' ? body.code : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/** Rotas de entrada (login/OTP/Google/cadastro): o erro aparece no formulário, sem eventos globais. */
+function isSignInEndpoint(path: string): boolean {
+    return /^\/auth\/(login|google|register)(\/|$|\?)/.test(path);
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -76,28 +180,64 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
     let res = await doFetch();
 
-    // Auto-refresh on 401 (skip auth endpoints to avoid infinite loop)
+    // Auto-refresh on 401 (skip auth endpoints to avoid infinite loop).
+    // 401 ACCOUNT_DISABLED (membro desativado/excluído) não tenta refresh: a conta não volta renovando o token.
     const isAuthEndpoint = path.includes('/auth/refresh') || path.includes('/auth/login');
-    if (res.status === 401 && !isAuthEndpoint) {
-        const refreshed = await tryRefresh();
-        if (refreshed) {
+    if (res.status === 401 && !isAuthEndpoint && (await peekErrorCode(res)) !== 'ACCOUNT_DISABLED') {
+        const outcome = await tryRefresh();
+        if (outcome === 'ok') {
             // Retry the original request with the new access token
             res = await doFetch();
+        } else if (outcome === 'unavailable') {
+            // NS-3: falha passageira ao renovar NÃO é sessão encerrada — lança 503 (quem trata 401 como
+            // "sessão terminou", como o refreshPermissions, mantém o usuário) em vez do 401 original.
+            throw new ApiError(SESSION_REFRESH_UNAVAILABLE_MESSAGE, 503, undefined, 'SESSION_REFRESH_UNAVAILABLE');
         }
     }
 
     if (!res.ok) {
         // Fallback vazio (não truthy): quando o corpo não é JSON (proxy 502, rate-limit
         // em texto), a mensagem cai no status HTTP real em vez de "Erro desconhecido".
-        const body = await res.json().catch(() => ({} as { error?: string; details?: unknown; code?: string }));
+        const body = await res.json().catch(() => ({} as { error?: string; details?: unknown; code?: string; permission?: unknown }));
+        const code = typeof body.code === 'string' ? body.code : undefined;
+        if (!isSignInEndpoint(path)) {
+            if (res.status === 401 && code === 'ACCOUNT_DISABLED') {
+                emitAccountDisabled(body.error);
+            } else if (res.status === 403 && code === 'PERMISSION_DENIED') {
+                emitWindowEvent<PermissionsStaleDetail>(AUTH_PERMISSIONS_STALE_EVENT, {
+                    permission: typeof body.permission === 'string' ? body.permission : null,
+                    method: (options.method || 'GET').toUpperCase(),
+                    path,
+                });
+            }
+        }
         throw new ApiError(
             body.error || `Erro ${res.status} do servidor`, res.status, body.details,
-            typeof body.code === 'string' ? body.code : undefined,
+            code,
             errorBodyOf(body),
         );
     }
 
     return res.json();
+}
+
+/**
+ * Caches de respostas da API no navegador (Cache Storage do service worker). `api-cache` é o legado —
+ * guardava QUALQUER GET /api/* por 1 h, inclusive de outro usuário no mesmo computador (S2);
+ * `api-public-cache` é o atual (só GETs públicos de preços/formas de pagamento, ver sw.ts).
+ */
+export const API_CACHE_NAMES = ['api-cache', 'api-public-cache'] as const;
+
+/**
+ * S2: apaga as respostas da API guardadas pelo service worker. O AuthContext chama no login e no
+ * logout (computador de recepção compartilhado). Nunca lança; sem Cache Storage (http, navegador
+ * antigo) não faz nada.
+ */
+export async function clearApiCaches(): Promise<void> {
+    try {
+        if (typeof caches === 'undefined') return;
+        await Promise.all(API_CACHE_NAMES.map(name => caches.delete(name).catch(() => false)));
+    } catch { /* ignore */ }
 }
 
 
@@ -161,7 +301,9 @@ export const bookingsApi = {
     adminCreate: (data: { userId: string; date: string; startTime: string; status?: string; addOns?: string[]; adminNotes?: string; customPrice?: number; paymentMethod?: 'CARTAO' | 'PIX' | 'BOLETO'; couponCode?: string }) => request<{ booking: Booking; message: string; paymentId?: string; paymentAmount?: number; couponDiscount?: number; boletoUrl?: string; boletoError?: string }>('/bookings/admin', { method: 'POST', body: JSON.stringify(data) }),
     // noShowJustified (admin, D4): ao marcar FALTA num contrato AVULSO, true abre a janela de
     // remarcação (makeupStatus OPEN até o fim do dia D+N em SP); false com OPEN desfaz a justificativa.
-    update: (id: string, data: { date?: string; startTime?: string; status?: string; statusReason?: string | null; noShowJustified?: boolean; adminNotes?: string; clientNotes?: string; platforms?: string; platformLinks?: string, durationMinutes?: number | null, peakViewers?: number | null, chatMessages?: number | null, audienceOrigin?: string | null, isLivestream?: boolean | null, streamMetrics?: string | null }) => request<{ booking: BookingWithUser; message: string }>(`/bookings/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+    // R7 (AUDFIN6-03): makeupOpened/makeupDeadline/makeupBlockReason dizem se a troca abriu a janela do avulso e, se
+    // não abriu, o motivo — ausentes = a tela não afirma (utils/avulsoMakeup.reasonSaveFeedback).
+    update: (id: string, data: { date?: string; startTime?: string; status?: string; statusReason?: string | null; noShowJustified?: boolean; adminNotes?: string; clientNotes?: string; platforms?: string; platformLinks?: string, durationMinutes?: number | null, peakViewers?: number | null, chatMessages?: number | null, audienceOrigin?: string | null, isLivestream?: boolean | null, streamMetrics?: string | null }) => request<{ booking: BookingWithUser; message: string; reopenedWithoutCharge?: boolean; makeupOpened?: boolean; makeupDeadline?: string | null; makeupBlockReason?: string | null }>(`/bookings/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
     // 400 `code: 'RECORDING_START_FUTURE'` = sessão de data FUTURA (só dá para iniciar no dia da sessão ou depois — mostre `message`).
     startRecording: (id: string) => request<{ booking: BookingWithUser; message: string }>(`/bookings/${id}/start-recording`, { method: 'PUT' }),
     /**
@@ -330,12 +472,35 @@ export const contractsApi = {
     resume: (id: string) => request<{ contract: Contract; message: string }>(`/contracts/${id}/resume`, { method: 'PATCH' }),
 };
 
-// ─── Users ──────────────────────────────────────────────
+// ─── Users (SÓ clientes) ────────────────────────────────
+// `/api/users` trata SÓ de CLIENTE (D1): a listagem nunca traz a equipe e alvo que não é cliente → 404.
+// A equipe (ADMIN/COLABORADOR) vive em `staffApi` (/api/staff, só ADMIN).
+/** Campos do cadastro de cliente aceitos por POST/PATCH /users (sem papel: o papel é da tela Equipe). */
+interface ClientWriteFields {
+    name?: string; email?: string; phone?: string; notes?: string;
+    cpfCnpj?: string | null; address?: string | null; addressNumber?: string | null; complement?: string | null;
+    neighborhood?: string | null; city?: string | null; state?: string | null; zipCode?: string | null;
+    tags?: string[]; socialLinks?: string | null; clientStatus?: string;
+    /**
+     * Senha do CLIENTE — SÓ o ADMIN define (F8/D9: o colaborador recebe 403; sem senha o cliente entra
+     * pelo código enviado ao e-mail). Trocar e-mail de login e bloquear exigem `clientes.acesso`.
+     */
+    password?: string;
+}
+/**
+ * Tira o papel do corpo (D1/D9): o cadastro de cliente nunca envia `role` (o servidor recusa `role` ≠
+ * 'CLIENTE' com 400). O tipo já não aceita `role`; a remoção em tempo de execução fica como defesa.
+ */
+function withoutRole<T extends object>(data: T): Omit<T, 'role'> {
+    const { role: _ignored, ...rest } = data as T & { role?: unknown };
+    return rest;
+}
 export const usersApi = {
-    getAll: (role?: string) => request<{ users: UserSummary[] }>(`/users${role ? `?role=${role}` : ''}`),
+    /** `role` só aceita 'CLIENTE' (o servidor recusa outro valor com 400); sem filtro também lista só clientes. */
+    getAll: (role?: 'CLIENTE') => request<{ users: UserSummary[] }>(`/users${role ? `?role=${role}` : ''}`),
     getById: (id: string) => request<{ user: UserDetail }>(`/users/${id}`),
-    create: (data: { email: string; password: string; name: string; phone?: string; role?: string; notes?: string; cpfCnpj?: string | null; address?: string | null; addressNumber?: string | null; complement?: string | null; neighborhood?: string | null; city?: string | null; state?: string | null; zipCode?: string | null; tags?: string[]; socialLinks?: string | null; clientStatus?: string }) => request<{ user: UserSummary; message: string }>('/users', { method: 'POST', body: JSON.stringify(data) }),
-    update: (id: string, data: { name?: string; email?: string; phone?: string; role?: string; password?: string; notes?: string; cpfCnpj?: string | null; address?: string | null; addressNumber?: string | null; complement?: string | null; neighborhood?: string | null; city?: string | null; state?: string | null; zipCode?: string | null; tags?: string[]; socialLinks?: string | null; clientStatus?: string }) => request<{ user: UserSummary; message: string }>(`/users/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+    create: (data: ClientWriteFields & { email: string; name: string }) => request<{ user: UserSummary; message: string }>('/users', { method: 'POST', body: JSON.stringify(withoutRole(data)) }),
+    update: (id: string, data: ClientWriteFields) => request<{ user: UserSummary; message: string }>(`/users/${id}`, { method: 'PATCH', body: JSON.stringify(withoutRole(data)) }),
     // D3: sem nenhum vínculo → exclusão física (softDeleted false); com qualquer vínculo → soft delete
     // com anonimização (softDeleted true). `message` já vem pronta para o toast.
     /** paidDuringDeletion: cobranças PENDING que o provedor confirmou como pagas DURANTE a exclusão (ficam PAID, sem estorno automático). */
@@ -348,6 +513,127 @@ export const usersApi = {
         duePayments: { id: string; amount: number; dueDate: string | null; overdue: boolean; contractName: string }[];
     }>(`/users/${id}/payment-overview`),
     setAutoCharge: (id: string, enabled: boolean) => request<{ autoChargeEnabled: boolean }>(`/users/${id}/auto-charge`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
+};
+
+// ─── Equipe (/api/staff — só ADMIN, papel lido do banco) ─
+// Contrato D5 (DECISOES-EQUIPE.md). Todo `/api/staff/:id` com alvo que não é da equipe (CLIENTE ou
+// excluído) → 404. Códigos de erro estáveis (ApiError.code): ver StaffErrorCode.
+/** Papel que a tela Equipe atribui (nunca transforma ninguém em CLIENTE). */
+export type StaffRole = 'ADMIN' | 'COLABORADOR';
+/** Nível de uma ação no catálogo: "Ver" / "Ver e editar" / "Tudo, inclusive cancelar e excluir". */
+export type StaffPermissionLevel = 'ver' | 'editar' | 'tudo';
+/** Selos da ação: dinheiro ($), irreversivel (⚠⚠ não tem volta), sensivel (⚠), clienteVe ("o cliente vê isto"). */
+export type StaffPermissionBadge = 'dinheiro' | 'irreversivel' | 'sensivel' | 'clienteVe';
+/**
+ * Códigos de erro do /api/staff:
+ *  - EMAIL_TAKEN (409): e-mail já usado por outro membro da equipe;
+ *  - EMAIL_IS_CLIENT (409): e-mail já é de um cliente (sem diferenciar maiúsculas) — use outro e-mail;
+ *  - SELF_CHANGE_FORBIDDEN (400): ninguém altera o próprio papel, permissões ou situação;
+ *  - LAST_ADMIN (409): a mudança deixaria o sistema sem administrador ativo;
+ *  - INVALID_PERMISSION (400): chave desconhecida ou exclusiva do ADMIN na lista (`ApiError.body.invalid`);
+ *  - STAFF_NOT_FOUND (404): alvo não é da equipe (cliente ou excluído);
+ *  - ADMIN_TARGET_FORBIDDEN (403): e-mail/senha de um ADMIN não se alteram por aqui (use "Enviar acesso");
+ *  - STAFF_INACTIVE (409): acesso desativado — reative antes de enviar o e-mail de acesso;
+ *  - PERMISSION_DENIED (403): quem chamou deixou de ser ADMIN.
+ */
+export type StaffErrorCode =
+    | 'EMAIL_TAKEN' | 'EMAIL_IS_CLIENT' | 'SELF_CHANGE_FORBIDDEN' | 'LAST_ADMIN' | 'INVALID_PERMISSION'
+    | 'STAFF_NOT_FOUND' | 'ADMIN_TARGET_FORBIDDEN' | 'STAFF_INACTIVE' | 'PERMISSION_DENIED';
+export interface StaffCatalogAction {
+    key: PermissionKey;
+    label: string;
+    description: string;
+    /** null = caixa sem nível (Configurações). */
+    level: StaffPermissionLevel | null;
+    badges: StaffPermissionBadge[];
+    /** Chaves marcadas e travadas junto (o servidor normaliza ao salvar). */
+    requires: PermissionKey[];
+}
+export interface StaffCatalogModule {
+    key: PermissionModuleKey;
+    label: string;
+    description: string;
+    /** Chaves de cada nível (cumulativo: "editar" inclui "ver"). Configurações: os três vazios. */
+    levels: Record<StaffPermissionLevel, PermissionKey[]>;
+    actions: StaffCatalogAction[];
+}
+/** GET /api/staff/catalog — rótulos em pt-BR, níveis, selos, dependências e perfis modelo (fonte: servidor). */
+export interface StaffCatalog {
+    modules: StaffCatalogModule[];
+    /** Exclusivas do ADMIN: aparecem em cinza ("só o administrador"), nunca para marcar. */
+    adminOnly: { key: AdminOnlyPermissionKey; label: string }[];
+    /** Perfis modelo: escolher só PREENCHE as caixas (o banco guarda só as chaves). */
+    presets: { key: string; label: string; description: string; permissions: PermissionKey[] }[];
+}
+/** Membro da equipe (GET /api/staff). */
+export interface StaffMember {
+    id: string;
+    name: string;
+    /** Sempre preenchido para quem foi criado pela tela Equipe; contas antigas podem vir null. */
+    email: string | null;
+    phone: string | null;
+    photoUrl: string | null;
+    role: StaffRole;
+    /** Cargo ("Recepção"). */
+    title: string | null;
+    /** Chaves marcadas (COLABORADOR). ADMIN: acesso total — a lista não vale. */
+    permissions: PermissionKey[];
+    /** false = desativado (não entra; as permissões ficam guardadas e voltam ao reativar). */
+    active: boolean;
+    /** É quem está logado (as ações de risco não aparecem na própria linha). */
+    isSelf: boolean;
+    /**
+     * E-mail e senha travados na tela Equipe (E2): a pessoa é ou já foi ADMIN (o servidor recusa com 403
+     * ADMIN_TARGET_FORBIDDEN). Opcional só para tolerar resposta antiga: ausente = `role !== 'COLABORADOR'`
+     * (use `credentialsLocked()` de components/admin/team/teamPermissions).
+     */
+    credentialsLocked?: boolean;
+    createdAt: string;
+    updatedAt: string;
+}
+/** POST /api/staff. Sem senha, a pessoa entra com o código enviado ao e-mail. */
+export interface StaffCreateInput {
+    name: string;
+    email: string;
+    phone?: string | null;
+    title?: string | null;
+    role: StaffRole;
+    /** Só COLABORADOR (ADMIN ignora). O servidor normaliza as dependências. */
+    permissions?: PermissionKey[];
+    /** Senha provisória (≥ 8). */
+    password?: string;
+    /** Envia o e-mail "Você foi adicionado à equipe…" com o link de login. */
+    sendAccessEmail?: boolean;
+}
+/** PATCH /api/staff/:id — campos opcionais, SEM senha (senha: setPassword). E-mail só de alvo sem `credentialsLocked`. */
+export interface StaffUpdateInput {
+    name?: string;
+    email?: string;
+    phone?: string | null;
+    title?: string | null;
+    role?: StaffRole;
+    permissions?: PermissionKey[];
+}
+export const staffApi = {
+    getCatalog: () => request<StaffCatalog>('/staff/catalog'),
+    list: () => request<{ members: StaffMember[] }>('/staff'),
+    /** 201 `{ member, message, accessEmailSent? }`; 409 EMAIL_TAKEN | EMAIL_IS_CLIENT. */
+    create: (data: StaffCreateInput) =>
+        request<{ member: StaffMember; message: string; accessEmailSent?: boolean }>('/staff', { method: 'POST', body: JSON.stringify(data) }),
+    /** Revoga as sessões do membro se o papel ou o e-mail mudar. 400 SELF_CHANGE_FORBIDDEN; 409 LAST_ADMIN. */
+    update: (id: string, data: StaffUpdateInput) =>
+        request<{ member: StaffMember; message: string }>(`/staff/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(data) }),
+    /** Só alvo sem `credentialsLocked` (COLABORADOR que nunca foi ADMIN — E2). Senha ≥ 8; revoga as sessões. */
+    setPassword: (id: string, password: string) =>
+        request<{ message: string }>(`/staff/${encodeURIComponent(id)}/password`, { method: 'POST', body: JSON.stringify({ password }) }),
+    /** E-mail de acesso (entra por código). Rate limit leve. */
+    sendAccess: (id: string) =>
+        request<{ message: string }>(`/staff/${encodeURIComponent(id)}/send-access`, { method: 'POST' }),
+    /** BLOCKED + revoga sessões + apaga as push subscriptions. 400 SELF_CHANGE_FORBIDDEN; 409 LAST_ADMIN. */
+    deactivate: (id: string) =>
+        request<{ member: StaffMember; message: string }>(`/staff/${encodeURIComponent(id)}/deactivate`, { method: 'POST' }),
+    reactivate: (id: string) =>
+        request<{ member: StaffMember; message: string }>(`/staff/${encodeURIComponent(id)}/reactivate`, { method: 'POST' }),
 };
 
 // ─── Coupons ────────────────────────────────────────────
@@ -466,11 +752,28 @@ export const publicApi = {
 };
 
 // ─── Types ──────────────────────────────────────────────
+/**
+ * Papel da conta. CLIENTE = área do cliente; COLABORADOR = área administrativa limitada às `permissions`;
+ * ADMIN = acesso total (único que gerencia a Equipe).
+ */
+export type UserRole = 'ADMIN' | 'COLABORADOR' | 'CLIENTE';
+/**
+ * Usuário logado — formato ÚNICO de /auth/me, login, OTP, Google, register, PATCH /auth/profile e foto.
+ * Use `usePermission()` (hooks/usePermission.ts) em vez de ler `role`/`permissions` direto.
+ */
 export interface User {
-    id: string; email: string; name: string; role: 'ADMIN' | 'CLIENTE'; phone?: string | null; photoUrl?: string | null;
+    id: string; email: string; name: string; role: UserRole; phone?: string | null; photoUrl?: string | null;
     cpfCnpj?: string | null; address?: string | null; city?: string | null; state?: string | null; socialLinks?: string | null;
     addressNumber?: string | null; complement?: string | null; neighborhood?: string | null; zipCode?: string | null;
     essentialNotificationsOnly?: boolean;
+    /**
+     * Permissões efetivas (chaves de constants/permissions.ts): ADMIN = todas (inclusive as exclusivas);
+     * COLABORADOR = as marcadas na tela Equipe; CLIENTE = []. Uma resposta antiga/parcial pode vir sem o
+     * campo em tempo de execução — trate como [] (o usePermission já faz isso; o ADMIN passa sempre).
+     */
+    permissions: string[];
+    /** Cargo do membro da equipe ("Recepção"); null para cliente/sem cargo. */
+    staffTitle?: string | null;
 }
 export interface Slot {
     time: string; available: boolean; tier: 'COMERCIAL' | 'AUDIENCIA' | 'SABADO' | null; price: number | null;
@@ -514,6 +817,19 @@ export interface Booking {
     missedDate?: string | null;     // ISO (@db.Date) — data da gravação perdida (histórico)
     addOns?: string[];
     holdExpiresAt?: string | null;
+    /**
+     * R5 — só nas rotas da equipe: quantas cobranças desta gravação estão em aberto (PENDING/FAILED com o
+     * bookingId — a da própria sessão e a dos extras). Cancelar a sessão anula essas cobranças, o que exige
+     * cobrancas.baixa (403 sem ela). Ausente = desconhecido (servidor antigo/rota do cliente): a tela não trava
+     * e a mensagem do 403 do servidor aparece (cancelBlockedByOpenCharge, bookingPermissions).
+     */
+    openChargeCount?: number;
+    /**
+     * R7 (espelho do AUDFIN6-02) — a cobrança própria desta sessão foi anulada e ela não volta a ficar em aberto (409
+     * SESSION_CHARGE_VOIDED). A lista de Agendamentos marca a linha quando o servidor disse isso (reopenedWithoutCharge
+     * ou o 409). Ausente = desconhecido: a tela oferece e a mensagem do servidor aparece (isVoidedChargeReopenBlocked).
+     */
+    ownChargeVoided?: boolean;
     contract?: {
         id: string;
         name: string;
@@ -713,6 +1029,17 @@ export interface Contract extends Partial<ContractCancellationInfo>, Partial<Con
     accessMode?: 'FULL' | 'PROGRESSIVE' | null;
     customCreditsRemaining?: number | null;
     addonUsage?: Record<string, { limit: number, used: number }>;
+    /**
+     * ATU5-03 — só em GET /contracts (equipe): cobranças em aberto (PENDING/FAILED) do contrato. No avulso são as da
+     * própria sessão: sem a baixa, cancelar o contrato com cobrança em aberto é recusado (403).
+     */
+    openChargeCount?: number;
+    /**
+     * R7 (AUDFIN6-01/ATU6-02) — só em GET /contracts (equipe): as cobranças em aberto que cancelar o contrato (ou decidir o
+     * pedido de cancelamento) só anula COM a baixa — no avulso, todas (= openChargeCount); nos outros tipos, a cobrança
+     * própria de uma gravação (cobrada à parte). > 0 sem a baixa → 403. Ausente = desconhecido (contractCancelRules).
+     */
+    openSessionChargeCount?: number;
 }
 /** Payment.metadata (só GET /contracts/:id devolve o objeto inteiro; as telas do cliente recebem apenas `kind`). */
 export interface PaymentMetadata {
@@ -760,6 +1087,11 @@ export type AdminContract = WithRequired<Contract, keyof ContractCancellationInf
 export interface ContractWithStats extends WithRequired<Contract, keyof ContractCancellationInfo | 'alreadyRenewed'> {
     completedBookings: number;
     totalBookings: number;
+    /**
+     * AUDFIN-05 — só no FIXO: vagas do plano usadas pela MESMA regra do servidor (Reservado conta; a sessão EXTRA,
+     * criada com o teto já cheio, não). É o que decide se o cliente ainda agenda pelo plano.
+     */
+    planSessionsUsed?: number;
     _count: { bookings: number };
     payments: PaymentSummary[];
     bookings: ContractBooking[];
@@ -903,6 +1235,12 @@ export interface UserDeletionPreview {
     pending: { activeContracts: number; futureBookings: number; pendingPayments: number; pendingAmount: number };
     preserved: { paidPayments: number; paidAmount: number };
     accessories: { savedCards: number; pushSubscriptions: number; notifications: number; couponEligibilities: number; autoChargeEnabled: boolean };
+    /**
+     * AUDFIN-04: chaves que o acesso NÃO tem e que a exclusão exige (contratos.cancelar, contratos.multa, cobrancas.baixa
+     * — pelo que ela anularia). Não vazio = o DELETE responde 403; `blockedMessage` é o mesmo texto do 403.
+     */
+    missingPermissions?: string[];
+    blockedMessage?: string | null;
 }
 export interface UserDetail {
     id: string; email: string; name: string; phone: string | null; role: string;

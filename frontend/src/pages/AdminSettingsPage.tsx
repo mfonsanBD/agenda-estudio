@@ -14,9 +14,12 @@ import {
     Mail,
     ChevronLeft,
     ChevronRight,
+    Lock,
     type LucideIcon,
 } from 'lucide-react';
 import { useDragScroll } from '../hooks/useDragScroll';
+import { usePermission } from '../hooks/usePermission';
+import { SETTINGS_SECTION_PERMISSIONS } from '../constants/permissions';
 import AdminPageHeader from '../components/admin/AdminPageHeader';
 import Tooltip from '../components/ui/Tooltip';
 import SettingsBusinessConfigSection from '../components/admin/settings/SettingsBusinessConfigSection';
@@ -38,17 +41,27 @@ type SectionId =
     | 'email'
     | 'integracoes';
 
+/** O que o acesso de quem está vendo libera DENTRO de uma seção (hoje: as taxas de gateway de Preços e regras). */
+interface SectionContext {
+    /** Taxas de gateway (grupo `gateway` + histórico): exclusivas do ADMIN (`config.taxas`). */
+    canEditGatewayFees: boolean;
+}
+
 interface SectionDef {
     id: SectionId;
     label: string;
     icon: LucideIcon;
-    render: () => React.ReactNode;
+    render: (ctx: SectionContext) => React.ReactNode;
 }
 
 /**
  * Each section is fully self-contained (owns its own fetch + dirty flag +
  * save bar). Switching sections unmounts the previous one — there is no
  * shared cross-section state, mirroring the legacy per-tab behavior.
+ *
+ * Equipe (D2): cada seção abre com a sua chave (`SETTINGS_SECTION_PERMISSIONS`: config.gerais, …); a
+ * página lista só as permitidas. E-mail, Integrações e as Taxas de gateway são exclusivas do ADMIN — o
+ * colaborador vê as taxas em cinza, "só o administrador", dentro de Preços e regras.
  */
 const SECTIONS: SectionDef[] = [
     {
@@ -65,7 +78,7 @@ const SECTIONS: SectionDef[] = [
     },
     {
         id: 'horarios',
-        label: 'Horários',
+        label: 'Horários & Grade',
         icon: Clock,
         render: () => (
             <SettingsBusinessConfigSection
@@ -77,17 +90,30 @@ const SECTIONS: SectionDef[] = [
     },
     {
         id: 'financeiro',
-        label: 'Financeiro',
+        // EQ-REQ-03: o nome do catálogo (config.precos) — "Financeiro" confundia com o módulo "Financeiro e receita".
+        label: 'Preços e regras',
         icon: Wallet,
-        render: () => (
+        render: ({ canEditGatewayFees }) => (
             <div style={{ display: 'grid', gap: '32px' }}>
                 <SettingsTiersSection />
-                <SettingsBusinessConfigSection
-                    groups={['plans', 'gateway', 'payments']}
-                    title="Planos, Taxas & Gateway"
-                    subtitle="Descontos por fidelidade, taxas de cartão/PIX e taxas de gateway."
-                    stackedSaveBar
-                />
+                {canEditGatewayFees ? (
+                    <SettingsBusinessConfigSection
+                        groups={['plans', 'gateway', 'payments']}
+                        title="Planos, Taxas & Gateway"
+                        subtitle="Descontos por fidelidade, taxas de cartão/PIX e taxas de gateway."
+                        stackedSaveBar
+                    />
+                ) : (
+                    // Colaborador com "Preços e regras": sem o grupo gateway (o servidor nem o envia);
+                    // as taxas aparecem em cinza, "só o administrador".
+                    <SettingsBusinessConfigSection
+                        groups={['plans', 'payments']}
+                        adminOnlyGroups={['gateway']}
+                        title="Planos & Taxas"
+                        subtitle="Descontos por fidelidade e taxas de cartão/PIX."
+                        stackedSaveBar
+                    />
+                )}
             </div>
         ),
     },
@@ -111,7 +137,7 @@ const SECTIONS: SectionDef[] = [
     },
     {
         id: 'pagamentos',
-        label: 'Pagamentos',
+        label: 'Formas de pagamento',
         icon: CreditCard,
         render: () => <SettingsPaymentMethodsSection />,
     },
@@ -158,13 +184,21 @@ const DEFAULT_SECTION: SectionId = 'gerais';
 export default function AdminSettingsPage() {
     const [searchParams, setSearchParams] = useSearchParams();
     const { ref: railRef, showLeft, showRight, scrollByPage } = useDragScroll<HTMLElement>();
+    const { can, isAdmin } = usePermission();
 
-    const activeId: SectionId = useMemo(() => {
+    // Só as seções que o acesso libera (o SettingsSectionGuard do App já tira a pessoa de ?sec= proibido;
+    // aqui a trilha e o conteúdo também não mostram o que ela não abre).
+    const sections = useMemo(() => SECTIONS.filter(s => can(SETTINGS_SECTION_PERMISSIONS[s.id])), [can]);
+    const ctx: SectionContext = { canEditGatewayFees: can('config.taxas') };
+
+    const activeId: SectionId | null = useMemo(() => {
         const sec = searchParams.get('sec') as SectionId | null;
-        return SECTIONS.some(s => s.id === sec) ? (sec as SectionId) : DEFAULT_SECTION;
-    }, [searchParams]);
+        if (sec && sections.some(s => s.id === sec)) return sec;
+        if (sections.some(s => s.id === DEFAULT_SECTION)) return DEFAULT_SECTION;
+        return sections[0]?.id ?? null;
+    }, [searchParams, sections]);
 
-    const active = SECTIONS.find(s => s.id === activeId) ?? SECTIONS[0];
+    const active = sections.find(s => s.id === activeId) ?? sections[0] ?? null;
 
     const goToSection = (id: SectionId) => {
         setSearchParams(prev => {
@@ -205,7 +239,7 @@ export default function AdminSettingsPage() {
                         className="admin-settings-rail admin-settings-rail--mobile-only scrollrow-track"
                         aria-label="Seções de configurações"
                     >
-                        {SECTIONS.map(section => {
+                        {sections.map(section => {
                             const Icon = section.icon;
                             const isActive = section.id === activeId;
                             return (
@@ -241,7 +275,21 @@ export default function AdminSettingsPage() {
 
                 {/* ── Active section only ── */}
                 <div className="admin-settings-panel">
-                    {active.render()}
+                    {active
+                        ? active.render(ctx)
+                        : (
+                            <div style={{ padding: 24, borderRadius: 16, textAlign: 'center', background: 'var(--bg-secondary)', border: '1px solid var(--border-color)', color: 'var(--text-muted)', fontSize: '0.8125rem' }}>
+                                Seu acesso não libera nenhuma seção das Configurações. Fale com o administrador.
+                            </div>
+                        )}
+                    {/* Colaborador: o que é exclusivo do administrador aparece em cinza, para ninguém procurar
+                        (as Taxas de gateway aparecem em cinza dentro da própria seção Preços e regras). */}
+                    {!isAdmin && (
+                        <p role="note" style={{ display: 'flex', alignItems: 'center', gap: 6, margin: '28px 0 0', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                            <Lock size={13} aria-hidden="true" style={{ flexShrink: 0 }} />
+                            <span>E-mail (SMTP) e Integrações (Stripe, Sicoob e Cora): só o administrador.</span>
+                        </p>
+                    )}
                 </div>
             </div>
         </div>

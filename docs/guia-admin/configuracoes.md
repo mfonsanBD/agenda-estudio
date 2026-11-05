@@ -1,8 +1,8 @@
 # Configurações
 
-> Rota: **`/admin/configuracoes`** · Menu: **Configurações** · Acesso: Admin
+> Rota: **`/admin/configuracoes`** · Menu: **Configurações** · Acesso: administrador (todas as seções) e colaborador (só as seções marcadas — ver [Acesso da equipe](#acesso-da-equipe))
 
-Página única com **7 seções** que controlam as regras do negócio. Cada seção tem seu próprio botão de salvar e detecta alterações não salvas. Você pode chegar direto numa seção pela query string `?sec=<seção>` (ex.: `?sec=financeiro`). As rotas antigas `/admin/pricing`, `/admin/services` e `/admin/integrations` redirecionam para as seções correspondentes.
+Página única com **10 seções** que controlam as regras do negócio, na ordem do menu: Gerais, Horários & Grade, Preços e regras, Políticas, Serviços, Formas de pagamento, Ambiente, Gravações, E-mail e Integrações (as numeradas abaixo, mais as de [Outras seções](#outras-seções)). Cada seção tem seu próprio botão de salvar e detecta alterações não salvas. Você pode chegar direto numa seção pela query string `?sec=<seção>` (ex.: `?sec=financeiro`). As rotas antigas `/admin/pricing`, `/admin/services` e `/admin/integrations` redirecionam para as seções correspondentes.
 
 ## 1. Gerais (`?sec=gerais`)
 Dados do estúdio: nome, logo, e-mail e informações de contato.
@@ -10,17 +10,17 @@ Dados do estúdio: nome, logo, e-mail e informações de contato.
 ![Gerais](../images/admin/config-01-gerais.png)
 <!-- TODO screenshot: seção Gerais -->
 
-## 2. Horários (`?sec=horarios`)
+## 2. Horários & Grade (`?sec=horarios`)
 Faixas de horário, rótulos de intervalo, dias de operação e duração do bloco. As constantes base (09:00–23:00, slots de 30 min, seg–sáb) estão em `config.studio` ([setup-dev.md](../tecnico/setup-dev.md)).
 
 ![Horários](../images/admin/config-02-horarios.png)
 <!-- TODO screenshot: seção Horários -->
 
-## 3. Financeiro (`?sec=financeiro`)
+## 3. Preços e regras (`?sec=financeiro`)
 Preços por **tier** (Comercial/Audiência/Sábado), descontos de fidelidade e taxas (cartão/PIX/boleto).
 
 - **Preço do Pacote 2h** (por faixa): campo em R$ (ver [Campos em R$](#campos-em-r)). A prévia "Preços com Desconto" do card acompanha o valor enquanto você digita. Nada é gravado até clicar em **Salvar Alterações**; **Descartar** volta ao valor salvo.
-- **Taxas de Gateway**: as taxas fixas (Stripe por transação, Cora por cobrança) aparecem em R$ (ex.: R$ 0,39). Por baixo continuam gravadas em centavos, então o histórico de taxas e o relatório financeiro não mudam. As taxas percentuais continuam com o campo −/+ e o sufixo %.
+- **Taxas de Gateway**: as taxas fixas (Stripe por transação, Cora por cobrança) aparecem em R$ (ex.: R$ 0,39). Por baixo continuam gravadas em centavos, então o histórico de taxas e o relatório financeiro não mudam. As taxas percentuais continuam com o campo −/+ e o sufixo %. **Só o administrador** edita as taxas de gateway: o colaborador com esta seção vê "Planos & Taxas" (descontos e taxas de cartão/PIX) e as taxas de gateway num cartão cinza, "só o administrador".
 
 ![Financeiro](../images/admin/config-03-financeiro.png)
 <!-- TODO screenshot: seção Financeiro com preços e descontos -->
@@ -41,7 +41,7 @@ O selo do card mostra o **nome** do serviço (ex.: "GESTÃO DE REDES SOCIAIS") e
 ![Serviços](../images/admin/config-05-servicos.png)
 <!-- TODO screenshot: seção Serviços (add-ons) -->
 
-## 6. Pagamentos (`?sec=pagamentos`)
+## 6. Formas de pagamento (`?sec=pagamentos`)
 Habilita/desabilita métodos (PIX, Cartão, Boleto), define rótulos, ordem e em quais **contextos** cada método aparece (`avulso,contract,invoice`).
 
 **Aceitar pagamento por boleto** — é a chave única do boleto:
@@ -78,6 +78,12 @@ Credenciais das integrações de pagamento (**Stripe** e **Cora**), com ambiente
 ![Integrações](../images/admin/config-07-integracoes.png)
 <!-- TODO screenshot: seção Integrações (chaves MASCARADAS) -->
 
+## Outras seções
+
+- **Ambiente** (`?sec=ambiente`): a animação por aba e o clima/dia-noite no topo das telas do cliente (defina a cidade do clima).
+- **Gravações** (`?sec=gravacoes`): liga ou desliga as plataformas de transmissão oferecidas ao cliente.
+- **E-mail** (`?sec=email`): o envio de e-mails (SMTP), com o botão de teste. Só o administrador.
+
 ## Campos em R$
 
 Todos os valores em dinheiro do painel usam o mesmo campo, que funciona como app de banco:
@@ -103,6 +109,25 @@ Na edição, o código não muda, e você pode clicar numa etapa no topo para ir
 - Cada seção **salva separadamente** — confira o aviso de "alterações não salvas" antes de trocar de seção.
 - Mudanças de **preço/desconto** valem para **novos** contratos/agendamentos; não recobram os existentes.
 - A configuração pública (preços, métodos, business config) é exposta por endpoints `GET .../public` consumidos pelo frontend (ver [API](../tecnico/api.md)).
+
+## Acesso da equipe
+
+Na tela **Equipe**, Configurações não tem nível: é **uma caixa por seção** (mais "Marcar todas"). O colaborador vê no menu e na página **só as seções marcadas**; abrir pelo endereço uma seção não liberada leva à primeira liberada, com o aviso "Você não tem acesso a essa seção das Configurações.".
+
+| Seção | Caixa na tela Equipe |
+|---|---|
+| Gerais (aparece no site para os clientes) | **Gerais** |
+| Horários & Grade | **Horários & Grade** |
+| Preços e regras (planos e pagamentos; sem as taxas de gateway) | **Preços e regras** |
+| Políticas | **Políticas** |
+| Serviços | **Serviços** |
+| Formas de pagamento (inclui a chave do boleto) | **Formas de pagamento** |
+| Ambiente | **Ambiente** |
+| Gravações | **Gravações** |
+| E-mail, Integrações e taxas de gateway | só o administrador (aparecem em cinza na tela Equipe) |
+
+- Para o colaborador, o pé da página mostra "E-mail (SMTP) e Integrações (Stripe, Sicoob e Cora): só o administrador.".
+- Salvar é **tudo ou nada**: se a gravação tocar uma parte que a pessoa não pode alterar, aparece "Você não tem permissão para alterar: … Nada foi salvo.".
 
 ## Ver também
 

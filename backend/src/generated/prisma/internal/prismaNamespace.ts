@@ -385,6 +385,7 @@ type FieldRefInputType<Model, FieldType> = Model extends never ? never : FieldRe
 
 export const ModelName = {
   User: 'User',
+  StaffProfile: 'StaffProfile',
   PushSubscription: 'PushSubscription',
   Contract: 'Contract',
   Booking: 'Booking',
@@ -418,7 +419,7 @@ export type TypeMap<ExtArgs extends runtime.Types.Extensions.InternalArgs = runt
     omit: GlobalOmitOptions
   }
   meta: {
-    modelProps: "user" | "pushSubscription" | "contract" | "booking" | "payment" | "coupon" | "couponEligibleUser" | "couponRedemption" | "savedPaymentMethod" | "blockedSlot" | "pricingConfig" | "addOnConfig" | "businessConfig" | "gatewayFeeHistory" | "paymentMethodConfig" | "auditLog" | "integrationConfig" | "notification" | "notificationTemplate"
+    modelProps: "user" | "staffProfile" | "pushSubscription" | "contract" | "booking" | "payment" | "coupon" | "couponEligibleUser" | "couponRedemption" | "savedPaymentMethod" | "blockedSlot" | "pricingConfig" | "addOnConfig" | "businessConfig" | "gatewayFeeHistory" | "paymentMethodConfig" | "auditLog" | "integrationConfig" | "notification" | "notificationTemplate"
     txIsolationLevel: TransactionIsolationLevel
   }
   model: {
@@ -493,6 +494,80 @@ export type TypeMap<ExtArgs extends runtime.Types.Extensions.InternalArgs = runt
         count: {
           args: Prisma.UserCountArgs<ExtArgs>
           result: runtime.Types.Utils.Optional<Prisma.UserCountAggregateOutputType> | number
+        }
+      }
+    }
+    StaffProfile: {
+      payload: Prisma.$StaffProfilePayload<ExtArgs>
+      fields: Prisma.StaffProfileFieldRefs
+      operations: {
+        findUnique: {
+          args: Prisma.StaffProfileFindUniqueArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$StaffProfilePayload> | null
+        }
+        findUniqueOrThrow: {
+          args: Prisma.StaffProfileFindUniqueOrThrowArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$StaffProfilePayload>
+        }
+        findFirst: {
+          args: Prisma.StaffProfileFindFirstArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$StaffProfilePayload> | null
+        }
+        findFirstOrThrow: {
+          args: Prisma.StaffProfileFindFirstOrThrowArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$StaffProfilePayload>
+        }
+        findMany: {
+          args: Prisma.StaffProfileFindManyArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$StaffProfilePayload>[]
+        }
+        create: {
+          args: Prisma.StaffProfileCreateArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$StaffProfilePayload>
+        }
+        createMany: {
+          args: Prisma.StaffProfileCreateManyArgs<ExtArgs>
+          result: BatchPayload
+        }
+        createManyAndReturn: {
+          args: Prisma.StaffProfileCreateManyAndReturnArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$StaffProfilePayload>[]
+        }
+        delete: {
+          args: Prisma.StaffProfileDeleteArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$StaffProfilePayload>
+        }
+        update: {
+          args: Prisma.StaffProfileUpdateArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$StaffProfilePayload>
+        }
+        deleteMany: {
+          args: Prisma.StaffProfileDeleteManyArgs<ExtArgs>
+          result: BatchPayload
+        }
+        updateMany: {
+          args: Prisma.StaffProfileUpdateManyArgs<ExtArgs>
+          result: BatchPayload
+        }
+        updateManyAndReturn: {
+          args: Prisma.StaffProfileUpdateManyAndReturnArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$StaffProfilePayload>[]
+        }
+        upsert: {
+          args: Prisma.StaffProfileUpsertArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$StaffProfilePayload>
+        }
+        aggregate: {
+          args: Prisma.StaffProfileAggregateArgs<ExtArgs>
+          result: runtime.Types.Utils.Optional<Prisma.AggregateStaffProfile>
+        }
+        groupBy: {
+          args: Prisma.StaffProfileGroupByArgs<ExtArgs>
+          result: runtime.Types.Utils.Optional<Prisma.StaffProfileGroupByOutputType>[]
+        }
+        count: {
+          args: Prisma.StaffProfileCountArgs<ExtArgs>
+          result: runtime.Types.Utils.Optional<Prisma.StaffProfileCountAggregateOutputType> | number
         }
       }
     }
@@ -1899,6 +1974,17 @@ export const UserScalarFieldEnum = {
 export type UserScalarFieldEnum = (typeof UserScalarFieldEnum)[keyof typeof UserScalarFieldEnum]
 
 
+export const StaffProfileScalarFieldEnum = {
+  userId: 'userId',
+  title: 'title',
+  permissions: 'permissions',
+  createdAt: 'createdAt',
+  updatedAt: 'updatedAt'
+} as const
+
+export type StaffProfileScalarFieldEnum = (typeof StaffProfileScalarFieldEnum)[keyof typeof StaffProfileScalarFieldEnum]
+
+
 export const PushSubscriptionScalarFieldEnum = {
   id: 'id',
   userId: 'userId',
@@ -2647,6 +2733,7 @@ export type PrismaClientOptions = ({
 }
 export type GlobalOmitConfig = {
   user?: Prisma.UserOmit
+  staffProfile?: Prisma.StaffProfileOmit
   pushSubscription?: Prisma.PushSubscriptionOmit
   contract?: Prisma.ContractOmit
   booking?: Prisma.BookingOmit

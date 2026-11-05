@@ -1,12 +1,17 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
-import { authenticate, authorize } from '../../middleware/auth.js';
+import { authenticate } from '../../middleware/auth.js';
+import { requirePermission } from '../../middleware/permissions.js';
+import { getStaffRecipientIds } from '../../lib/staffRecipients.js';
 import { releaseMultiSlotLock } from '../../lib/redis.js';
 import { stripeGetPaymentIntent } from '../../lib/stripeService.js';
 import { getPackageSlots } from '../../utils/pricing.js';
 import { BookingStatus } from '../../generated/prisma/client.js';
-import { restoreCredit, voidExtrasOfCancelledBooking, voidedExtrasNote } from './booking.service.js';
+import {
+    restoreCredit, voidExtrasOfCancelledBooking, voidedExtrasNote, sessionChargeState, sessionAwaitsOwnPayment, awaitsOwnPayment,
+    withOpenChargeCountOne,
+} from './booking.service.js';
 import { syncContractCompletion } from '../../lib/contractCompletion.js';
 import { notifyEvent } from '../notifications/notificationService.js';
 import { completeBookingSchema } from './validators.js';
@@ -60,6 +65,7 @@ router.post('/:id/complete-payment', authenticate, async (req: Request, res: Res
         }
 
         // Security: verify the PaymentIntent with Stripe BEFORE updating booking
+        let bookingPaymentId: string;
         try {
             const pi = await stripeGetPaymentIntent(paymentIntentId);
             if (pi.status !== 'succeeded') {
@@ -93,19 +99,27 @@ router.post('/:id/complete-payment', authenticate, async (req: Request, res: Res
                 res.status(400).json({ error: 'Valor do pagamento não confere.' });
                 return;
             }
+            bookingPaymentId = bookingPayment.id;
         } catch {
             res.status(400).json({ error: 'Não foi possível verificar o pagamento no Stripe.' });
             return;
         }
 
+        // ATU-02/R5: o PaymentIntent pago é de OUTRA cobrança da reserva (um serviço extra) e a cobrança da PRÓPRIA
+        // sessão segue sem pagar → o pagamento é registrado (e os efeitos rodam), mas a sessão não vira Confirmada —
+        // a mesma regra do /confirm (402): sessionAwaitsOwnPayment, contando como PAGO o Payment deste PaymentIntent.
+        const sessionChargeOpen = await sessionAwaitsOwnPayment(booking, { assumePaidId: bookingPaymentId });
+
         // Update booking to CONFIRMED (AFTER payment verification)
-        const updated = await prisma.booking.update({
-            where: { id: bookingId },
-            data: {
-                status: 'CONFIRMED' as BookingStatus,
-                holdExpiresAt: null,
-            },
-        });
+        const updated = sessionChargeOpen
+            ? booking
+            : await prisma.booking.update({
+                where: { id: bookingId },
+                data: {
+                    status: 'CONFIRMED' as BookingStatus,
+                    holdExpiresAt: null,
+                },
+            });
 
         // Update Payment record to PAID (atomic — only if still PENDING)
         const paid = await prisma.payment.updateMany({
@@ -153,7 +167,9 @@ router.post('/:id/complete-payment', authenticate, async (req: Request, res: Res
                 status: updated.status,
                 price: updated.price,
             },
-            message: '✅ Pagamento confirmado! Seu horário está reservado.',
+            message: sessionChargeOpen
+                ? 'Pagamento confirmado. A sessão continua aguardando o pagamento da cobrança dela (em Meus pagamentos).'
+                : '✅ Pagamento confirmado! Seu horário está reservado.',
         });
     } catch (err) {
         console.error('[BOOKING] complete-payment error:', err);
@@ -169,6 +185,7 @@ router.patch('/:id/confirm', authenticate, async (req: Request, res: Response) =
 
     const booking = await prisma.booking.findFirst({
         where: { id, userId, status: BookingStatus.RESERVED },
+        include: { contract: { select: { type: true } } },
     });
 
     if (!booking) {
@@ -176,16 +193,20 @@ router.patch('/:id/confirm', authenticate, async (req: Request, res: Response) =
         return;
     }
 
-    // VULN-C2 FIX: Avulso bookings (with holdExpiresAt) MUST have a PAID payment
-    // Contract-based bookings (no hold timer) can confirm directly via credit consumption
-    if (booking.holdExpiresAt) {
-        const hasPaidPayment = await prisma.payment.findFirst({
-            where: { bookingId: id, status: 'PAID' },
+    // R5 (pagamento DA SESSÃO — booking.service.sessionAwaitsOwnPayment):
+    //  • sessão com cobrança MARCADA (metadata.sessionCharge: SERVIÇO, FIXO acima do teto, avulso/sessão cobrada
+    //    pela equipe — R4 ATK-03/FIN-05): só confirma com essa cobrança paga (nenhuma marcada em aberto);
+    //  • avulso sem a marca (do próprio cliente, com ou sem hold — VULN-C2/DIN-05): exige o PAGAMENTO DA GRAVAÇÃO
+    //    pago — a compra de um extra paga não conta;
+    //  • sessão de plano sem cobrança própria: confirma (extras em aberto não a seguram).
+    const ownCharge = await sessionChargeState(id);
+    if (awaitsOwnPayment(ownCharge, { holdExpiresAt: booking.holdExpiresAt, contractType: booking.contract?.type })) {
+        res.status(402).json({
+            error: booking.contract?.type === 'AVULSO' || (!!booking.holdExpiresAt && !ownCharge.marked)
+                ? 'Pagamento obrigatório para confirmar agendamento avulso.'
+                : 'Pagamento obrigatório para confirmar esta sessão.',
         });
-        if (!hasPaidPayment) {
-            res.status(402).json({ error: 'Pagamento obrigatório para confirmar agendamento avulso.' });
-            return;
-        }
+        return;
     }
 
     // Confirm booking
@@ -211,18 +232,23 @@ router.patch('/:id/confirm', authenticate, async (req: Request, res: Response) =
         message: 'Agendamento confirmado com sucesso!',
     });
 
-    // Instant push: notify admin that a booking was confirmed
-    const admins = await prisma.user.findMany({ where: { role: 'ADMIN' }, select: { id: true } });
-    const clientName = (await prisma.user.findUnique({ where: { id: booking.userId }, select: { name: true } }))?.name || 'Cliente';
-    const bookingDate = booking.date.toISOString().split('T')[0];
-    const [dd, mm] = [bookingDate.slice(8, 10), bookingDate.slice(5, 7)];
-    for (const admin of admins) {
-        notifyEvent('admin_booking_confirmed', {
-            userId: admin.id,
-            vars: { cliente: clientName, data: `${dd}/${mm}`, hora: booking.startTime },
-            entityType: 'BOOKING',
-            entityId: booking.id,
-        }).catch(() => {});
+    // Aviso instantâneo à equipe (ADMIN + COLABORADOR com a permissão do evento; nunca BLOCKED nem
+    // excluído — staffRecipients). A resposta já foi enviada: falha aqui só perde o aviso.
+    try {
+        const staffIds = await getStaffRecipientIds('admin_booking_confirmed');
+        const clientName = (await prisma.user.findUnique({ where: { id: booking.userId }, select: { name: true } }))?.name || 'Cliente';
+        const bookingDate = booking.date.toISOString().split('T')[0];
+        const [dd, mm] = [bookingDate.slice(8, 10), bookingDate.slice(5, 7)];
+        for (const staffId of staffIds) {
+            notifyEvent('admin_booking_confirmed', {
+                userId: staffId,
+                vars: { cliente: clientName, data: `${dd}/${mm}`, hora: booking.startTime },
+                entityType: 'BOOKING',
+                entityId: booking.id,
+            }).catch(() => {});
+        }
+    } catch (err) {
+        console.error('[BOOKING] Falha ao avisar a equipe da confirmação:', err);
     }
 });
 
@@ -264,22 +290,27 @@ router.put('/:id/client-cancel', authenticate, async (req: Request, res: Respons
         }
         await syncContractCompletion(booking.contractId, userId);
 
-        // Gravação de plano cancelada: a cobrança em aberto dos EXTRAS dela deixa de ser devida
-        // (best-effort; avulso não entra — ver voidExtrasOfCancelledBooking).
+        // Gravação cancelada pelo cliente: a cobrança em aberto dela (a dos EXTRAS e a da própria sessão, inclusive a do
+        // avulso desde a R5) deixa de ser devida (best-effort — ver voidExtrasOfCancelledBooking).
         const voidedExtras = await voidExtrasOfCancelledBooking(id, booking.contractId);
 
-        // Instant push: notify admin of cancellation
-        const admins = await prisma.user.findMany({ where: { role: 'ADMIN' }, select: { id: true } });
-        const clientName = (await prisma.user.findUnique({ where: { id: booking.userId }, select: { name: true } }))?.name || 'Cliente';
-        const cancelDate = booking.date.toISOString().split('T')[0];
-        const [cdd, cmm] = [cancelDate.slice(8, 10), cancelDate.slice(5, 7)];
-        for (const admin of admins) {
-            notifyEvent('admin_booking_cancelled', {
-                userId: admin.id,
-                vars: { cliente: clientName, data: `${cdd}/${cmm}`, hora: booking.startTime },
-                entityType: 'BOOKING',
-                entityId: booking.id,
-            }).catch(() => {});
+        // Aviso instantâneo à equipe (ADMIN + COLABORADOR com a permissão do evento; nunca BLOCKED nem
+        // excluído — staffRecipients). O cancelamento já foi gravado: falha aqui só perde o aviso.
+        try {
+            const staffIds = await getStaffRecipientIds('admin_booking_cancelled');
+            const clientName = (await prisma.user.findUnique({ where: { id: booking.userId }, select: { name: true } }))?.name || 'Cliente';
+            const cancelDate = booking.date.toISOString().split('T')[0];
+            const [cdd, cmm] = [cancelDate.slice(8, 10), cancelDate.slice(5, 7)];
+            for (const staffId of staffIds) {
+                notifyEvent('admin_booking_cancelled', {
+                    userId: staffId,
+                    vars: { cliente: clientName, data: `${cdd}/${cmm}`, hora: booking.startTime },
+                    entityType: 'BOOKING',
+                    entityId: booking.id,
+                }).catch(() => {});
+            }
+        } catch (err) {
+            console.error('[BOOKING] Falha ao avisar a equipe do cancelamento:', err);
         }
 
         res.json({ message: `Agendamento cancelado com sucesso. O crédito retornou ao seu plano.${voidedExtrasNote(voidedExtras)}`, voidedExtras });
@@ -295,9 +326,9 @@ router.put('/:id/client-cancel', authenticate, async (req: Request, res: Respons
     }
 });
 
-// ─── PUT /api/bookings/:id/check-in (Admin) ─────────────
+// ─── PUT /api/bookings/:id/check-in (equipe — Hoje: confirmar presença) ─────────────
 
-router.put('/:id/check-in', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.put('/:id/check-in', authenticate, requirePermission('hoje.presenca'), async (req: Request, res: Response) => {
     const id = req.params.id as string;
     const booking = await prisma.booking.findUnique({ where: { id } });
     if (!booking) { res.status(404).json({ error: 'Agendamento não encontrado.' }); return; }
@@ -306,12 +337,12 @@ router.put('/:id/check-in', authenticate, authorize('ADMIN'), async (req: Reques
     }
     // Limpa o hold ao promover para CONFIRMED (evita que o cleanup varra uma reserva já com check-in).
     const updated = await prisma.booking.update({ where: { id }, data: { status: BookingStatus.CONFIRMED, holdExpiresAt: null } });
-    res.json({ booking: updated, message: '✅ Check-in realizado! Cliente presente.' });
+    res.json({ booking: await withOpenChargeCountOne(updated), message: '✅ Check-in realizado! Cliente presente.' });
 });
 
-// ─── PUT /api/bookings/:id/complete (Admin) ──────────────
+// ─── PUT /api/bookings/:id/complete (equipe — Hoje: operar a gravação) ──────────────
 
-router.put('/:id/complete', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.put('/:id/complete', authenticate, requirePermission('hoje.gravacao'), async (req: Request, res: Response) => {
     try {
         const id = req.params.id as string;
         const data = completeBookingSchema.parse(req.body || {});
@@ -369,7 +400,7 @@ router.put('/:id/complete', authenticate, authorize('ADMIN'), async (req: Reques
                 if (!current) { res.status(404).json({ error: 'Agendamento não encontrado.' }); return; }
                 // Duplo clique / outro operador já finalizou: idempotente, sem regravar nada.
                 if (current.status === BookingStatus.COMPLETED) {
-                    res.json({ booking: current, message: '🏁 Sessão finalizada com sucesso!' });
+                    res.json({ booking: await withOpenChargeCountOne(current), message: '🏁 Sessão finalizada com sucesso!' });
                     return;
                 }
                 res.status(409).json({
@@ -382,7 +413,7 @@ router.put('/:id/complete', authenticate, authorize('ADMIN'), async (req: Reques
         }
         // D6: gravação finalizada → o contrato pode estar concluído (avulso sempre; plano se não resta nada).
         await syncContractCompletion(booking.contractId, req.user!.userId);
-        res.json({ booking: updated, message: '🏁 Sessão finalizada com sucesso!' });
+        res.json({ booking: await withOpenChargeCountOne(updated), message: '🏁 Sessão finalizada com sucesso!' });
     } catch (err) {
         if (err instanceof z.ZodError) { res.status(400).json({ error: 'Dados inválidos.', details: err.errors }); return; }
         throw err;
@@ -392,11 +423,11 @@ router.put('/:id/complete', authenticate, authorize('ADMIN'), async (req: Reques
 // Falta é registrada via PATCH /:id (status=FALTA + statusReason) — todo no-show carrega um motivo.
 // A antiga rota reason-less /mark-falta foi removida para não abrir uma porta lateral sem motivo.
 
-// ─── PUT /api/bookings/:id/start-recording (Admin) ──────
+// ─── PUT /api/bookings/:id/start-recording (equipe — Hoje: operar a gravação) ──────
 // O operador clica em "Iniciar Gravação" — registra QUEM operou e QUANDO. Marca que houve alguém
 // presente e é pré-requisito para finalizar (ver o guard em /:id/complete).
 
-router.put('/:id/start-recording', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.put('/:id/start-recording', authenticate, requirePermission('hoje.gravacao'), async (req: Request, res: Response) => {
     const id = req.params.id as string;
     const booking = await prisma.booking.findUnique({ where: { id } });
     if (!booking) { res.status(404).json({ error: 'Agendamento não encontrado.' }); return; }
@@ -417,7 +448,7 @@ router.put('/:id/start-recording', authenticate, authorize('ADMIN'), async (req:
     }
     // Idempotente: se já foi iniciada, mantém o operador/horário original (não sobrescreve).
     if (booking.recordingStartedAt) {
-        res.json({ booking, message: 'Gravação já iniciada.' });
+        res.json({ booking: await withOpenChargeCountOne(booking), message: 'Gravação já iniciada.' });
         return;
     }
     const operator = await prisma.user.findUnique({ where: { id: req.user!.userId }, select: { name: true } });
@@ -429,15 +460,15 @@ router.put('/:id/start-recording', authenticate, authorize('ADMIN'), async (req:
             recordingStartedByName: operator?.name ?? null,
         },
     });
-    res.json({ booking: updated, message: '🔴 Gravação iniciada.' });
+    res.json({ booking: await withOpenChargeCountOne(updated), message: '🔴 Gravação iniciada.' });
 });
 
-// ─── PUT /api/bookings/:id/undo-start-recording (Admin) ─
+// ─── PUT /api/bookings/:id/undo-start-recording (equipe — Hoje: operar a gravação) ─
 // Desfaz um "Iniciar Gravação" clicado por engano: zera QUEM/QUANDO iniciou. O cliente deixa de ver o
 // selo "AO VIVO" (isRecordingNow) e a sessão volta a exigir "Iniciar Gravação" antes de finalizar.
 // Só em gravação CONFIRMED (iniciada e ainda NÃO finalizada); o registro anterior fica na auditoria.
 
-router.put('/:id/undo-start-recording', authenticate, authorize('ADMIN'), async (req: Request, res: Response) => {
+router.put('/:id/undo-start-recording', authenticate, requirePermission('hoje.gravacao'), async (req: Request, res: Response) => {
     const id = req.params.id as string;
     const booking = await prisma.booking.findUnique({ where: { id } });
     if (!booking) { res.status(404).json({ error: 'Agendamento não encontrado.' }); return; }
@@ -450,7 +481,7 @@ router.put('/:id/undo-start-recording', authenticate, authorize('ADMIN'), async 
     if (booking.status !== BookingStatus.CONFIRMED) { notUndoable(booking.status); return; }
     // Idempotente: nada iniciado → nada a desfazer (dois cliques, ou duas abas do painel).
     if (!booking.recordingStartedAt) {
-        res.json({ booking, message: 'A gravação não estava iniciada.' });
+        res.json({ booking: await withOpenChargeCountOne(booking), message: 'A gravação não estava iniciada.' });
         return;
     }
     // Escrita guardada pelo estado: se a finalização gravou ANTES (status → COMPLETED), o início não é
@@ -465,7 +496,7 @@ router.put('/:id/undo-start-recording', authenticate, authorize('ADMIN'), async 
     if (!current) { res.status(404).json({ error: 'Agendamento não encontrado.' }); return; }
     if (undone.count === 0) {
         if (current.status !== BookingStatus.CONFIRMED) { notUndoable(current.status); return; }
-        res.json({ booking: current, message: 'A gravação não estava iniciada.' });
+        res.json({ booking: await withOpenChargeCountOne(current), message: 'A gravação não estava iniciada.' });
         return;
     }
     await logAudit('BOOKING', id, 'RECORDING_START_UNDONE', req.user!.userId, {
@@ -473,7 +504,7 @@ router.put('/:id/undo-start-recording', authenticate, authorize('ADMIN'), async 
         recordingStartedById: booking.recordingStartedById,
         recordingStartedByName: booking.recordingStartedByName,
     });
-    res.json({ booking: current, message: 'Início da gravação desfeito.' });
+    res.json({ booking: await withOpenChargeCountOne(current), message: 'Início da gravação desfeito.' });
 });
 
 } // end registerStatusRoutes

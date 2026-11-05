@@ -1,9 +1,9 @@
 import { getErrorMessage } from '../utils/errors';
 import { useState, useMemo } from 'react';
-import { bookingsApi, BookingWithUser } from '../api/client';
+import { bookingsApi, BookingWithUser, ApiError } from '../api/client';
 import { useNavigate } from 'react-router-dom';
 import { useUI } from '../context/UIContext';
-import { ClipboardList, Search, FilterX, Pencil, Trash2, Clock, Moon, Ban } from 'lucide-react';
+import { ClipboardList, Search, FilterX, Pencil, Trash2, Clock, Moon, Ban, Lock } from 'lucide-react';
 import AdminPageHeader from '../components/admin/AdminPageHeader';
 import { HeroSkeleton, TableSkeleton } from '../components/ui/SkeletonLoader';
 import StatusBadge from '../components/ui/StatusBadge';
@@ -16,14 +16,27 @@ import EditBookingModal from '../components/admin/bookings/EditBookingModal';
 import StatusReasonModal, { type ReasonKind, type ReasonConfirmOptions } from '../components/admin/bookings/StatusReasonModal';
 import { MakeupStatusPanel } from '../components/admin/bookings/MakeupRescheduleModal';
 import { useBusinessConfig } from '../hooks/useBusinessConfig';
-import { buildReasonUpdate, reasonToastMessage } from '../utils/avulsoMakeup';
+import { buildReasonUpdate, reasonSaveFeedback, showReasonFeedback } from '../utils/avulsoMakeup';
 import { bookingSummary, cancelBookingConsequences, cancelBookingRequest, hardDeleteConsequences } from '../components/admin/bookings/bookingDanger';
+import { useBookingPermissions, cancelledReopenNeedsBaixaHint, CANCEL_OPEN_CHARGE_NEEDS_BAIXA, HARD_DELETE_OPEN_CHARGE_NEEDS_BAIXA } from '../components/admin/bookings/bookingPermissions';
 import CommitSelect from '../components/admin/CommitSelect';
+import { usePermission } from '../hooks/usePermission';
+
+/** Status oferecidos no seletor inline (HELD é interno do fluxo de pagamento). */
+const INLINE_STATUSES = Object.keys(BOOKING_STATUS_META).filter(key => key !== 'HELD');
 
 export default function AdminBookingsPage() {
     const navigate = useNavigate();
     const { showAlert, showConfirm, showToast } = useUI();
-    const { bookings, setBookings, users, loading, dateFilter, setDateFilter, statusFilter, setStatusFilter, reload } = useAdminBookings();
+    const { can } = usePermission();
+    // Botões e opções seguem a permissão (o servidor recusa o resto com 403).
+    const bp = useBookingPermissions();
+    // Receita consolidada só com "Financeiro e receita" (DECISÕES, resposta 3).
+    const canSeeRevenue = can('financeiro.ver');
+    // Coluna "Ações" só quando o acesso tem alguma ação de agendamento (Editar abre com data/horário ou
+    // com qualquer troca de status; Excluir com agendamentos.excluir).
+    const showActionsCol = bp.canHardDelete || bp.canEditSlot || bp.canFaltas || bp.canCancel || bp.canConfirmPresence || bp.canOperateRecording;
+    const { bookings, setBookings, users, loading, dateFilter, setDateFilter, statusFilter, setStatusFilter, reload } = useAdminBookings({ loadClients: bp.canCreate });
     const [searchQuery, setSearchQuery] = useState('');
 
     const [showCreate, setShowCreate] = useState(false);
@@ -31,7 +44,7 @@ export default function AdminBookingsPage() {
     // Falta / Não Realizado pelo select inline passam pelo modal de MOTIVO (e, no avulso, a falta justificada).
     const [reasonModal, setReasonModal] = useState<{ booking: BookingWithUser; kind: ReasonKind } | null>(null);
     const [savingReason, setSavingReason] = useState(false);
-    const { get: getRule } = useBusinessConfig();
+    useBusinessConfig(); // pré-carrega as regras (prazo da remarcação) que o modal de motivo mostra
 
     // D3: exclusão PERMANENTE (hard-delete) — diálogo de perigo com as consequências reais do backend.
     // Sem try/catch no onConfirm: o erro da API aparece dentro do diálogo.
@@ -41,7 +54,7 @@ export default function AdminBookingsPage() {
             icon: Trash2,
             title: 'Excluir agendamento permanentemente?',
             message: `${bookingSummary(b)}\n\nPara manter o registro no histórico, mude o status para "Cancelado" em vez de excluir.`,
-            consequences: hardDeleteConsequences(b),
+            consequences: hardDeleteConsequences(b, { canSettleCharges: bp.canSettleCharges }),
             confirmLabel: 'Excluir agendamento',
             loadingLabel: 'Excluindo…',
             onConfirm: async () => {
@@ -61,7 +74,7 @@ export default function AdminBookingsPage() {
             icon: Ban,
             title: 'Cancelar agendamento?',
             message: bookingSummary(b),
-            consequences: cancelBookingConsequences(b),
+            consequences: cancelBookingConsequences(b, { canSettleCharges: bp.canSettleCharges }),
             confirmLabel: 'Cancelar agendamento',
             loadingLabel: 'Cancelando…',
             onConfirm: async () => {
@@ -75,6 +88,8 @@ export default function AdminBookingsPage() {
 
     const handleInlineStatusChange = async (b: BookingWithUser, newStatus: string) => {
         const id = b.id;
+        // Rede de segurança: o seletor só oferece as transições permitidas.
+        if (newStatus !== b.status && !bp.canChangeStatus(b, newStatus)) return;
         // FALTA / NAO_REALIZADO exigem motivo (e, no avulso, decidir a falta justificada): abre o modal
         // em vez de gravar direto. O select controlado volta sozinho ao status atual até confirmar.
         if ((newStatus === 'FALTA' || newStatus === 'NAO_REALIZADO') && newStatus !== b.status) {
@@ -93,8 +108,19 @@ export default function AdminBookingsPage() {
             // A janela de remarcação do avulso pode mudar junto (ex.: Falta → Confirmado = remarcada).
             const u = res?.booking;
             const mk = u ? { makeupStatus: u.makeupStatus ?? null, makeupDeadline: u.makeupDeadline ?? null, missedDate: u.missedDate ?? null } : {};
-            setBookings(prev => prev.map(b => b.id === id ? { ...b, status: newStatus as any, ...mk } : b));
-        } catch (err: unknown) { showAlert({ message: getErrorMessage(err), type: 'error' }); }
+            // AUDFIN6-02 (espelho): a sessão reaberta sem cobrança não volta a ficar em aberto — a linha passa a saber.
+            const voided = res?.reopenedWithoutCharge ? { ownChargeVoided: true } : {};
+            setBookings(prev => prev.map(b => b.id === id ? { ...b, status: newStatus as any, ...mk, ...voided } : b));
+            // AUDFIN-01: reabriu (Concluído/Não realizado) uma sessão cuja cobrança foi anulada — o servidor avisa.
+            if (res?.reopenedWithoutCharge) showAlert({ type: 'warning', title: 'Sessão reaberta sem cobrança', message: res.message });
+        } catch (err: unknown) {
+            // AUDFIN6-02 (espelho): o servidor recusou a volta ao "em aberto" porque a cobrança foi anulada (409) — a
+            // mensagem dele aparece e a linha deixa de oferecer Reservado/Confirmado.
+            if (err instanceof ApiError && err.code === 'SESSION_CHARGE_VOIDED') {
+                setBookings(prev => prev.map(x => x.id === id ? { ...x, ownChargeVoided: true } : x));
+            }
+            showAlert({ message: getErrorMessage(err), type: 'error' });
+        }
     };
 
     const handleConfirmReason = async (reason: string, { justified }: ReasonConfirmOptions) => {
@@ -109,8 +135,10 @@ export default function AdminBookingsPage() {
             setBookings(prev => prev.map(x => x.id === booking.id ? {
                 ...x, status: kind, statusReason: u?.statusReason ?? reason,
                 makeupStatus: u?.makeupStatus ?? null, makeupDeadline: u?.makeupDeadline ?? null, missedDate: u?.missedDate ?? null,
+                ...(res?.reopenedWithoutCharge ? { ownChargeVoided: true } : {}),
             } : x));
-            showToast(reasonToastMessage(kind, { isAvulso, justified, bookingDate: booking.date, makeupDays: getRule('avulso_makeup_days') }));
+            // AUDFIN6-03/TELA6-01: o retorno segue a RESPOSTA (janela gravada / aviso da sessão sem cobrança).
+            showReasonFeedback(reasonSaveFeedback(kind, { isAvulso, justified }, res), { showToast, showAlert });
             setReasonModal(null);
         } catch (err: unknown) { showToast({ message: getErrorMessage(err) || 'Erro ao registrar.', type: 'error' }); }
         finally { setSavingReason(false); }
@@ -141,14 +169,14 @@ export default function AdminBookingsPage() {
                 icon={ClipboardList}
                 title="Agendamentos"
                 subtitle="Gerencie todos os agendamentos do estúdio"
-                actions={
+                actions={bp.canCreate ? (
                     <button className="btn-admin-go" onClick={() => setShowCreate(true)}>
                         <span style={{ fontSize: '1.1rem' }} aria-hidden="true">+</span> Novo Agendamento
                     </button>
-                }
+                ) : undefined}
             />
 
-            {/* --- KPI CARDS --- */}
+            {/* --- KPI CARDS --- (a "Receita" é consolidada: só com financeiro.ver) */}
             <div className="admin-kpi-grid">
                 <div className="admin-kpi-card admin-kpi-card--accent">
                     <div className="admin-kpi-card__label">Total</div>
@@ -170,11 +198,13 @@ export default function AdminBookingsPage() {
                     <div className="admin-kpi-card__value" style={kpis.cancelled > 0 ? { color: 'var(--danger)' } : undefined}>{kpis.cancelled}</div>
                     <div className="admin-kpi-card__caption">cancelados + faltas</div>
                 </div>
-                <div className="admin-kpi-card admin-kpi-card--success">
-                    <div className="admin-kpi-card__label" style={{ color: 'var(--success)' }}>Receita</div>
-                    <div className="admin-kpi-card__value admin-kpi-card__value--sm">{formatBRL(kpis.revenue)}</div>
-                    <div className="admin-kpi-card__caption">confirmados + concluídos</div>
-                </div>
+                {canSeeRevenue && (
+                    <div className="admin-kpi-card admin-kpi-card--success">
+                        <div className="admin-kpi-card__label" style={{ color: 'var(--success)' }}>Receita</div>
+                        <div className="admin-kpi-card__value admin-kpi-card__value--sm">{formatBRL(kpis.revenue)}</div>
+                        <div className="admin-kpi-card__caption">confirmados + concluídos</div>
+                    </div>
+                )}
             </div>
 
             {/* --- SEARCH + FILTERS --- */}
@@ -251,12 +281,17 @@ export default function AdminBookingsPage() {
                                         <th>Agendado em</th>
                                         <th style={{ textAlign: 'right' }}>Valor</th>
                                         <th style={{ textAlign: 'center' }}>Status</th>
-                                        <th style={{ textAlign: 'center' }}>Ações</th>
+                                        {showActionsCol && <th style={{ textAlign: 'center' }}>Ações</th>}
                                     </tr>
                                 </thead>
                                 <tbody>
                                     {filtered.map((b) => {
                                         const sc = getMeta(BOOKING_STATUS_META, b.status);
+                                        // Só as transições que o acesso permite (mesma tabela do servidor); sem
+                                        // nenhuma, o status vira um selo (nada a escolher).
+                                        const statusChoices = bp.statusOptions(b, INLINE_STATUSES.includes(b.status) ? INLINE_STATUSES : [b.status, ...INLINE_STATUSES]);
+                                        // Editar: data/horário (agendamentos.editar) ou alguma troca de status permitida.
+                                        const canOpenEdit = bp.canEditSlot || statusChoices.length > 1;
                                         const dateObj = new Date(b.date);
                                         const dayStr = dateObj.toLocaleDateString('pt-BR', { timeZone: 'UTC', weekday: 'short', day: '2-digit', month: '2-digit' });
                                         const createdStr = b.createdAt ? new Date(b.createdAt).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—';
@@ -274,13 +309,18 @@ export default function AdminBookingsPage() {
                                                             {b.user.name.charAt(0).toUpperCase()}
                                                         </div>
                                                         <div>
-                                                            <Tooltip content={`Abrir perfil de ${b.user.name}`}>
-                                                                <button type="button"
-                                                                    style={{ fontWeight: 600, fontSize: '0.875rem', cursor: 'pointer', color: 'var(--accent-text)', background: 'none', border: 'none', padding: 0, fontFamily: 'inherit', textAlign: 'left' }}
-                                                                    onClick={() => navigate(`/admin/clients/${b.user.id}`)}>
-                                                                    {b.user.name}
-                                                                </button>
-                                                            </Tooltip>
+                                                            {/* Perfil do cliente só com clientes.ver (senão o link cairia no redirecionamento). */}
+                                                            {bp.canOpenClient ? (
+                                                                <Tooltip content={`Abrir perfil de ${b.user.name}`}>
+                                                                    <button type="button"
+                                                                        style={{ fontWeight: 600, fontSize: '0.875rem', cursor: 'pointer', color: 'var(--accent-text)', background: 'none', border: 'none', padding: 0, fontFamily: 'inherit', textAlign: 'left' }}
+                                                                        onClick={() => navigate(`/admin/clients/${b.user.id}`)}>
+                                                                        {b.user.name}
+                                                                    </button>
+                                                                </Tooltip>
+                                                            ) : (
+                                                                <span style={{ fontWeight: 600, fontSize: '0.875rem', color: 'var(--text-primary)' }}>{b.user.name}</span>
+                                                            )}
                                                             {b.user.email && (
                                                                 <div style={{ fontSize: '0.6875rem', color: 'var(--text-muted)', marginTop: '1px' }}>
                                                                     {b.user.email}
@@ -322,6 +362,14 @@ export default function AdminBookingsPage() {
 
                                                 {/* Status - premium inline select */}
                                                 <td data-label="Status" style={{ textAlign: 'center' }}>
+                                                    {statusChoices.length <= 1 ? (
+                                                        // FIN-01/ATK-02: cancelada sem a baixa — o selo explica por que não reabre.
+                                                        bp.cancelledReopenNeedsBaixa(b) ? (
+                                                            <Tooltip content={cancelledReopenNeedsBaixaHint(b)}>
+                                                                <span tabIndex={0} style={{ display: 'inline-flex' }}><StatusBadge meta={sc} /></span>
+                                                            </Tooltip>
+                                                        ) : <StatusBadge meta={sc} />
+                                                    ) : (
                                                     <div style={{ display: 'inline-flex', alignItems: 'center', position: 'relative' }}>
                                                         {/* Animated dot */}
                                                         <span style={{
@@ -340,34 +388,65 @@ export default function AdminBookingsPage() {
                                                             className="admin-status-select"
                                                             style={{ color: sc.color }}
                                                         >
-                                                            {Object.entries(BOOKING_STATUS_META).filter(([key]) => key !== 'HELD').map(([key, cfg]) => (
-                                                                <option key={key} value={key} style={{ background: 'var(--sheet-bg)', color: cfg.color, padding: '6px' }}>{cfg.label}</option>
-                                                            ))}
+                                                            {statusChoices.map(key => {
+                                                                const cfg = getMeta(BOOKING_STATUS_META, key);
+                                                                return <option key={key} value={key} style={{ background: 'var(--sheet-bg)', color: cfg.color, padding: '6px' }}>{cfg.label}</option>;
+                                                            })}
                                                         </CommitSelect>
                                                     </div>
+                                                    )}
+                                                    {/* R5: com cobrança em aberto e sem a baixa, o "Cancelado" some do seletor — o selo
+                                                        explica (dica no mouse/teclado; no toque, o clique mostra o mesmo texto). */}
+                                                    {bp.cancelNeedsBaixa(b) && (
+                                                        <span className="mkp-chips">
+                                                            <Tooltip content={CANCEL_OPEN_CHARGE_NEEDS_BAIXA}>
+                                                                <button type="button" className="mkp-chip mkp-chip--muted"
+                                                                    aria-label={`Cancelar indisponível para ${b.user.name}: ver por quê`}
+                                                                    onClick={() => showAlert({ type: 'info', title: 'Cancelar indisponível', message: CANCEL_OPEN_CHARGE_NEEDS_BAIXA })}>
+                                                                    <Lock size={12} aria-hidden="true" /> Cancelar indisponível
+                                                                </button>
+                                                            </Tooltip>
+                                                        </span>
+                                                    )}
                                                     {/* Remarcação do avulso (D4/D5): "Remarcar até DD/MM" / "Justificar falta" / status. */}
                                                     <MakeupStatusPanel booking={b} clientName={b.user.name} layout="chips" onChanged={reload} />
                                                 </td>
 
-                                                {/* Actions */}
+                                                {/* Actions (cada uma com a sua permissão; sem nenhuma, a coluna some) */}
+                                                {showActionsCol && (
                                                 <td data-label="" style={{ textAlign: 'center' }}>
                                                     <div style={{ display: 'flex', gap: '4px', justifyContent: 'center' }}>
-                                                        <Tooltip content="Editar agendamento" describe={false}>
-                                                            <button type="button" className="admin-icon-btn admin-icon-btn--success"
-                                                                aria-label={`Editar agendamento de ${b.user.name}`}
-                                                                onClick={() => setEditBooking(b)}>
-                                                                <Pencil size={16} aria-hidden="true" />
-                                                            </button>
-                                                        </Tooltip>
-                                                        <Tooltip content="Excluir agendamento" describe={false}>
-                                                            <button type="button" className="admin-icon-btn admin-icon-btn--danger"
-                                                                aria-label={`Excluir permanentemente agendamento de ${b.user.name}`}
-                                                                onClick={() => handleHardDelete(b)}>
-                                                                <Trash2 size={16} aria-hidden="true" />
-                                                            </button>
-                                                        </Tooltip>
+                                                        {canOpenEdit && (
+                                                            <Tooltip content="Editar agendamento" describe={false}>
+                                                                <button type="button" className="admin-icon-btn admin-icon-btn--success"
+                                                                    aria-label={`Editar agendamento de ${b.user.name}`}
+                                                                    onClick={() => setEditBooking(b)}>
+                                                                    <Pencil size={16} aria-hidden="true" />
+                                                                </button>
+                                                            </Tooltip>
+                                                        )}
+                                                        {/* TELA5-05: sem a baixa e com cobrança em aberto, excluir é recusado — a Lixeira
+                                                            fica travada com o motivo (no toque, o clique mostra o mesmo texto). */}
+                                                        {bp.canHardDelete && (bp.hardDeleteNeedsBaixa(b) ? (
+                                                            <Tooltip content={HARD_DELETE_OPEN_CHARGE_NEEDS_BAIXA}>
+                                                                <button type="button" className="admin-icon-btn" aria-disabled="true"
+                                                                    aria-label={`Excluir indisponível para ${b.user.name}: ver por quê`}
+                                                                    onClick={() => showAlert({ type: 'info', title: 'Excluir indisponível', message: HARD_DELETE_OPEN_CHARGE_NEEDS_BAIXA })}>
+                                                                    <Lock size={16} aria-hidden="true" />
+                                                                </button>
+                                                            </Tooltip>
+                                                        ) : (
+                                                            <Tooltip content="Excluir agendamento" describe={false}>
+                                                                <button type="button" className="admin-icon-btn admin-icon-btn--danger"
+                                                                    aria-label={`Excluir permanentemente agendamento de ${b.user.name}`}
+                                                                    onClick={() => handleHardDelete(b)}>
+                                                                    <Trash2 size={16} aria-hidden="true" />
+                                                                </button>
+                                                            </Tooltip>
+                                                        ))}
                                                     </div>
                                                 </td>
+                                                )}
                                             </tr>
                                         );
                                     })}

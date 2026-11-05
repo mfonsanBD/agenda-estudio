@@ -17,8 +17,9 @@ import StatusReasonModal, { type ReasonKind, type ReasonConfirmOptions } from '.
 import { MakeupStatusPanel } from '../components/admin/bookings/MakeupRescheduleModal';
 import { useBusinessConfig } from '../hooks/useBusinessConfig';
 import { useIsMobile } from '../hooks/useIsMobile';
-import { buildReasonUpdate, reasonToastMessage } from '../utils/avulsoMakeup';
+import { buildReasonUpdate, reasonSaveFeedback, showReasonFeedback } from '../utils/avulsoMakeup';
 import { bookingSummary, cancelBookingConsequences, cancelBookingRequest } from '../components/admin/bookings/bookingDanger';
+import { useBookingPermissions, CANCEL_OPEN_CHARGE_NEEDS_BAIXA } from '../components/admin/bookings/bookingPermissions';
 import { TIER_META, BOOKING_STATUS_META, getMeta } from '../constants/adminMeta';
 
 import { formatBRL, getInitials } from '../utils/format';
@@ -32,8 +33,11 @@ const TIMELINE = buildDayTimeline();
 export default function AdminTodayPage() {
     const uid = useId();
     const navigate = useNavigate();
-    const { showToast, showConfirm } = useUI();
-    const { get: getRule } = useBusinessConfig();
+    const { showToast, showConfirm, showAlert } = useUI();
+    useBusinessConfig(); // pré-carrega as regras (prazo da remarcação) que o modal de motivo mostra
+    // Cada ação segue a sua permissão (o servidor recusa o resto com 403): presença, gravação, falta,
+    // cancelar, notas/métricas e o link do perfil do cliente.
+    const bp = useBookingPermissions();
     // Tela estreita (celular): o cabeçalho do horário não cabe numa linha só — horário + status em
     // cima, cliente embaixo; as ações rápidas (ícones) ficam só no painel aberto, com rótulo.
     const compact = useIsMobile(640);
@@ -80,7 +84,7 @@ export default function AdminTodayPage() {
     const handleStatusChange = async (bookingId: string, newStatus: string, label: string) => {
         try {
             await bookingsApi.update(bookingId, { status: newStatus });
-            showToast(`${label} registrado com sucesso!`);
+            showToast(newStatus === 'CONFIRMED' ? 'Presença confirmada!' : `${label}: registrado com sucesso!`);
             await loadData();
         } catch (err: unknown) { showToast({ message: getErrorMessage(err) || `Não foi possível registrar: ${label.toLowerCase()}.`, type: 'error' }); }
     };
@@ -135,8 +139,9 @@ export default function AdminTodayPage() {
         const isAvulso = booking.contract?.type === 'AVULSO';
         setSavingReason(true);
         try {
-            await bookingsApi.update(booking.id, buildReasonUpdate(kind, reason, { isAvulso, justified }));
-            showToast(reasonToastMessage(kind, { isAvulso, justified, bookingDate: booking.date, makeupDays: getRule('avulso_makeup_days') }));
+            const res = await bookingsApi.update(booking.id, buildReasonUpdate(kind, reason, { isAvulso, justified }));
+            // AUDFIN6-03: o retorno segue a RESPOSTA do servidor (a remarcação só é prometida se a janela abriu).
+            showReasonFeedback(reasonSaveFeedback(kind, { isAvulso, justified }, res), { showToast, showAlert });
             setReasonModal(null);
             await loadData();
         } catch (err: unknown) { showToast({ message: getErrorMessage(err) || 'Erro ao registrar.', type: 'error' }); }
@@ -151,7 +156,7 @@ export default function AdminTodayPage() {
             icon: Ban,
             title: 'Cancelar agendamento?',
             message: bookingSummary(booking),
-            consequences: cancelBookingConsequences(booking),
+            consequences: cancelBookingConsequences(booking, { canSettleCharges: bp.canSettleCharges }),
             confirmLabel: 'Cancelar agendamento',
             loadingLabel: 'Cancelando…',
             onConfirm: async () => {
@@ -382,14 +387,21 @@ export default function AdminTodayPage() {
                                                     <div style={{ minWidth: 0 }}>
                                                         {/* Botão de verdade (teclado) dentro da linha clicável: o Enter/Espaço não sobe
                                                             para a linha (que abriria os detalhes e cancelaria o clique do botão). */}
-                                                        <Tooltip content={`Abrir perfil de ${booking.user.name}`}>
-                                                            <button type="button" className="dash-name-btn dash-name-btn--ellipsis"
-                                                                style={{ display: 'block', color: 'var(--accent-text)', lineHeight: 'inherit' }}
-                                                                onKeyDown={(e) => e.stopPropagation()}
-                                                                onClick={(e) => { e.stopPropagation(); navigate(`/admin/clients/${booking.user.id}`); }}>
+                                                        {bp.canOpenClient ? (
+                                                            <Tooltip content={`Abrir perfil de ${booking.user.name}`}>
+                                                                <button type="button" className="dash-name-btn dash-name-btn--ellipsis"
+                                                                    style={{ display: 'block', color: 'var(--accent-text)', lineHeight: 'inherit' }}
+                                                                    onKeyDown={(e) => e.stopPropagation()}
+                                                                    onClick={(e) => { e.stopPropagation(); navigate(`/admin/clients/${booking.user.id}`); }}>
+                                                                    {booking.user.name}
+                                                                </button>
+                                                            </Tooltip>
+                                                        ) : (
+                                                            // Sem clientes.ver: só o nome (o perfil cairia no redirecionamento).
+                                                            <span className="dash-name-btn dash-name-btn--ellipsis" style={{ display: 'block', lineHeight: 'inherit', cursor: 'inherit' }}>
                                                                 {booking.user.name}
-                                                            </button>
-                                                        </Tooltip>
+                                                            </span>
+                                                        )}
                                                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '2px' }}>
                                                             <span style={{
                                                                 fontSize: '0.625rem', color: tierInfo.color, fontWeight: 700,
@@ -419,7 +431,7 @@ export default function AdminTodayPage() {
                                             {booking && !isExpanded && !compact && (booking.status === 'CONFIRMED' || booking.status === 'RESERVED')
                                                 && (!isPast || (booking.status === 'CONFIRMED' && !!booking.recordingStartedAt)) && (
                                                 <div style={{ display: 'flex', gap: '3px' }}>
-                                                    {booking.status === 'RESERVED' && (
+                                                    {booking.status === 'RESERVED' && bp.canConfirmPresence && (
                                                         <button className="today-action-btn today-action-btn--info"
                                                             aria-label="Confirmar presença"
                                                             style={{ padding: '4px 10px', fontSize: '0.6875rem' }}
@@ -427,7 +439,7 @@ export default function AdminTodayPage() {
                                                             Confirmar
                                                         </button>
                                                     )}
-                                                    {booking.status === 'CONFIRMED' && !booking.recordingStartedAt && (
+                                                    {booking.status === 'CONFIRMED' && !booking.recordingStartedAt && bp.canOperateRecording && (
                                                         <Tooltip content="Iniciar gravação" describe={false}>
                                                             <button type="button" className="today-action-btn today-action-btn--danger"
                                                                 aria-label="Iniciar gravação"
@@ -437,7 +449,7 @@ export default function AdminTodayPage() {
                                                             </button>
                                                         </Tooltip>
                                                     )}
-                                                    {booking.status === 'CONFIRMED' && booking.recordingStartedAt && (
+                                                    {booking.status === 'CONFIRMED' && booking.recordingStartedAt && bp.canOperateRecording && (
                                                         <>
                                                             <Tooltip content="Desfazer início da gravação" describe={false}>
                                                                 <button type="button" className="today-action-btn today-action-btn--neutral"
@@ -457,7 +469,7 @@ export default function AdminTodayPage() {
                                                             </Tooltip>
                                                         </>
                                                     )}
-                                                    {!isPast && (
+                                                    {!isPast && bp.canFaltas && (
                                                         <Tooltip content="Registrar falta" describe={false}>
                                                             <button type="button" className="today-action-btn today-action-btn--danger"
                                                                 aria-label="Registrar falta"
@@ -480,41 +492,62 @@ export default function AdminTodayPage() {
                                     {/* -- Expanded Panel -- */}
                                     {booking && isExpanded && (
                                         <div className="today-expand-panel">
-                                            {/* Action buttons row */}
-                                            {(booking.status === 'CONFIRMED' || booking.status === 'RESERVED') && !isPast && (
+                                            {/* Action buttons row (cada botão com a sua permissão; sem nenhum, a barra some) */}
+                                            {(booking.status === 'CONFIRMED' || booking.status === 'RESERVED') && !isPast
+                                                && ((booking.status === 'RESERVED' && bp.canConfirmPresence) || (booking.status === 'CONFIRMED' && bp.canOperateRecording) || bp.canFaltas || bp.canCancel) && (
                                                 <div className="today-actions-bar">
-                                                    {booking.status === 'RESERVED' && (
+                                                    {booking.status === 'RESERVED' && bp.canConfirmPresence && (
                                                         <button className="today-action-btn today-action-btn--info"
                                                             onClick={() => handleStatusChange(booking.id, 'CONFIRMED', 'Confirmação')}>
                                                             <CheckCircle2 size={14} aria-hidden="true" /> Confirmar Presença
                                                         </button>
                                                     )}
                                                     {/* CONFIRMED: iniciar (marca operador) → depois libera o Finalizar. */}
-                                                    {booking.status === 'CONFIRMED' && !booking.recordingStartedAt && (
+                                                    {booking.status === 'CONFIRMED' && !booking.recordingStartedAt && bp.canOperateRecording && (
                                                         <button className="today-action-btn today-action-btn--danger"
                                                             onClick={() => handleStartRecording(booking.id)}>
                                                             <Radio size={14} aria-hidden="true" /> Iniciar Gravação
                                                         </button>
                                                     )}
-                                                    {booking.status === 'CONFIRMED' && booking.recordingStartedAt && (
+                                                    {booking.status === 'CONFIRMED' && booking.recordingStartedAt && bp.canOperateRecording && (
                                                         <button className="today-action-btn today-action-btn--success"
                                                             onClick={() => setFinalizeBooking(booking)}>
                                                             <Flag size={14} aria-hidden="true" /> Finalizar gravação
                                                         </button>
                                                     )}
-                                                    <button className="today-action-btn today-action-btn--danger"
-                                                        onClick={() => setReasonModal({ booking, kind: 'FALTA' })}>
-                                                        <XCircle size={14} aria-hidden="true" /> Falta
-                                                    </button>
-                                                    <button className="today-action-btn today-action-btn--teal"
-                                                        onClick={() => setReasonModal({ booking, kind: 'NAO_REALIZADO' })}>
-                                                        <AlertCircle size={14} aria-hidden="true" /> Não Realizado
-                                                    </button>
-                                                    <div style={{ flex: 1 }} />
-                                                    <button className="today-action-btn today-action-btn--danger"
-                                                        onClick={() => handleCancel(booking)}>
-                                                        <Ban size={14} aria-hidden="true" /> Cancelar
-                                                    </button>
+                                                    {bp.canFaltas && (
+                                                        <>
+                                                            <button className="today-action-btn today-action-btn--danger"
+                                                                onClick={() => setReasonModal({ booking, kind: 'FALTA' })}>
+                                                                <XCircle size={14} aria-hidden="true" /> Falta
+                                                            </button>
+                                                            <button className="today-action-btn today-action-btn--teal"
+                                                                onClick={() => setReasonModal({ booking, kind: 'NAO_REALIZADO' })}>
+                                                                <AlertCircle size={14} aria-hidden="true" /> Não Realizado
+                                                            </button>
+                                                        </>
+                                                    )}
+                                                    {bp.canCancel && (
+                                                        <>
+                                                            <div style={{ flex: 1 }} />
+                                                            {bp.cancelNeedsBaixa(booking) ? (
+                                                                // R5: cobrança em aberto e sem a baixa — o Cancelar fica indisponível com a
+                                                                // explicação (dica no mouse/teclado; no toque, o clique mostra o mesmo texto).
+                                                                <Tooltip content={CANCEL_OPEN_CHARGE_NEEDS_BAIXA}>
+                                                                    <button type="button" className="today-action-btn today-action-btn--danger"
+                                                                        aria-disabled="true" style={{ opacity: 0.5, cursor: 'not-allowed', transform: 'none', filter: 'none' }}
+                                                                        onClick={() => showAlert({ type: 'info', title: 'Cancelar indisponível', message: CANCEL_OPEN_CHARGE_NEEDS_BAIXA })}>
+                                                                        <Ban size={14} aria-hidden="true" /> Cancelar
+                                                                    </button>
+                                                                </Tooltip>
+                                                            ) : (
+                                                                <button className="today-action-btn today-action-btn--danger"
+                                                                    onClick={() => handleCancel(booking)}>
+                                                                    <Ban size={14} aria-hidden="true" /> Cancelar
+                                                                </button>
+                                                            )}
+                                                        </>
+                                                    )}
                                                 </div>
                                             )}
 
@@ -525,15 +558,17 @@ export default function AdminTodayPage() {
                                                         <Radio size={13} aria-hidden="true" style={{ flexShrink: 0 }} /> Em gravação — iniciada por {booking.recordingStartedByName || 'operador'} às {new Date(booking.recordingStartedAt).toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' })}
                                                     </span>
                                                     {/* Fica aqui (e não só na barra de ações) para continuar ao alcance depois que o horário passou. */}
-                                                    <Tooltip content="Clicou em “Iniciar gravação” por engano? Desfaz o início: o cliente deixa de ver “AO VIVO”.">
-                                                        <button type="button" className="today-action-btn today-action-btn--neutral"
-                                                            onClick={() => handleUndoStartRecording(booking)}>
-                                                            <Undo2 size={14} aria-hidden="true" /> Desfazer início
-                                                        </button>
-                                                    </Tooltip>
+                                                    {bp.canOperateRecording && (
+                                                        <Tooltip content="Clicou em “Iniciar gravação” por engano? Desfaz o início: o cliente deixa de ver “AO VIVO”.">
+                                                            <button type="button" className="today-action-btn today-action-btn--neutral"
+                                                                onClick={() => handleUndoStartRecording(booking)}>
+                                                                <Undo2 size={14} aria-hidden="true" /> Desfazer início
+                                                            </button>
+                                                        </Tooltip>
+                                                    )}
                                                     {/* Depois do fim do horário a barra de ações some: o Finalizar continua aqui
                                                         (antes disso ele já está na barra — sem duplicar). */}
-                                                    {isPast && (
+                                                    {isPast && bp.canOperateRecording && (
                                                         <button type="button" className="today-action-btn today-action-btn--success"
                                                             onClick={() => setFinalizeBooking(booking)}>
                                                             <Flag size={14} aria-hidden="true" /> Finalizar gravação
@@ -566,10 +601,12 @@ export default function AdminTodayPage() {
                                                         <span style={{ width: 20, height: 2, background: 'var(--success)', borderRadius: 1 }} />
                                                         Métricas Pós-Gravação
                                                     </div>
-                                                    <button className="today-action-btn today-action-btn--danger" style={{ marginBottom: '14px' }}
-                                                        onClick={() => setFinalizeBooking(booking)}>
-                                                        <Radio size={14} aria-hidden="true" /> Dados da transmissão (redes, links e métricas por rede)
-                                                    </button>
+                                                    {bp.canOperateRecording && (
+                                                        <button className="today-action-btn today-action-btn--danger" style={{ marginBottom: '14px' }}
+                                                            onClick={() => setFinalizeBooking(booking)}>
+                                                            <Radio size={14} aria-hidden="true" /> Dados da transmissão (redes, links e métricas por rede)
+                                                        </button>
+                                                    )}
                                                     <div className="admin-kpi-grid">
                                                         {[
                                                             { icon: Timer, label: 'Duração (min)', value: durationMin, onChange: (v: string) => setDurationMin(v === '' ? '' : Number(v)), type: 'number', ph: 'Ex: 120' },
@@ -581,6 +618,7 @@ export default function AdminTodayPage() {
                                                                 <label className="admin-field__label" style={{ display: 'flex', alignItems: 'center', gap: 4 }} htmlFor={`${uid}-metric-${fi}`}><f.icon size={13} aria-hidden="true" /> {f.label}</label>
                                                                 <input id={`${uid}-metric-${fi}`} type={f.type} className="form-input form-input--raised" placeholder={f.ph}
                                                                     style={{ fontSize: '0.8125rem' }}
+                                                                    readOnly={!bp.canEditNotes}
                                                                     value={f.value} onChange={e => f.onChange(e.target.value)} />
                                                             </div>
                                                         ))}
@@ -598,6 +636,7 @@ export default function AdminTodayPage() {
                                                     <textarea id={`${uid}-admin-notes`} className="form-input form-input--raised"
                                                         style={{ minHeight: 80, resize: 'vertical', fontFamily: 'inherit', fontSize: '0.8125rem' }}
                                                         placeholder="Notas privadas sobre a sessão..."
+                                                        readOnly={!bp.canEditNotes}
                                                         value={adminNotes}
                                                         onChange={e => setAdminNotes(e.target.value)} />
                                                 </div>
@@ -609,6 +648,7 @@ export default function AdminTodayPage() {
                                                     <textarea id={`${uid}-client-notes`} className="form-input form-input--raised"
                                                         style={{ minHeight: 80, resize: 'vertical', fontFamily: 'inherit', fontSize: '0.8125rem' }}
                                                         placeholder="Visível no painel do cliente..."
+                                                        readOnly={!bp.canEditNotes}
                                                         value={clientNotes}
                                                         onChange={e => setClientNotes(e.target.value)} />
                                                 </div>
@@ -619,15 +659,24 @@ export default function AdminTodayPage() {
                                                 display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', flexWrap: 'wrap',
                                                 paddingTop: '16px', borderTop: '1px solid var(--border-color)',
                                             }}>
-                                                <button className="today-action-btn today-action-btn--neutral"
-                                                    onClick={() => navigate(`/admin/clients/${booking.user.id}`)}>
-                                                    <UserRound size={14} aria-hidden="true" /> Ver Perfil
-                                                </button>
-                                                <button className="btn-admin-go"
-                                                    onClick={() => handleSaveMetrics(booking.id)}
-                                                    disabled={saving}>
-                                                    {saving ? 'Salvando…' : <><Save size={15} aria-hidden="true" /> Salvar Alterações</>}
-                                                </button>
+                                                {bp.canOpenClient ? (
+                                                    <button className="today-action-btn today-action-btn--neutral"
+                                                        onClick={() => navigate(`/admin/clients/${booking.user.id}`)}>
+                                                        <UserRound size={14} aria-hidden="true" /> Ver Perfil
+                                                    </button>
+                                                ) : <span />}
+                                                {/* Notas e métricas: hoje.gravacao OU agendamentos.editar (PATCH /bookings/:id). */}
+                                                {bp.canEditNotes ? (
+                                                    <button className="btn-admin-go"
+                                                        onClick={() => handleSaveMetrics(booking.id)}
+                                                        disabled={saving}>
+                                                        {saving ? 'Salvando…' : <><Save size={15} aria-hidden="true" /> Salvar Alterações</>}
+                                                    </button>
+                                                ) : (
+                                                    <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                                                        Somente leitura: editar notas e métricas exige operar a gravação ou mudar agendamentos.
+                                                    </span>
+                                                )}
                                             </div>
                                         </div>
                                     )}

@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Bell, Check, CheckCheck, CheckCircle } from 'lucide-react';
-import { useAuth } from '../context/AuthContext';
+import { usePermission } from '../hooks/usePermission';
 import { useNotifications } from '../hooks/useNotifications';
 import { resolveNotifMeta, formatTimeAgo } from '../utils/notificationMeta';
 import { NotificationItem } from '../api/client';
@@ -31,9 +31,9 @@ function dayLabel(iso: string): string {
 }
 
 export default function NotificationsPage() {
-    const { user } = useAuth();
     const navigate = useNavigate();
-    const isAdmin = user?.role === 'ADMIN';
+    // Equipe (ADMIN ou COLABORADOR) vê a página no visual da área administrativa.
+    const { isStaff } = usePermission();
     const { notifications, summary, loading, markRead, markAllRead } = useNotifications();
     const [filter, setFilter] = useState<SeverityFilter>('all');
 
@@ -64,7 +64,7 @@ export default function NotificationsPage() {
 
     return (
         <div>
-            {isAdmin ? (
+            {isStaff ? (
                 <AdminPageHeader
                     icon={Bell}
                     title="Notificações"
@@ -115,9 +115,9 @@ export default function NotificationsPage() {
             </div>
 
             {filtered.length === 0 ? (
-                <div className={isAdmin ? 'admin-empty' : 'client-empty'}>
-                    <CheckCircle size={40} className={isAdmin ? 'admin-empty__icon' : 'client-empty__icon'} />
-                    <div className={isAdmin ? 'admin-empty__title' : 'client-empty__text'}>
+                <div className={isStaff ? 'admin-empty' : 'client-empty'}>
+                    <CheckCircle size={40} className={isStaff ? 'admin-empty__icon' : 'client-empty__icon'} />
+                    <div className={isStaff ? 'admin-empty__title' : 'client-empty__text'}>
                         {filter === 'all' ? 'Nenhuma notificação' : 'Nada neste filtro'}
                     </div>
                 </div>

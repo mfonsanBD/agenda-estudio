@@ -31,6 +31,36 @@ export async function mkUser(overrides: Partial<Prisma.UserUncheckedCreateInput>
     });
 }
 
+/**
+ * Membro da EQUIPE: cria o `users` (papel COLABORADOR por padrão) + a linha de `staff_profiles` com as
+ * permissões informadas, gravadas COMO VIERAM (sem normalizar — o teste decide; use
+ * normalizePermissions de src/config/staffPermissions se quiser as dependências). ADMIN também ganha
+ * a linha (com a lista ignorada pelo middleware), como a tela Equipe grava.
+ */
+export async function mkStaff(opts: {
+    permissions?: string[];
+    role?: 'COLABORADOR' | 'ADMIN';
+    title?: string | null;
+    overrides?: Partial<Prisma.UserUncheckedCreateInput>;
+} = {}) {
+    const n = uniq();
+    return prisma.user.create({
+        data: {
+            name: `Test Staff ${n}`,
+            email: `itest-staff-${n}@example.com`,
+            role: opts.role ?? 'COLABORADOR',
+            ...opts.overrides,
+            staffProfile: {
+                create: {
+                    title: opts.title ?? null,
+                    permissions: opts.permissions ?? [],
+                },
+            },
+        },
+        include: { staffProfile: true },
+    });
+}
+
 export async function mkContract(userId: string, overrides: Partial<Prisma.ContractUncheckedCreateInput> = {}) {
     return prisma.contract.create({
         data: {

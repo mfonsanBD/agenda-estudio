@@ -52,7 +52,7 @@ Toque (ou clique) num cartão para abrir o **detalhe do agendamento**. Nele voc�
 - **Capa** (enviada na hora);
 - **Onde vai transmitir** (YouTube, TikTok, Instagram, Facebook).
 
-Toque em **Salvar**: o cartão passa a mostrar o título e a capa. Fechar sem salvar descarta o que foi digitado. Você pode editar enquanto a gravação não foi finalizada nem cancelada (detalhes em [Minhas Gravações](minhas-gravacoes.md#ate-quando-posso-editar-as-informacoes)). O mesmo detalhe abre ao tocar num horário seu na grade.
+Toque em **Salvar**: o cartão passa a mostrar o título e a capa. Fechar sem salvar descarta o que foi digitado. Você pode editar enquanto a gravação não foi finalizada nem cancelada (detalhes em [Minhas Gravações](minhas-gravacoes.md#até-quando-posso-editar-as-informações)). O mesmo detalhe abre ao tocar num horário seu na grade.
 
 ## Remarcar
 

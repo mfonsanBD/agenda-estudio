@@ -10,6 +10,7 @@
 import { prisma } from './prisma.js';
 import { getConfig } from './businessConfig.js';
 import { logAudit } from './audit.js';
+import { occupiesFixoCap, FIXO_EXTRA_MARK_WHERE } from '../modules/bookings/sessionPayment.js';
 
 /** Sessões ainda por acontecer (ocupam agenda / aguardam gravação). */
 const PENDING_STATUSES = ['HELD', 'RESERVED', 'CONFIRMED'];
@@ -19,6 +20,8 @@ const SYNCABLE_STATUSES = ['ACTIVE', 'COMPLETED'];
 export interface CompletionBooking {
     status: string;
     makeupStatus?: string | null;
+    /** Sessão EXTRA do FIXO (Payment com a marca fixoExtra — criada com o teto já cheio): não ocupa o teto. */
+    fixoExtra?: boolean;
 }
 
 export interface CompletionInput {
@@ -36,7 +39,9 @@ export interface CompletionInput {
  *   NAO_REALIZADO (D5: culpa do estúdio — o valor continua garantido e o admin resolve).
  * - FIXO/FLEX/CUSTOM: sem sessão pendente, houve consumo (COMPLETED/FALTA) e não resta crédito/sessão:
  *   FLEX → flexCreditsRemaining; CUSTOM → customCreditsRemaining; FIXO → teto (meses × sessões/mês)
- *   menos as sessões usadas (mesma conta de booking.creation).
+ *   menos as sessões que OCUPAM o teto (occupiesFixoCap — a mesma regra de booking.service.fixoCapReached:
+ *   a sessão EXTRA, criada com o teto já cheio, não conta, então ela não conclui o plano antes da hora; a
+ *   sessão cobrada por quem tem a baixa DENTRO do teto conta — ATU5-02).
  * - SERVICO (e qualquer outro tipo): nunca.
  */
 export function isContractFulfilled(c: CompletionInput, sessionsPerMonth: number): boolean {
@@ -61,7 +66,7 @@ export function isContractFulfilled(c: CompletionInput, sessionsPerMonth: number
     } else if (c.type === 'CUSTOM') {
         remaining = c.customCreditsRemaining ?? 0;
     } else {
-        const used = live.filter(b => ['COMPLETED', 'CONFIRMED', 'FALTA', 'RESERVED'].includes(b.status)).length;
+        const used = live.filter(occupiesFixoCap).length;
         remaining = Math.max(0, c.durationMonths * sessionsPerMonth - used);
     }
     return remaining <= 0;
@@ -98,12 +103,19 @@ export async function syncContractCompletion(
                     flexCreditsRemaining: true, customCreditsRemaining: true,
                     bookings: {
                         where: { status: { not: 'CANCELLED' } },
-                        select: { status: true, makeupStatus: true },
+                        select: {
+                            status: true, makeupStatus: true,
+                            // Sessão EXTRA do FIXO (marca fixoExtra): não ocupa o teto (occupiesFixoCap).
+                            payments: { where: FIXO_EXTRA_MARK_WHERE, select: { id: true }, take: 1 },
+                        },
                     },
                 },
             });
             if (!c || c.type === 'SERVICO') return null;
-            const done = isContractFulfilled(c, sessionsPerMonth);
+            const done = isContractFulfilled({
+                ...c,
+                bookings: c.bookings.map(b => ({ status: b.status, makeupStatus: b.makeupStatus, fixoExtra: b.payments.length > 0 })),
+            }, sessionsPerMonth);
             if (done && c.status === 'ACTIVE') {
                 const r = await tx.contract.updateMany({ where: { id: contractId, status: 'ACTIVE' }, data: { status: 'COMPLETED' } });
                 return r.count > 0 ? ('COMPLETED' as const) : null;

@@ -11,6 +11,8 @@ import {
 } from './notificationService.js';
 import { getAllEffectiveEvents, renderTemplate, EffectiveEvent } from './templateStore.js';
 import { planPaymentBlockedByPendingCancellation } from '../../lib/cancellationPending.js';
+import { actorOrReply, canAny, type Actor } from '../../middleware/permissions.js';
+import { staffEventPermissions, type PermissionKey } from '../../config/staffPermissions.js';
 import adminRouter from './admin.js';
 
 const router = Router();
@@ -63,15 +65,55 @@ async function markComputedRead(userId: string, ids: string[]): Promise<void> {
     await redis.expire(key, COMPUTED_READ_TTL);
 }
 
-/** Builds the real-time (computed) notifications for a user/role. Shared by GET and read-all. */
-async function buildComputedNotifications(userId: string, userRole: string): Promise<ComputedNotification[]> {
+// ─── Equipe: quem vê cada alerta ────────────────────────
+// Os alertas de audiência "admin" vão para a EQUIPE: ADMIN vê todos; COLABORADOR só os do evento cuja
+// permissão tem (STAFF_EVENT_PERMISSIONS em config/staffPermissions.ts — cada uma abre a tela do link,
+// crítica I3). Sem a permissão o bloco nem consulta o banco; a equipe nunca cai no ramo do cliente (não
+// tem contrato/pagamento próprio — autoatendimento é só de CLIENTE).
+
+/** A equipe vê o alerta `eventKey`? ADMIN: sempre; COLABORADOR: com QUALQUER permissão do evento; CLIENTE: nunca. */
+function staffSeesEvent(actor: Actor, eventKey: string): boolean {
+    if (!actor.isStaff) return false;
+    return actor.isAdmin || canAny(actor, ...staffEventPermissions(eventKey));
+}
+
+/**
+ * Telas da área administrativa → permissões que as abrem (as mesmas guardas de rota do front). Usado para
+ * não mostrar ao COLABORADOR um aviso GUARDADO cujo link ele não abre mais (a permissão foi retirada depois
+ * do aviso): o texto traz nome de cliente e valores. Link fora desta lista (ou de cliente) não é filtrado.
+ */
+const STAFF_SCREEN_PERMISSIONS: ReadonlyArray<readonly [prefix: string, anyOf: readonly PermissionKey[]]> = [
+    ['/admin/today', ['hoje.ver']],
+    ['/admin/bookings', ['agendamentos.ver']],
+    ['/admin/clients', ['clientes.ver']],
+    ['/admin/contracts', ['contratos.ver']],
+    ['/admin/finance', ['financeiro.ver']],
+];
+
+/** O ator abre a tela do link? ADMIN e cliente: sempre (o filtro é só para COLABORADOR). */
+function staffCanOpenLink(actor: Actor, actionUrl: string | null | undefined): boolean {
+    if (!actionUrl || actor.role !== 'COLABORADOR') return true;
+    const path = actionUrl.split(/[?#]/)[0]!;
+    const screen = STAFF_SCREEN_PERMISSIONS.find(([prefix]) => path === prefix || path.startsWith(`${prefix}/`));
+    return !screen || canAny(actor, ...screen[1]);
+}
+
+/**
+ * Builds the real-time (computed) notifications for the actor. Shared by GET and read-all.
+ * Cliente: os próprios alertas. Equipe: os alertas "admin" que a permissão libera (ver staffSeesEvent).
+ */
+async function buildComputedNotifications(actor: Actor): Promise<ComputedNotification[]> {
     const notifications: ComputedNotification[] = [];
     const now = new Date();
     // São Paulo calendar day as 00:00Z — matches Booking.date (@db.Date) and keeps
     // day-based windows/labels correct after 21:00 SP (when the UTC date already flipped).
     const sp = saoPauloParts(now);
     const today = new Date(Date.UTC(sp.y, sp.m - 1, sp.day));
-    const isAdmin = userRole === 'ADMIN';
+    const userId = actor.userId;
+    // `staff` = visão da equipe (todos os clientes). Antes era `role === 'ADMIN'`; agora vale para o
+    // COLABORADOR também, mas cada bloco só roda com a permissão do evento (`allowed`).
+    const staff = actor.isStaff;
+    const allowed = (eventKey: string) => !staff || staffSeesEvent(actor, eventKey);
     const iso = now.toISOString();
 
     // Text/enabled/severity come from the template store (admin-editable); IDs and
@@ -80,9 +122,10 @@ async function buildComputedNotifications(userId: string, userRole: string): Pro
     const ev = (key: string) => events.get(key)!; // every catalog key is present
 
     // 1. Contracts expiring within threshold
-    const expiringEff = ev(isAdmin ? 'computed_contract_expiring_admin' : 'computed_contract_expiring');
-    if (expiringEff.enabled) {
-        const thresholdDays = isAdmin ? 7 : 15;
+    const expiringKey = staff ? 'computed_contract_expiring_admin' : 'computed_contract_expiring';
+    const expiringEff = ev(expiringKey);
+    if (allowed(expiringKey) && expiringEff.enabled) {
+        const thresholdDays = staff ? 7 : 15;
         const targetDateFromNow = new Date(today);
         targetDateFromNow.setDate(targetDateFromNow.getDate() + thresholdDays);
         // D6: avulso é sessão única (vigência = dia da gravação) — nunca "expira". Planos concluídos
@@ -92,20 +135,21 @@ async function buildComputedNotifications(userId: string, userRole: string): Pro
                 status: { in: ['ACTIVE', 'COMPLETED'] },
                 type: { not: 'AVULSO' },
                 endDate: { gte: today, lte: targetDateFromNow },
-                ...(isAdmin ? {} : { userId }),
+                ...(staff ? {} : { userId }),
             },
             include: { user: { select: { name: true } } },
         });
         for (const c of expiringContracts) {
             const dias = Math.ceil((new Date(c.endDate).getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
-            const vars: Record<string, string | number> = isAdmin ? { cliente: c.user.name, contrato: c.name, dias } : { contrato: c.name, dias };
+            const vars: Record<string, string | number> = staff ? { cliente: c.user.name, contrato: c.name, dias } : { contrato: c.name, dias };
             notifications.push({
                 id: `contract-expiring-${c.id}`, type: 'CONTRACT_EXPIRING',
                 severity: computedSeverity(expiringEff, dias <= 2 ? 'critical' : 'warning'),
                 title: renderTemplate(expiringEff.title, vars),
                 message: renderTemplate(expiringEff.message, vars),
                 entityType: 'CONTRACT', entityId: c.id,
-                actionUrl: isAdmin ? `/admin/clients/${c.userId}` : '/meus-contratos',
+                // Equipe: o detalhe do contrato (abre com contratos.ver, a permissão do alerta — I3).
+                actionUrl: staff ? `/admin/contracts/${c.id}` : '/meus-contratos',
                 createdAt: iso, read: false, source: 'computed',
             });
         }
@@ -116,18 +160,19 @@ async function buildComputedNotifications(userId: string, userRole: string): Pro
     // Cancelamento em análise (E13): o CLIENTE não paga parcela do plano de um contrato
     // PENDING_CANCELLATION (as rotas de pagamento devolvem 409 CANCELLATION_PENDING) — então também não é
     // lembrado dela. Mesma regra das rotas (planPaymentBlockedByPendingCancellation): extras de gravação e
-    // a multa continuam avisando; o admin (que pode cobrar) continua vendo tudo.
+    // a multa continuam avisando; a equipe (que pode cobrar) continua vendo tudo.
     // Cobrança de uma gravação CANCELADA (extra que ficou em aberto — dado legado) não pode mais ser paga
     // (create-payment → 400 BOOKING_CANCELLED): fica fora de "vencidas" e de "pagamento falhou", para o
-    // cliente e para o admin.
-    const overdueEff = ev(isAdmin ? 'computed_payment_overdue_admin' : 'computed_payment_overdue');
-    if (overdueEff.enabled) {
+    // cliente e para a equipe.
+    const overdueKey = staff ? 'computed_payment_overdue_admin' : 'computed_payment_overdue';
+    const overdueEff = ev(overdueKey);
+    if (allowed(overdueKey) && overdueEff.enabled) {
         const overduePayments = (await prisma.payment.findMany({
-            where: { status: 'PENDING', dueDate: { lt: today }, ...(isAdmin ? {} : { userId }) },
+            where: { status: 'PENDING', dueDate: { lt: today }, ...(staff ? {} : { userId }) },
             include: { user: { select: { name: true } }, contract: { select: { status: true } }, booking: { select: { status: true } } },
-        })).filter(p => p.booking?.status !== 'CANCELLED' && !planPaymentBlockedByPendingCancellation(p, isAdmin));
+        })).filter(p => p.booking?.status !== 'CANCELLED' && !planPaymentBlockedByPendingCancellation(p, staff));
         const daysOverdue = (p: { dueDate: Date | null }) => Math.ceil((today.getTime() - new Date(p.dueDate!).getTime()) / (1000 * 60 * 60 * 24));
-        if (isAdmin) {
+        if (staff) {
             const byClient = new Map<string, { name: string; count: number; total: number; maxDays: number }>();
             for (const p of overduePayments) {
                 const g = byClient.get(p.userId) ?? { name: p.user.name, count: 0, total: 0, maxDays: 0 };
@@ -164,34 +209,35 @@ async function buildComputedNotifications(userId: string, userRole: string): Pro
     }
 
     // 2b. Failed payments
-    const failedEff = ev(isAdmin ? 'computed_payment_failed_admin' : 'computed_payment_failed');
-    if (failedEff.enabled) {
+    const failedKey = staff ? 'computed_payment_failed_admin' : 'computed_payment_failed';
+    const failedEff = ev(failedKey);
+    if (allowed(failedKey) && failedEff.enabled) {
         // L12: este alerta é "Pagamento com CARTÃO falhou" — restringir a provider STRIPE. Falhas de
         // PIX/boleto (Sicoob/Cora) têm seu próprio evento "Cobrança expirada"; antes elas disparavam a
         // cópia de cartão ("Atualize o cartão"), confundindo clientes que só usam PIX.
         // Mesma regra do "vencido": com o cancelamento em análise o cliente não consegue repagar a parcela.
         const failedPayments = (await prisma.payment.findMany({
-            where: { status: 'FAILED', provider: 'STRIPE', ...(isAdmin ? {} : { userId }) },
+            where: { status: 'FAILED', provider: 'STRIPE', ...(staff ? {} : { userId }) },
             include: { user: { select: { name: true } }, contract: { select: { status: true } }, booking: { select: { status: true } } },
-        })).filter(p => p.booking?.status !== 'CANCELLED' && !planPaymentBlockedByPendingCancellation(p, isAdmin));
+        })).filter(p => p.booking?.status !== 'CANCELLED' && !planPaymentBlockedByPendingCancellation(p, staff));
         for (const p of failedPayments) {
-            const vars: Record<string, string | number> = isAdmin ? { cliente: p.user.name, valor: fmtBRL(p.amount) } : {};
+            const vars: Record<string, string | number> = staff ? { cliente: p.user.name, valor: fmtBRL(p.amount) } : {};
             notifications.push({
                 id: `payment-failed-${p.id}`, type: 'PAYMENT_OVERDUE',
                 severity: computedSeverity(failedEff, 'critical'),
                 title: renderTemplate(failedEff.title, vars),
                 message: renderTemplate(failedEff.message, vars),
                 entityType: 'PAYMENT', entityId: p.id,
-                actionUrl: isAdmin ? '/admin/finance' : '/meus-pagamentos',
+                actionUrl: staff ? '/admin/finance' : '/meus-pagamentos',
                 createdAt: iso, read: false, source: 'computed',
             });
         }
     }
 
-    // 3. Unconfirmed bookings — TODAY only, ADMIN-only (the 7am dailyConfirmationJob owns
+    // 3. Unconfirmed bookings — TODAY only, STAFF-only (the 7am dailyConfirmationJob owns
     // the client signal; a computed one here would shadow it via same type+entityId).
     const unconfEff = ev('computed_booking_unconfirmed_admin');
-    if (isAdmin && unconfEff.enabled) {
+    if (staffSeesEvent(actor, 'computed_booking_unconfirmed_admin') && unconfEff.enabled) {
         const tomorrow = new Date(today);
         tomorrow.setDate(tomorrow.getDate() + 1);
         const unconfirmedBookings = await prisma.booking.findMany({
@@ -212,44 +258,48 @@ async function buildComputedNotifications(userId: string, userRole: string): Pro
     }
 
     // 4. Contracts pending cancellation
-    const cancelEff = ev(isAdmin ? 'computed_cancellation_pending_admin' : 'computed_cancellation_pending');
-    if (cancelEff.enabled) {
+    const cancelKey = staff ? 'computed_cancellation_pending_admin' : 'computed_cancellation_pending';
+    const cancelEff = ev(cancelKey);
+    if (allowed(cancelKey) && cancelEff.enabled) {
         const pendingCancellations = await prisma.contract.findMany({
-            where: { status: 'PENDING_CANCELLATION', ...(isAdmin ? {} : { userId }) },
+            where: { status: 'PENDING_CANCELLATION', ...(staff ? {} : { userId }) },
             include: { user: { select: { name: true } } },
         });
         for (const c of pendingCancellations) {
-            const vars: Record<string, string | number> = isAdmin ? { cliente: c.user.name, contrato: c.name } : { contrato: c.name };
+            const vars: Record<string, string | number> = staff ? { cliente: c.user.name, contrato: c.name } : { contrato: c.name };
             notifications.push({
                 id: `cancellation-pending-${c.id}`, type: 'CANCELLATION_PENDING',
                 severity: computedSeverity(cancelEff, 'warning'),
                 title: renderTemplate(cancelEff.title, vars),
                 message: renderTemplate(cancelEff.message, vars),
                 entityType: 'CONTRACT', entityId: c.id,
-                actionUrl: isAdmin ? '/admin/contracts' : '/meus-contratos',
+                // Lista de Contratos: é lá que ficam "Cobrar multa" e "Isentar" (contratos.multa ⊃ contratos.ver).
+                actionUrl: staff ? '/admin/contracts' : '/meus-contratos',
                 createdAt: iso, read: false, source: 'computed',
             });
         }
     }
 
     // 4b. Contracts awaiting payment
-    const awaitEff = ev(isAdmin ? 'computed_contract_awaiting_admin' : 'computed_contract_awaiting');
-    if (awaitEff.enabled) {
+    const awaitKey = staff ? 'computed_contract_awaiting_admin' : 'computed_contract_awaiting';
+    const awaitEff = ev(awaitKey);
+    if (allowed(awaitKey) && awaitEff.enabled) {
         const awaitingPayment = await prisma.contract.findMany({
-            where: { status: 'AWAITING_PAYMENT', ...(isAdmin ? {} : { userId }) },
+            where: { status: 'AWAITING_PAYMENT', ...(staff ? {} : { userId }) },
             include: { user: { select: { name: true } } },
         });
         for (const c of awaitingPayment) {
             const deadline = c.paymentDeadline ? new Date(c.paymentDeadline) : null;
             const isUrgent = !!deadline && (deadline.getTime() - now.getTime()) < 30 * 60 * 1000;
-            const vars: Record<string, string | number> = isAdmin ? { cliente: c.user.name, contrato: c.name } : { contrato: c.name };
+            const vars: Record<string, string | number> = staff ? { cliente: c.user.name, contrato: c.name } : { contrato: c.name };
             notifications.push({
                 id: `contract-awaiting-${c.id}`, type: 'CONTRACT_AWAITING_PAYMENT',
                 severity: computedSeverity(awaitEff, isUrgent ? 'critical' : 'warning'),
                 title: renderTemplate(awaitEff.title, vars),
                 message: renderTemplate(awaitEff.message, vars),
                 entityType: 'CONTRACT', entityId: c.id,
-                actionUrl: isAdmin ? `/admin/clients/${c.userId}` : '/meus-contratos',
+                // Equipe: o detalhe do contrato (abre com contratos.ver, a permissão do alerta — I3).
+                actionUrl: staff ? `/admin/contracts/${c.id}` : '/meus-contratos',
                 createdAt: iso, read: false, source: 'computed',
             });
         }
@@ -260,13 +310,16 @@ async function buildComputedNotifications(userId: string, userRole: string): Pro
 
 // ─── GET /api/notifications ─────────────────────────────
 // Returns a mix of computed (real-time) and persisted (DB) notifications.
+// Equipe: papel e permissões lidos do BANCO (getActor) — conta desativada/excluída → 401 ACCOUNT_DISABLED;
+// cliente: só o JWT (sem consulta extra).
 
 router.get('/', authenticate, async (req: Request, res: Response) => {
     try {
-        const userRole = req.user!.role;
-        const userId = req.user!.userId;
+        const actor = await actorOrReply(req, res);
+        if (!actor) return;
+        const userId = actor.userId;
 
-        const notifications = await buildComputedNotifications(userId, userRole);
+        const notifications = await buildComputedNotifications(actor);
 
         // Apply the computed-read state: read items stay visible (grey) but leave the counters.
         try {
@@ -283,8 +336,9 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
         const persistedIds = new Set<string>();
 
         for (const n of persistedNotifs) {
+            // COLABORADOR: aviso antigo de uma tela que ele não abre mais (permissão retirada) sai do sino.
+            if (!staffCanOpenLink(actor, n.actionUrl)) continue;
             // Avoid duplicates with computed (same entity)
-            const computedKey = `${n.type}-${n.entityId}`;
             const alreadyInComputed = notifications.some(cn =>
                 cn.entityId === n.entityId && cn.type === n.type,
             );
@@ -335,12 +389,14 @@ router.get('/', authenticate, async (req: Request, res: Response) => {
 // MUST be registered BEFORE /:id routes to avoid being intercepted by :id param
 router.patch('/read-all', authenticate, async (req: Request, res: Response) => {
     try {
-        const count = await markAllAsRead(req.user!.userId);
+        const actor = await actorOrReply(req, res);
+        if (!actor) return;
+        const count = await markAllAsRead(actor.userId);
         // Also remember the CURRENT computed notifications as read — otherwise they
-        // resurrect unread on the next poll (e.g. "Cancelamento Pendente").
+        // resurrect unread on the next poll (e.g. "Cancelamento Pendente"). Só os que o ator vê.
         try {
-            const computed = await buildComputedNotifications(req.user!.userId, req.user!.role);
-            await markComputedRead(req.user!.userId, computed.map(n => n.id));
+            const computed = await buildComputedNotifications(actor);
+            await markComputedRead(actor.userId, computed.map(n => n.id));
         } catch (err) { console.error('[NOTIF] computed read-all falhou (best-effort):', err); }
         res.json({ message: `${count} notificação(ões) marcada(s) como lida(s).`, count });
     } catch (err) {

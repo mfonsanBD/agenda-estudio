@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma.js';
 import { authenticate } from '../../middleware/auth.js';
+import { requireRole } from '../../middleware/permissions.js';
 import { getConfig } from '../../lib/businessConfig.js';
 import { createPayment as gatewayCreatePayment, updatePaymentWithGatewayResult, validatePaymentMethod, getProviderForMethod, PaymentMethodDisabledError } from '../../lib/paymentGateway.js';
 import { resolvePlanAmounts, type BillingCadence } from '../../lib/paymentPolicy.js';
@@ -22,7 +23,8 @@ export function registerServiceRoutes(router: Router) {
 // the Stripe/Cora webhook (onPaymentConfirmed → fulfillContractFromPayment SERVICE branch)
 // materializes the ACTIVE contract + installments 2..N once the first payment confirms.
 
-router.post('/service', authenticate, async (req: Request, res: Response) => {
+// Autoatendimento: só CLIENTE (crítica S5).
+router.post('/service', authenticate, requireRole('CLIENTE'), async (req: Request, res: Response) => {
     // pagamentos-9: trava por usuário+serviço envolvendo "substituir a tentativa anterior" + criar —
     // duas criações simultâneas (duas abas, reenvio) não geram duas contratações aguardando pagamento.
     // Liberada no finally assim que ESTA criação termina (o TTL só cobre um processo que caiu).

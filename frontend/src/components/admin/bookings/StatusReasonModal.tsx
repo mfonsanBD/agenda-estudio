@@ -3,7 +3,7 @@ import BottomSheetModal from '../../BottomSheetModal';
 import { AlertTriangle, XCircle, NotebookPen } from 'lucide-react';
 import type { MakeupStatus } from '../../../api/client';
 import { useBusinessConfig } from '../../../hooks/useBusinessConfig';
-import { previewMakeupWindow } from '../../../utils/avulsoMakeup';
+import { previewMakeupWindow, naoRealizadoAvulsoHint } from '../../../utils/avulsoMakeup';
 import '../../../styles/makeup.css';
 
 export type ReasonKind = 'FALTA' | 'NAO_REALIZADO';
@@ -88,9 +88,8 @@ export default function StatusReasonModal({
             hint = 'O cliente faltou. A sessão é consumida: ele PERDE o valor/crédito desta gravação. Descreva o que aconteceu.';
         }
     } else if (isAvulso && preview) {
-        hint = preview.expired
-            ? 'A gravação não aconteceu por um motivo do estúdio, e o cliente NÃO perde o valor. O prazo de remarcação automática já passou: combine a nova data com o cliente e use "Remarcar" nesta gravação. Descreva o motivo.'
-            : `A gravação não aconteceu por um motivo do estúdio, e o cliente NÃO perde o valor: a remarcação sem custo abre automaticamente até ${preview.ddmm} (${makeupDays} dias). Se ele não remarcar, o contrato continua ativo e você é avisado para combinar a nova data. Descreva o motivo.`;
+        // AUDFIN6-03: a janela só abre para gravação paga (o servidor decide) — a dica não promete sem saber.
+        hint = naoRealizadoAvulsoHint(preview, makeupDays);
     } else {
         hint = 'A gravação não aconteceu por um motivo alheio ao cliente. Nos planos com créditos (Flex/Personalizado) o crédito volta; nos demais a vaga é liberada. Descreva o motivo.';
     }

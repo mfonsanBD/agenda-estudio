@@ -21,6 +21,7 @@ import { useCountdown } from '../../hooks/useCountdown';
 import { useCardInstallments } from '../../hooks/useCardInstallments';
 import { useAuth } from '../../context/AuthContext';
 import { useUI } from '../../context/UIContext';
+import { usePermission } from '../../hooks/usePermission';
 import {
     ApiError, authApi, contractsApi, pricingApi,
     type AddOnConfig, type ContractTier, type CouponValidation, type CustomConflict, type CustomContractData,
@@ -231,6 +232,10 @@ export default function CustomContractFlow({ mode, pricing, users = [], onClose,
     const uid = useId();
     const { user, updateUser } = useAuth();
     const { showToast } = useUI();
+    // Modo equipe (D7): o contrato nasce ATIVO com a 1ª cobrança em aberto; o sheet "Cobrar agora" só abre
+    // com "Cobrar o cliente" (cobrancas.cobrar) — sem ela, a cobrança fica pendente (o cliente paga pelo app).
+    const { can } = usePermission();
+    const staffCanCharge = isAdmin && can('cobrancas.cobrar');
     const { get: getRule } = useBusinessConfig();
     const { step, next, back, goTo, isLast } = useWizardStep(STEPS.length);
 
@@ -376,6 +381,9 @@ export default function CustomContractFlow({ mode, pricing, users = [], onClose,
     const customOk = customDates.length > 0 && customDates.every(cd => inPeriod(cd.date) && slotGrid.isValidSlot(weekdayOf(cd.date), cd.time));
     const canStep2 = gridReady && volume.totalSessions > 0 && (frequency === 'CUSTOM' ? customOk : scheduleOk && patternOk);
     const canStep4 = !!method && (isAdmin || acceptedTerms);
+    // FE-2 (modo equipe): cupom que zera a 1ª cobrança registra a parcela como paga — sem a baixa manual o
+    // servidor recusa (403). "Criar contrato" fica desabilitado com a explicação, em vez do 403 genérico.
+    const zeroCouponNeedsBaixa = isAdmin && !can('cobrancas.baixa') && !!appliedCoupon && appliedCoupon.finalAmount <= 0;
 
     const step1Hint = isAdmin && !selectedClient ? 'Escolha o cliente.'
         : !nameOk ? `Dê um nome ao ${isAdmin ? 'contrato' : 'projeto'} (pelo menos 2 letras).`
@@ -559,7 +567,7 @@ export default function CustomContractFlow({ mode, pricing, users = [], onClose,
             setChargeError('');
             setCheckoutError('');
             if (isAdmin) {
-                setPhase(info.firstPaymentId && info.firstPending ? 'charge' : 'success');
+                setPhase(staffCanCharge && info.firstPaymentId && info.firstPending ? 'charge' : 'success');
             } else {
                 setPhase(info.status === 'AWAITING_PAYMENT' && info.firstPaymentId && info.firstPending ? 'checkout' : 'success');
             }
@@ -675,7 +683,7 @@ export default function CustomContractFlow({ mode, pricing, users = [], onClose,
     };
 
     // ── Admin: cobrança da 1ª parcela (substitui o wizard) ──
-    if (isAdmin && phase === 'charge' && created?.firstPaymentId) {
+    if (staffCanCharge && phase === 'charge' && created?.firstPaymentId) {
         const skippedNote = created.skipped.length > 0
             ? ` ${plural(created.skipped.length, 'ocorrência pulada', 'ocorrências puladas')} por conflito.`
             : '';
@@ -1399,6 +1407,11 @@ export default function CustomContractFlow({ mode, pricing, users = [], onClose,
                     onRemove={() => setAppliedCoupon(null)}
                     disabled={busy}
                 />
+                {zeroCouponNeedsBaixa && (
+                    <div id={`${uid}-zero-coupon`} className="admin-alert admin-alert--warning" role="status" style={{ marginTop: 'var(--space-2)', marginBottom: 0, fontSize: '0.75rem', lineHeight: 1.45 }}>
+                        Cupom que zera a 1ª cobrança registra a parcela como paga e exige a permissão “Marcar como pago, anular ou estornar”. Remova o cupom ou use um de valor menor.
+                    </div>
+                )}
                 <div className="ccf-summary">
                     <div className="ccf-summary__row">
                         <span>{paymentPlan === 'FULL' ? 'Pagamento integral' : '1ª cobrança'}</span>
@@ -1420,7 +1433,9 @@ export default function CustomContractFlow({ mode, pricing, users = [], onClose,
             {isAdmin ? (
                 <div className="admin-info-banner ccf-section">
                     <ShieldCheck size={16} className="admin-info-banner__icon" aria-hidden="true" />
-                    <span>O contrato nasce <strong>ativo</strong>, com as sessões confirmadas. Em seguida você cobra a 1ª cobrança (cartão ou PIX) ou deixa pendente para o cliente pagar depois.</span>
+                    {staffCanCharge
+                        ? <span>O contrato nasce <strong>ativo</strong>, com as sessões confirmadas. Em seguida você cobra a 1ª cobrança (cartão ou PIX) ou deixa pendente para o cliente pagar depois.</span>
+                        : <span>O contrato nasce <strong>ativo</strong>, com as sessões confirmadas. A 1ª cobrança fica <strong>pendente</strong>: o cliente paga pelo app. Cobrar na hora (cartão ou PIX) exige a permissão “Cobrar o cliente”.</span>}
                 </div>
             ) : (
                 <>
@@ -1449,13 +1464,14 @@ export default function CustomContractFlow({ mode, pricing, users = [], onClose,
                 <button key="back" type="button" className="btn-admin-ghost" disabled={busy} onClick={() => { setError(''); back(); }}>
                     <ArrowLeft size={16} aria-hidden="true" /> Voltar
                 </button>,
-                <button key="submit" type="button" className="btn-admin-go" disabled={!canStep4 || busy} aria-busy={busy}
+                <button key="submit" type="button" className="btn-admin-go" disabled={!canStep4 || busy || zeroCouponNeedsBaixa} aria-busy={busy}
+                    aria-describedby={zeroCouponNeedsBaixa ? `${uid}-zero-coupon` : undefined}
                     onClick={e => { if (e.detail > 1) return; void handleSubmit(); }}>
                     {busy
                         ? <><Loader2 size={16} className="csp-spin" aria-hidden="true" /> Verificando agenda…</>
                         : isAdmin ? <>Criar contrato <ArrowRight size={16} aria-hidden="true" /></> : <><ShieldCheck size={16} aria-hidden="true" /> Ir para pagamento</>}
                 </button>,
-                canStep4 ? undefined : step4Hint,
+                !canStep4 ? step4Hint : zeroCouponNeedsBaixa ? 'Remova o cupom que zera a 1ª cobrança.' : undefined,
             )}
         </div>
     );
@@ -1581,7 +1597,7 @@ export default function CustomContractFlow({ mode, pricing, users = [], onClose,
                 <h3 className="ccf-state__title">{isAdmin ? 'Contrato criado' : 'Plano ativado!'}</h3>
                 <p className="ccf-state__desc">
                     {isAdmin
-                        ? `O contrato "${name.trim()}" de ${selectedClient?.name ?? 'cliente'} está ativo${freeFirst ? ' e a 1ª cobrança foi coberta pelo cupom' : ''}.`
+                        ? `O contrato "${name.trim()}" de ${selectedClient?.name ?? 'cliente'} está ativo${freeFirst ? ' e a 1ª cobrança foi coberta pelo cupom' : created.firstPending ? '. A 1ª cobrança ficou pendente: o cliente paga pelo app' : ''}.`
                         : freeFirst
                             ? `Seu cupom cobriu a 1ª cobrança e o plano "${name.trim()}" já está ativo.`
                             : `Pagamento confirmado. Seu plano "${name.trim()}" está ativo.`}

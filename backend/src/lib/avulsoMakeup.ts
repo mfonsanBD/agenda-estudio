@@ -16,6 +16,7 @@ import { logAudit } from './audit.js';
 import { syncContractCompletion } from './contractCompletion.js';
 import { studioDateTime } from '../utils/pricing.js';
 import { notifyEvent } from '../modules/notifications/notificationService.js';
+import { getStaffRecipientIds } from './staffRecipients.js';
 import {
     checkMoveSlotTier,
     withMovableSlot,
@@ -23,6 +24,7 @@ import {
     deductCredit,
     syncAvulsoContractSchedule,
 } from '../modules/bookings/booking.service.js';
+import { sessionPaymentState, SESSION_PAYMENT_SELECT, type SessionPaymentLike } from '../modules/bookings/sessionPayment.js';
 import type { BookingStatus, MakeupStatus } from '../generated/prisma/client.js';
 
 export const AVULSO_MAKEUP_DAYS_KEY = 'avulso_makeup_days';
@@ -41,17 +43,20 @@ export function isMakeupContractStatus(status: string | null | undefined): boole
 
 /**
  * "Sem novo pagamento" pressupõe o pagamento original de pé. Motivo pelo qual a reserva NÃO pode usar a
- * remarcação (contrato cancelado/encerrado, valor estornado, reserva nunca paga) — ou null se pode.
- * `paymentStatuses` = status dos Payments da reserva e do contrato avulso (a mesma cobrança).
+ * remarcação (contrato cancelado/encerrado, valor estornado, gravação não paga) — ou null se pode.
+ * `payments` = os Payments da reserva e do contrato avulso (status, metadata e paymentUrl).
+ * R5 (ATU4-04/UXT-07): "paga" é a cobrança da GRAVAÇÃO (modules/bookings/sessionPayment.sessionPaymentState) —
+ * com a marca sessionCharge, nenhuma marcada em aberto e uma marcada PAID; sem a marca, um PAID que não seja a
+ * compra de um extra. Um serviço extra pago nunca libera a remarcação de uma sessão cuja cobrança está em aberto.
  */
-export function makeupBlockReason(p: { contractStatus: string | null | undefined; paymentStatuses: string[] }): string | null {
+export function makeupBlockReason(p: { contractStatus: string | null | undefined; payments: readonly SessionPaymentLike[] }): string | null {
     if (!isMakeupContractStatus(p.contractStatus)) {
         return 'O contrato desta gravação foi cancelado ou encerrado; a remarcação sem novo pagamento não está disponível.';
     }
-    if (p.paymentStatuses.includes('REFUNDED')) {
+    if (p.payments.some(x => x.status === 'REFUNDED')) {
         return 'O pagamento desta gravação foi estornado; a remarcação sem novo pagamento não está disponível.';
     }
-    if (!p.paymentStatuses.includes('PAID')) {
+    if (!sessionPaymentState(p.payments).paid) {
         return 'O pagamento desta gravação não está confirmado; a remarcação sem novo pagamento só vale para gravação paga.';
     }
     return null;
@@ -59,23 +64,26 @@ export function makeupBlockReason(p: { contractStatus: string | null | undefined
 
 /** Select Prisma com o que makeupBlockReason precisa (status do contrato + Payments da reserva e do contrato). */
 export const MAKEUP_ELIGIBILITY_SELECT = {
-    contract: { select: { status: true, payments: { select: { status: true } } } },
-    payments: { select: { status: true } },
+    contract: { select: { status: true, payments: { select: SESSION_PAYMENT_SELECT } } },
+    payments: { select: SESSION_PAYMENT_SELECT },
 } as const;
 
 /** makeupBlockReason a partir de uma reserva carregada com MAKEUP_ELIGIBILITY_SELECT. */
 export function makeupBlockReasonOf(b: {
-    contract: { status: string; payments: { status: string }[] } | null;
-    payments: { status: string }[];
+    contract: { status: string; payments: SessionPaymentLike[] } | null;
+    payments: SessionPaymentLike[];
 }): string | null {
     return makeupBlockReason({
         contractStatus: b.contract?.status,
-        paymentStatuses: [...b.payments, ...(b.contract?.payments ?? [])].map(x => x.status),
+        payments: [...b.payments, ...(b.contract?.payments ?? [])],
     });
 }
 
 /** D3: remarcação sem novo pagamento nunca vale para cliente excluído (soft delete/anonimizado). */
 export const MAKEUP_DELETED_CLIENT_ERROR = 'Este cliente foi excluído. A remarcação sem novo pagamento não está disponível.';
+
+/** Sem janela de remarcação (e sem outro motivo conhecido) — também o 400 do Remarcar nesse caso. */
+export const NO_MAKEUP_WINDOW_ERROR = 'Não há janela de remarcação aberta para esta gravação.';
 
 async function loadMakeupBlockReason(bookingId: string): Promise<string | null> {
     const b = await prisma.booking.findUnique({
@@ -209,8 +217,8 @@ export async function openMakeupWindow(
         where: { id: bookingId },
         select: {
             id: true, userId: true, date: true, status: true, makeupStatus: true,
-            contract: { select: { type: true, status: true, payments: { select: { status: true } } } },
-            payments: { select: { status: true } },
+            contract: { select: { type: true, status: true, payments: { select: SESSION_PAYMENT_SELECT } } },
+            payments: { select: SESSION_PAYMENT_SELECT },
             user: { select: { deletedAt: true } },
         },
     });
@@ -344,6 +352,52 @@ export async function applyMakeupOnStatusChange(p: {
     return false;
 }
 
+// ─── O que a marcação de Não realizado fez com a janela (resposta do PATCH) ─────
+
+/**
+ * AUDFIN6-03/TELA6-01: resultado da janela depois do PATCH → NAO_REALIZADO de um AVULSO, para a tela dizer o que o
+ * servidor fez em vez de prever pela data:
+ *  • makeupOpened — a janela está ABERTA e no prazo (o cliente remarca sem novo pagamento até makeupDeadline);
+ *  • makeupDeadline — o prazo gravado (janela aberta ou já vencida), ISO; null sem janela;
+ *  • makeupBlockReason — por que não está aberta (null quando está): prazo vencido (a equipe ainda remarca — D5) ou o
+ *    motivo de makeupBlockReason (contrato cancelado/encerrado, estornada, não paga — inclusive a cobrança anulada) /
+ *    cliente excluído.
+ */
+export interface MakeupOutcome {
+    makeupOpened: boolean;
+    makeupDeadline: string | null;
+    makeupBlockReason: string | null;
+}
+
+/** Motivo quando a janela ficou VENCIDA (Não realizado com o prazo já passado — D5: a equipe ainda remarca). */
+export function makeupExpiredReason(deadline: Date | null | undefined): string {
+    const last = deadline ? ` em ${ddmmOfYmd(deadlineYmd(deadline))}` : '';
+    return `O prazo da remarcação sem novo pagamento terminou${last}: o cliente não remarca pelo app, mas a equipe ainda pode remarcar (Remarcar).`;
+}
+
+/** Regra pura: o estado gravado da janela (+ o motivo de bloqueio já carregado) → MakeupOutcome. */
+export function makeupOutcome(
+    b: { status?: string | null; makeupStatus: string | null; makeupDeadline: Date | null },
+    blockReason: string | null,
+    now: Date = new Date(),
+): MakeupOutcome {
+    const deadline = b.makeupDeadline ? b.makeupDeadline.toISOString() : null;
+    if (isMakeupOpen(b, now)) return { makeupOpened: true, makeupDeadline: deadline, makeupBlockReason: null };
+    if (b.makeupStatus === 'OPEN' || b.makeupStatus === 'EXPIRED') {
+        return { makeupOpened: false, makeupDeadline: deadline, makeupBlockReason: makeupExpiredReason(b.makeupDeadline) };
+    }
+    return { makeupOpened: false, makeupDeadline: null, makeupBlockReason: blockReason ?? NO_MAKEUP_WINDOW_ERROR };
+}
+
+/** makeupOutcome da reserva já atualizada (carrega o motivo do bloqueio só quando não há janela). */
+export async function loadMakeupOutcome(
+    b: { id: string; status: string; makeupStatus: string | null; makeupDeadline: Date | null },
+    now: Date = new Date(),
+): Promise<MakeupOutcome> {
+    const hasWindow = b.makeupStatus === 'OPEN' || b.makeupStatus === 'EXPIRED';
+    return makeupOutcome(b, hasWindow ? null : await loadMakeupBlockReason(b.id), now);
+}
+
 // ─── Remarcação (PATCH /bookings/:id/makeup) ────────────
 
 const MAKEUP_BOOKING_SELECT = {
@@ -355,36 +409,49 @@ const MAKEUP_BOOKING_SELECT = {
 } as const;
 
 /**
+ * Quem remarca: o cliente dono, ou a EQUIPE autorizada (ADMIN ou COLABORADOR com `agendamentos.faltas`
+ * — a rota confere a permissão ANTES de chamar). `isStaff` é o campo atual; `isAdmin` é o nome antigo
+ * (mesmo significado: "equipe autorizada"), aceito para não quebrar quem já chama assim.
+ */
+export interface MakeupActor {
+    userId: string;
+    isStaff?: boolean;
+    /** @deprecated use `isStaff` (mesmo significado: equipe autorizada). */
+    isAdmin?: boolean;
+}
+
+/**
  * Remarca a gravação perdida para `date`/`startTime` reabrindo a MESMA reserva (mesmo Payment).
- * Cliente dono ou ADMIN. Regras:
- *  - contrato AVULSO, status FALTA/NAO_REALIZADO, janela OPEN e prazo não vencido. Exceção (D5): o
- *    ADMIN pode remarcar um NAO_REALIZADO mesmo sem janela aberta/depois do prazo (e sem o teto D+N);
+ * Cliente dono ou equipe autorizada. Regras:
+ *  - contrato AVULSO, status FALTA/NAO_REALIZADO, janela OPEN e prazo não vencido. Exceção (D5): a
+ *    equipe pode remarcar um NAO_REALIZADO mesmo sem janela aberta/depois do prazo (e sem o teto D+N);
  *  - nova data ≤ último dia da janela; antecedência mínima (booking_min_advance_hours) para o cliente,
- *    só "não no passado" para o admin; dia de funcionamento, horário da grade e mesma faixa;
+ *    só "não no passado" para a equipe; dia de funcionamento, horário da grade e mesma faixa;
  *  - trava Redis + conflito + bloqueio (withMovableSlot, o mesmo do /reschedule);
  *  - updateMany atômico → CONFIRMED + USED (2 cliques/2 abas: só um vence, o outro recebe 409).
  * A partir de NAO_REALIZADO faz deductCredit (o NAO_REALIZADO devolveu 1 crédito ao ser marcado).
  */
 export async function rescheduleAvulsoMakeup(p: {
     bookingId: string;
-    actor: { userId: string; isAdmin: boolean };
+    actor: MakeupActor;
     date: string;
     startTime: string;
     now?: Date;
 }) {
     const now = p.now ?? new Date();
+    const isStaff = p.actor.isStaff ?? p.actor.isAdmin ?? false;
     const b = await prisma.booking.findUnique({
         where: { id: p.bookingId },
         select: {
             id: true, userId: true, contractId: true, date: true, startTime: true, status: true,
             tierApplied: true, originalDate: true, missedDate: true,
             makeupStatus: true, makeupDeadline: true,
-            contract: { select: { type: true, status: true, payments: { select: { status: true } } } },
-            payments: { select: { status: true } },
+            contract: { select: { type: true, status: true, payments: { select: SESSION_PAYMENT_SELECT } } },
+            payments: { select: SESSION_PAYMENT_SELECT },
             user: { select: { name: true, deletedAt: true } },
         },
     });
-    if (!b || (!p.actor.isAdmin && b.userId !== p.actor.userId)) {
+    if (!b || (!isStaff && b.userId !== p.actor.userId)) {
         throw new MakeupError(404, 'Agendamento não encontrado.');
     }
     // D3: cliente excluído não ganha gravação nova — nem pelo override do admin (D5).
@@ -403,7 +470,7 @@ export async function rescheduleAvulsoMakeup(p: {
             : 'Esta gravação não está disponível para remarcação.');
     }
 
-    const adminOverride = p.actor.isAdmin && b.status === 'NAO_REALIZADO';
+    const adminOverride = isStaff && b.status === 'NAO_REALIZADO';
     const windowOpen = isMakeupOpen(b, now);
     if (!windowOpen && !adminOverride) {
         if (b.makeupStatus === 'USED') throw new MakeupError(400, 'Esta gravação já foi remarcada (a remarcação é única).');
@@ -413,7 +480,7 @@ export async function rescheduleAvulsoMakeup(p: {
         }
         throw new MakeupError(400, b.status === 'FALTA'
             ? 'Esta falta não foi justificada pelo estúdio, então não há remarcação sem novo pagamento.'
-            : 'Não há janela de remarcação aberta para esta gravação.');
+            : NO_MAKEUP_WINDOW_ERROR);
     }
 
     // Data/horário de destino.
@@ -425,7 +492,7 @@ export async function rescheduleAvulsoMakeup(p: {
     }
     const slotStart = studioDateTime(p.date, p.startTime);
     if (Number.isNaN(slotStart.getTime())) throw new MakeupError(400, 'Data ou horário inválido.');
-    if (p.actor.isAdmin) {
+    if (isStaff) {
         if (slotStart.getTime() <= now.getTime()) {
             throw new MakeupError(400, 'Não é possível remarcar para uma data ou horário que já passou.');
         }
@@ -487,7 +554,7 @@ export async function rescheduleAvulsoMakeup(p: {
     const oldYmd = ymdOfDbDate(b.date);
     const slotKey = `${p.date}:${p.startTime}`;
     // Remarcado pelo ESTÚDIO: o cliente precisa saber a nova data (quando ele mesmo remarca, já sabe).
-    if (p.actor.isAdmin) {
+    if (isStaff) {
         await notifyEvent('avulso_makeup_rescheduled', {
             userId: b.userId,
             vars: { data: ddmmOfYmd(oldYmd), novaData: ddmmOfYmd(p.date), hora: p.startTime },
@@ -496,24 +563,28 @@ export async function rescheduleAvulsoMakeup(p: {
             dedupKey: `makeup:rescheduled:client:${b.id}:${slotKey}`,
         }).catch(err => console.error('[MAKEUP] notify client rescheduled:', err));
     }
-    // Admins são avisados — menos quem acabou de remarcar.
-    const admins = await prisma.user.findMany({
-        where: { role: 'ADMIN', deletedAt: null, id: { not: p.actor.userId } },
-        select: { id: true },
-    });
-    for (const admin of admins) {
+    // Equipe avisada (ADMIN ativo + COLABORADOR ativo com a permissão do evento — STAFF_EVENT_PERMISSIONS),
+    // menos quem acabou de remarcar. Nunca BLOCKED nem excluído. A remarcação já foi gravada: falha aqui
+    // só perde o aviso.
+    let staffIds: string[] = [];
+    try {
+        staffIds = await getStaffRecipientIds('admin_makeup_rescheduled', { excludeUserId: p.actor.userId });
+    } catch (err) {
+        console.error('[MAKEUP] Falha ao buscar a equipe para o aviso de remarcação:', err);
+    }
+    for (const staffId of staffIds) {
         await notifyEvent('admin_makeup_rescheduled', {
-            userId: admin.id,
+            userId: staffId,
             vars: { cliente: b.user?.name || 'Cliente', data: ddmmOfYmd(oldYmd), novaData: ddmmOfYmd(p.date), hora: p.startTime },
             entityType: 'BOOKING',
             entityId: b.id,
-            dedupKey: `makeup:rescheduled:${b.id}:${admin.id}:${slotKey}`,
-        }).catch(err => console.error('[MAKEUP] notify admin rescheduled:', err));
+            dedupKey: `makeup:rescheduled:${b.id}:${staffId}:${slotKey}`,
+        }).catch(err => console.error('[MAKEUP] notify staff rescheduled:', err));
     }
     await logAudit('BOOKING', b.id, 'MAKEUP_RESCHEDULED', p.actor.userId, {
         from: { date: oldYmd, startTime: b.startTime, status: fromStatus, makeupStatus: b.makeupStatus },
         to: { date: p.date, startTime: p.startTime },
-        byAdmin: p.actor.isAdmin,
+        byStaff: isStaff,
         afterDeadline: !windowOpen,
     });
     await syncContractCompletion(b.contractId, p.actor.userId);

@@ -1,5 +1,5 @@
 import { useState, useEffect, useId } from 'react';
-import { notificationsAdminApi, usersApi, UserSummary, BroadcastBatch } from '../../../api/client';
+import { notificationsAdminApi, usersApi, UserSummary, BroadcastBatch, ApiError } from '../../../api/client';
 import { useUI } from '../../../context/UIContext';
 import { getErrorMessage } from '../../../utils/errors';
 import ToggleSwitch from '../../ui/ToggleSwitch';
@@ -71,6 +71,15 @@ export default function BroadcastComposer() {
                     setTitle(''); setMessage(''); setSelected(null);
                     loadHistory();
                 } catch (err) {
+                    // 400 INVALID_RECIPIENTS (F5): o destinatário escolhido não é (mais) um cliente ativo no app
+                    // (excluído, ou a lista estava velha) — nada foi enviado. Limpa a escolha e recarrega a lista.
+                    if (err instanceof ApiError && err.code === 'INVALID_RECIPIENTS') {
+                        setSelected(null);
+                        setLoaded(false);
+                        setClientsRetry(n => n + 1);
+                        showToast({ message: `${getErrorMessage(err)} Nada foi enviado.`, type: 'error' });
+                        return;
+                    }
                     showToast({ message: getErrorMessage(err), type: 'error' });
                 } finally { setSending(false); }
             },
