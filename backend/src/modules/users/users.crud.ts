@@ -4,7 +4,7 @@ import bcrypt from 'bcryptjs';
 import { prisma } from '../../lib/prisma.js';
 import { logAudit } from '../../lib/audit.js';
 import { authenticate, revokeUserSessions } from '../../middleware/auth.js';
-import { enforceRuleResult, requirePermission, requireStaff, can, type Actor } from '../../middleware/permissions.js';
+import { enforceRuleResult, requirePermission, requireStaff, requireAdmin, can, type Actor } from '../../middleware/permissions.js';
 import { routeActor } from '../bookings/permissionGuards.js';
 import { requiredForUserCreate, requiredForUserPatch } from '../../lib/permissionRules.js';
 import { cleanDocument, isValidCpfCnpj } from '../../utils/document.js';
@@ -12,7 +12,9 @@ import { formatBRL } from '../../utils/pricing.js';
 import {
     deleteUser, getDeletionPreview, assertUserDeletable, UserDeletionError,
     deletionMissingPermissions, deletionMissingPermissionsMessage, type DeletionSettleKey,
+    getPurgePreview, purgeUser,
 } from '../../lib/userDeletion.js';
+import { StaffError } from '../staff/staff.service.js';
 
 /**
  * AUDFIN-04: o `can` da exclusão para o ator — ADMIN não confere nada (como antes); a equipe precisa também da chave
@@ -355,6 +357,43 @@ export function registerUserCrudRoutes(router: Router) {
             }
             console.error('[DELETE USER ERROR]:', err);
             res.status(500).json({ error: 'Erro ao excluir o cliente.' });
+        }
+    });
+
+    // ─── Exclusão DEFINITIVA (só o ADMIN; qualquer conta) ───
+    // Apaga a conta e tudo o que é dela (contratos, gravações, cobranças, resgates de cupom). Regras em
+    // lib/userDeletion.ts (purgeUser): não a própria conta, nunca o último administrador ativo.
+    const purgeErrorBody = (err: unknown, res: Response): boolean => {
+        if (err instanceof UserDeletionError) {
+            res.status(err.httpStatus).json({ error: err.message, ...(err.extra ?? {}) });
+            return true;
+        }
+        if (err instanceof StaffError) {
+            res.status(err.status).json(err.body());
+            return true;
+        }
+        return false;
+    };
+
+    router.get('/:id/purge-preview', authenticate, requireAdmin(), async (req: Request, res: Response) => {
+        try {
+            res.json({ preview: await getPurgePreview(req.params.id as string, req.user!.userId) });
+        } catch (err) {
+            if (purgeErrorBody(err, res)) return;
+            console.error('[USER-PURGE-PREVIEW]', err);
+            res.status(500).json({ error: 'Erro ao calcular o que será apagado.' });
+        }
+    });
+
+    router.delete('/:id/permanent', authenticate, requireAdmin(), async (req: Request, res: Response) => {
+        try {
+            const result = await purgeUser(req.params.id as string, req.user!.userId);
+            const who = result.role === 'CLIENTE' ? 'Cliente' : result.role === 'ADMIN' ? 'Administrador' : 'Colaborador';
+            res.json({ message: `${who} excluído definitivamente.`, removed: result.removed });
+        } catch (err) {
+            if (purgeErrorBody(err, res)) return;
+            console.error('[USER-PURGE]', err);
+            res.status(500).json({ error: 'Erro ao excluir a conta.' });
         }
     });
 

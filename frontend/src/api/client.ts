@@ -507,6 +507,10 @@ export const usersApi = {
     remove: (id: string) => request<{ message: string; softDeleted: boolean; cancelled?: { contracts: number; bookings: number; payments: number }; paidDuringDeletion?: { payments: number; amount: number } }>(`/users/${id}`, { method: 'DELETE' }),
     // Consequências reais da exclusão, para o modal de perigo montar a lista antes de confirmar.
     deletionPreview: (id: string) => request<{ preview: UserDeletionPreview }>(`/users/${id}/deletion-preview`),
+    /** Exclusão DEFINITIVA (só o ADMIN; qualquer conta): o que vai sumir. */
+    purgePreview: (id: string) => request<{ preview: UserPurgePreview }>(`/users/${id}/purge-preview`),
+    /** Exclusão DEFINITIVA: apaga a conta e tudo o que é dela (contratos, gravações, cobranças). */
+    purge: (id: string) => request<{ message: string; removed: { contracts: number; bookings: number; payments: number; couponRedemptions: number; blockedSlotsReassigned: number } }>(`/users/${id}/permanent`, { method: 'DELETE' }),
     paymentOverview: (id: string) => request<{
         autoChargeEnabled: boolean; hasSavedCard: boolean;
         cards: { id: string; brand: string; last4: string; expMonth: number; expYear: number; isDefault: boolean }[];
@@ -1227,6 +1231,20 @@ export interface UserSummary {
     deletedAt?: string | null;
 }
 /** GET /users/:id/deletion-preview — mode 'hard' = nada de negócio vinculado (apaga de vez); 'soft' = anonimiza e cancela pendências. Valores em centavos. */
+/** GET /users/:id/purge-preview — o que a exclusão definitiva apaga. */
+export interface UserPurgePreview {
+    id: string;
+    name: string;
+    role: 'ADMIN' | 'CLIENTE' | 'COLABORADOR' | string;
+    alreadyDeleted: boolean;
+    contracts: number;
+    bookings: number;
+    payments: number;
+    paidPayments: number;
+    paidAmount: number;
+    blockedSlots: number;
+}
+
 export interface UserDeletionPreview {
     userId: string;
     name: string;

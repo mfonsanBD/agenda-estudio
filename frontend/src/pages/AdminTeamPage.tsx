@@ -4,6 +4,7 @@ import { staffApi, type StaffMember } from '../api/client';
 import { useAuth } from '../context/AuthContext';
 import { useUI } from '../context/UIContext';
 import { useAdminTeam, type TeamFilter } from '../hooks/useAdminTeam';
+import { usePurgeUser } from '../hooks/usePurgeUser';
 import AdminPageHeader from '../components/admin/AdminPageHeader';
 import TeamTable from '../components/admin/team/TeamTable';
 import TeamMemberModal from '../components/admin/team/TeamMemberModal';
@@ -37,6 +38,7 @@ export default function AdminTeamPage() {
     const team = useAdminTeam();
     const { showToast, showConfirm } = useUI();
     const { refreshPermissions } = useAuth();
+    const { requestPurge, purgingId } = usePurgeUser();
 
     const [editor, setEditor] = useState<{ member: StaffMember | null; step?: number } | null>(null);
     const [passwordFor, setPasswordFor] = useState<StaffMember | null>(null);
@@ -210,6 +212,8 @@ export default function AdminTeamPage() {
                                     onSetPassword={setPasswordFor}
                                     onDeactivate={member => setConfirm({ kind: 'deactivate', member })}
                                     onReactivate={member => setConfirm({ kind: 'reactivate', member })}
+                                    onPurge={member => void requestPurge({ id: member.id, name: member.name }, () => void team.reload())}
+                                    purgingId={purgingId}
                                 />
                                 {onlyMe && !filtering && (
                                     <div className="admin-empty" style={{ paddingTop: '24px' }}>

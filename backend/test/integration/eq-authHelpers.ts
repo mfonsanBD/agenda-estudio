@@ -661,6 +661,11 @@ export const MATRIX: MatrixRow[] = [
                 return u.deletedAt !== null && p.status === 'CANCELLED';
             });
         } },
+    // Exclusão DEFINITIVA (05/11): só o ADMIN, qualquer conta.
+    { method: 'GET', path: '/api/users/:id/purge-preview', need: 'ADMIN',
+        build: async ({ owner }) => at('GET', `/api/users/${owner.id}/purge-preview`) },
+    { method: 'DELETE', path: '/api/users/:id/permanent', need: 'ADMIN',
+        build: async ({ owner }) => at('DELETE', `/api/users/${owner.id}/permanent`) },
     // DECISOES resposta 3 (EQ-REQ-05): o card "Pagamento" do perfil não é receita consolidada — abre com o perfil.
     { method: 'GET', path: '/api/users/:id/payment-overview', need: ['clientes.ver', 'financeiro.ver', 'cobrancas.automatica'],
         build: async ({ owner }) => { await sicoobPayment(owner); return at('GET', `/api/users/${owner.id}/payment-overview`); } },

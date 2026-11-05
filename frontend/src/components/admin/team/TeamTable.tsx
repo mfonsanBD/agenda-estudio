@@ -1,4 +1,4 @@
-import { KeyRound, Loader2, Mail, Pencil, Power, PowerOff, ShieldCheck } from 'lucide-react';
+import { KeyRound, Loader2, Mail, Pencil, Power, PowerOff, ShieldCheck, Trash2 } from 'lucide-react';
 import type { StaffCatalog, StaffMember } from '../../../api/client';
 import { STAFF_ROLE_META, STAFF_STATUS_META, getMeta } from '../../../constants/adminMeta';
 import { maskPhone } from '../../../utils/mask';
@@ -21,6 +21,10 @@ export interface TeamTableProps {
     onSetPassword: (member: StaffMember) => void;
     onDeactivate: (member: StaffMember) => void;
     onReactivate: (member: StaffMember) => void;
+    /** Exclusão definitiva (prévia → digitar EXCLUIR). */
+    onPurge: (member: StaffMember) => void;
+    /** Linha com a prévia da exclusão em andamento (ícone vira spinner). */
+    purgingId: string | null;
 }
 
 function initials(name: string): string {
@@ -45,7 +49,7 @@ function accessModules(member: StaffMember, catalog: StaffCatalog | null): strin
  * "Desativar" do único administrador ativo fica desabilitado com a explicação.
  */
 export default function TeamTable({
-    members, catalog, activeAdmins, sendingId, onEdit, onSendAccess, onSetPassword, onDeactivate, onReactivate,
+    members, catalog, activeAdmins, sendingId, onEdit, onSendAccess, onSetPassword, onDeactivate, onReactivate, onPurge, purgingId,
 }: TeamTableProps) {
     return (
         <div className="table-container" style={{ margin: 0 }}>
@@ -181,6 +185,22 @@ export default function TeamTable({
                                                         onClick={() => onReactivate(m)}>
                                                         <Power size={16} aria-hidden="true" />
                                                     </button>
+                                                </Tooltip>
+                                            )}
+
+                                            {!m.isSelf && (
+                                                <Tooltip content="Excluir definitivamente" describe={false}>
+                                                    <span style={{ display: 'inline-flex' }}>
+                                                        <button type="button" className="admin-icon-btn admin-icon-btn--danger"
+                                                            aria-label={`Excluir ${m.name} definitivamente`}
+                                                            aria-busy={purgingId === m.id || undefined}
+                                                            disabled={purgingId !== null}
+                                                            onClick={() => onPurge(m)}>
+                                                            {purgingId === m.id
+                                                                ? <Loader2 size={16} className="danger-dialog__spinner" aria-hidden="true" />
+                                                                : <Trash2 size={16} aria-hidden="true" />}
+                                                        </button>
+                                                    </span>
                                                 </Tooltip>
                                             )}
                                         </div>

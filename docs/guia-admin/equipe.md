@@ -29,12 +29,13 @@ O sistema nunca fica sem administrador ativo: a tela não deixa tornar colaborad
 | **Definir senha** (chave) | Colaborador que não é você e **nunca foi administrador** | Define uma senha nova (mínimo de 8 caracteres, digitada duas vezes). As sessões abertas da pessoa são encerradas em todos os aparelhos. Para quem já foi administrador o botão não aparece (use **Enviar acesso**); se a lista estiver desatualizada, o sistema recusa e a folha explica a regra. |
 | **Desativar acesso** | Pessoa ativa que não é você | Pede confirmação. A pessoa sai na hora de todas as sessões, não consegue mais entrar (senha, código e Google), e as notificações no celular param. O histórico fica; as permissões ficam guardadas. Para o único administrador ativo, o botão fica desabilitado com a explicação. |
 | **Reativar acesso** | Pessoa desativada | Pede confirmação. A pessoa volta a entrar com o mesmo e-mail e recupera as permissões que tinha. |
+| **Excluir definitivamente** (lixeira) | Qualquer pessoa que não é você (inclusive outro administrador) | Mostra o que vai sumir e pede para digitar **EXCLUIR**. A conta é apagada de vez e a pessoa perde o acesso na hora; os bloqueios de agenda que ela criou continuam, em seu nome. Não é possível desfazer. Para afastar alguém sem apagar, use **Desativar acesso**. |
 
 ### Proteções
 
 - **Na sua própria linha só existe Editar**: ninguém muda o próprio tipo de acesso nem se desativa (peça a outro administrador).
 - O **e-mail e a senha de um administrador não se alteram por aqui**, nem os de quem **já foi administrador** e virou colaborador. Para essas pessoas, use **Enviar acesso** (o código de entrada vai para o e-mail delas). No **Editar**, o e-mail delas já vem travado: o seu, com "O seu e-mail de administrador não se altera por aqui, por segurança."; o de um administrador, com "O e-mail de um administrador não se altera por aqui, por segurança."; o de quem já foi, com "Esta pessoa já foi administradora: o e-mail e a senha não se alteram por aqui, por segurança.". Se a lista estiver desatualizada e o sistema recusar a troca, o assistente volta à etapa **Dados** com "Por segurança, o e-mail de quem é ou já foi administrador não se altera pela tela Equipe. O e-mail voltou ao anterior: salve de novo para gravar as outras alterações.".
-- **Não existe excluir** pessoa da equipe: use **Desativar**.
+- **Excluir definitivamente** apaga a conta de vez; para só afastar a pessoa (e poder trazê-la de volta), use **Desativar**. Ninguém exclui a própria conta, e o sistema nunca fica sem um administrador ativo.
 - O e-mail da equipe **não pode ser de um cliente**: a mesma pessoa que é cliente usa outro e-mail para a conta da equipe.
 - Toda mudança fica registrada na auditoria do sistema (quem fez, quando e o que mudou).
 

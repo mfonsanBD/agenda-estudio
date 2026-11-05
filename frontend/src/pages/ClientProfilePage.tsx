@@ -12,6 +12,7 @@ import { ArrowLeft, NotebookPen, Check, UserX, AlertTriangle, Trash2, Loader2, C
 import BrandLoader from '../components/ui/BrandLoader';
 import { useUI } from '../context/UIContext';
 import { useDeleteClient } from '../hooks/useDeleteClient';
+import { usePurgeUser } from '../hooks/usePurgeUser';
 import { getErrorMessage } from '../utils/errors';
 import { usePermission } from '../hooks/usePermission';
 
@@ -28,7 +29,8 @@ export default function ClientProfilePage() {
     // clientes.ver, financeiro.ver OU cobrancas.automatica — EQ-REQ-05 / DECISÕES resposta 3: sem
     // financeiro.ver some só a receita consolidada, não as parcelas do cliente. O interruptor continua só
     // com cobrancas.automatica; excluir = clientes.excluir.
-    const { can, canAny } = usePermission();
+    const { can, canAny, isAdmin } = usePermission();
+    const { requestPurge, purgingId } = usePurgeUser();
     const canEditProfile = can('clientes.editar');
     const canSeePayments = canAny('clientes.ver', 'financeiro.ver', 'cobrancas.automatica');
     const canToggleAutoCharge = can('cobrancas.automatica');
@@ -229,8 +231,9 @@ export default function ClientProfilePage() {
 
             <BookingHistorySection bookings={user.bookings} onBookingUpdated={handleBookingUpdated} />
 
-            {/* Zona de perigo (D3): mesmo fluxo da lista — prévia real → digitar EXCLUIR → excluir. */}
-            {canDelete && (
+            {/* Zona de perigo (D3): mesmo fluxo da lista — prévia real → digitar EXCLUIR → excluir. A exclusão
+                definitiva (só o ADMIN) aparece também no perfil de cliente já excluído. */}
+            {(canDelete || isAdmin) && (
                 <section aria-labelledby="client-danger-zone-title" style={{
                     padding: '20px', marginTop: '24px', marginBottom: '16px', borderRadius: 'var(--radius-lg)',
                     background: 'var(--bg-card)', border: '1px solid var(--danger-bg)',
@@ -239,6 +242,7 @@ export default function ClientProfilePage() {
                     <h2 id="client-danger-zone-title" style={{ fontSize: '1.0625rem', fontWeight: 700, margin: '0 0 12px', display: 'flex', alignItems: 'center', gap: 8, color: 'var(--danger)' }}>
                         <AlertTriangle size={17} aria-hidden="true" /> Zona de perigo
                     </h2>
+                    {canDelete && (
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px 20px', flexWrap: 'wrap' }}>
                         <div style={{ flex: '1 1 280px', minWidth: 0 }}>
                             <div style={{ fontWeight: 600, fontSize: '0.875rem' }}>Excluir cliente</div>
@@ -255,6 +259,28 @@ export default function ClientProfilePage() {
                             Excluir cliente
                         </button>
                     </div>
+                    )}
+                    {isAdmin && (
+                        <div style={{
+                            display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px 20px', flexWrap: 'wrap',
+                            ...(canDelete ? { marginTop: 16, paddingTop: 16, borderTop: '1px solid var(--border-subtle)' } : {}),
+                        }}>
+                            <div style={{ flex: '1 1 280px', minWidth: 0 }}>
+                                <div style={{ fontWeight: 600, fontSize: '0.875rem' }}>Excluir definitivamente</div>
+                                <p style={{ margin: '4px 0 0', fontSize: '0.8125rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                                    Apaga de vez o cadastro e tudo o que está ligado a ele: contratos, gravações e cobranças, inclusive as pagas, que somem do financeiro e dos relatórios. Só o administrador vê esta opção. Não é possível desfazer.
+                                </p>
+                            </div>
+                            <button type="button" className="btn btn-danger" onClick={() => void requestPurge({ id: user.id, name: user.name }, () => navigate('/admin/clients'))}
+                                disabled={purgingId !== null || previewingId !== null} aria-busy={purgingId === user.id || undefined}
+                                style={{ flexShrink: 0, minHeight: 44 }}>
+                                {purgingId === user.id
+                                    ? <Loader2 size={16} className="danger-dialog__spinner" aria-hidden="true" />
+                                    : <Trash2 size={16} aria-hidden="true" />}
+                                Excluir definitivamente
+                            </button>
+                        </div>
+                    )}
                 </section>
             )}
         </div>

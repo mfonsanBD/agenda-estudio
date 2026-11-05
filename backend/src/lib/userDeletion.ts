@@ -30,6 +30,7 @@ import {
 import { getPackageSlots } from '../utils/pricing.js';
 import { isCancellationFine } from './cancellationFine.js';
 import type { BookingStatus, ContractStatus, Prisma } from '../generated/prisma/client.js';
+import { withStaffGuard, assertNotLastActiveAdmin } from '../modules/staff/staff.service.js';
 
 /**
  * Folga da revogação final (exclusão concluída): tokens assinados até N s DEPOIS do commit também
@@ -713,6 +714,136 @@ export async function deleteUser(
                 }
             }
             return await softDeleteUser(userId, adminId, now);
+        } catch (err) {
+            await undoRevocationIfNotDeleted(userId, previousRevocation, provisionalRevocation);
+            throw err;
+        }
+    } finally {
+        await releaseMutex(lockKey).catch(() => {});
+    }
+}
+
+// ─── Exclusão DEFINITIVA (só o ADMIN) ────────────────────────────────────────
+// Pedido do dono (05/11): o administrador pode apagar de vez QUALQUER conta (cliente, já excluído ou não,
+// colaborador ou outro administrador), com tudo o que é dela: contratos, gravações, cobranças (inclusive as
+// pagas, que somem dos relatórios) e resgates de cupom. Os bloqueios de agenda que a pessoa criou passam para
+// quem exclui (a agenda não muda). A auditoria fica (sem dados pessoais).
+// Recusas: a própria conta (400), conta inexistente (404), o último administrador ativo (409 LAST_ADMIN) e um
+// pagamento em processamento no provedor (409, como na exclusão comum). Antes de apagar, as cobranças vivas são
+// conciliadas e canceladas no provedor (cancelUserPendencies): nada fica cobrável lá sem registro aqui.
+
+export interface PurgePreview {
+    id: string;
+    name: string;
+    role: string;
+    alreadyDeleted: boolean;
+    contracts: number;
+    bookings: number;
+    payments: number;
+    paidPayments: number;
+    paidAmount: number;
+    blockedSlots: number;
+}
+
+export interface PurgeResult {
+    role: string;
+    removed: { contracts: number; bookings: number; payments: number; couponRedemptions: number; blockedSlotsReassigned: number };
+}
+
+/** Recusas que só leem (antes de qualquer efeito). */
+export async function assertUserPurgeable(userId: string, actorId: string): Promise<{ id: string; name: string; role: string; deletedAt: Date | null }> {
+    if (userId === actorId) throw new UserDeletionError(400, 'Você não pode excluir a sua própria conta.');
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, name: true, role: true, deletedAt: true } });
+    if (!user) throw new UserDeletionError(404, 'Usuário não encontrado.');
+    return user;
+}
+
+/** Escopo do que é da pessoa: contratos dela, gravações dela ou desses contratos, cobranças de qualquer um desses. */
+async function purgeScope(db: Pick<typeof prisma, 'contract' | 'booking'>, userId: string) {
+    const contractIds = (await db.contract.findMany({ where: { userId }, select: { id: true } })).map(c => c.id);
+    const bookingIds = (await db.booking.findMany({
+        where: { OR: [{ userId }, { contractId: { in: contractIds } }] },
+        select: { id: true },
+    })).map(b => b.id);
+    const paymentWhere: Prisma.PaymentWhereInput = {
+        OR: [{ userId }, { contractId: { in: contractIds } }, { bookingId: { in: bookingIds } }],
+    };
+    return { contractIds, bookingIds, paymentWhere };
+}
+
+export async function getPurgePreview(userId: string, actorId: string): Promise<PurgePreview> {
+    const user = await assertUserPurgeable(userId, actorId);
+    const { contractIds, bookingIds, paymentWhere } = await purgeScope(prisma, userId);
+    const [payments, paid, blockedSlots] = await Promise.all([
+        prisma.payment.count({ where: paymentWhere }),
+        prisma.payment.aggregate({ where: { AND: [paymentWhere, { status: 'PAID' }] }, _count: true, _sum: { amount: true } }),
+        prisma.blockedSlot.count({ where: { createdBy: userId } }),
+    ]);
+    return {
+        id: user.id,
+        name: user.name,
+        role: user.role,
+        alreadyDeleted: !!user.deletedAt,
+        contracts: contractIds.length,
+        bookings: bookingIds.length,
+        payments,
+        paidPayments: paid._count,
+        paidAmount: paid._sum.amount ?? 0,
+        blockedSlots,
+    };
+}
+
+export async function purgeUser(userId: string, actorId: string, now: Date = new Date()): Promise<PurgeResult> {
+    await assertUserPurgeable(userId, actorId);
+    const lockKey = userDeletionLockKey(userId); // o login da pessoa recusa enquanto ela existe
+    if (!(await acquireMutex(lockKey, 120))) {
+        throw new UserDeletionError(409, 'A exclusão desta conta já está em andamento.');
+    }
+    try {
+        const target = await assertUserPurgeable(userId, actorId);
+        const previousRevocation = await readUserSessionRevocation(userId);
+        // Derruba a sessão ANTES: a pessoa não cria reserva/cobrança nova enquanto a exclusão roda.
+        const provisionalRevocation = await revokeUserSessions(userId);
+        try {
+            const stripe = await prisma.user.findUnique({ where: { id: userId }, select: { stripeCustomerId: true } });
+            // Provedor primeiro (o que foi pago vira PAID; cobrança viva é cancelada lá; em processamento → 409).
+            await cancelUserPendencies(userId, now);
+            await detachSavedCards(userId);
+
+            const removed = await withStaffGuard(actorId, async (tx, assertActorStillAdmin) => {
+                await assertActorStillAdmin();
+                if (target.role === 'ADMIN') await assertNotLastActiveAdmin(tx, userId);
+                const { contractIds, bookingIds, paymentWhere } = await purgeScope(tx, userId);
+                const paymentIds = (await tx.payment.findMany({ where: paymentWhere, select: { id: true } })).map(p => p.id);
+
+                // Resgates de cupom: o uso ainda contado (RESERVED/CONFIRMED) volta ao cupom.
+                const redemptions = await tx.couponRedemption.findMany({
+                    where: { OR: [{ userId }, { paymentId: { in: paymentIds } }] },
+                    select: { id: true, couponId: true, status: true },
+                });
+                const counted = new Map<string, number>();
+                for (const r of redemptions) {
+                    if (r.status !== 'RELEASED') counted.set(r.couponId, (counted.get(r.couponId) ?? 0) + 1);
+                }
+                for (const [couponId, n] of counted) {
+                    await tx.coupon.updateMany({ where: { id: couponId, usedCount: { gte: n } }, data: { usedCount: { decrement: n } } });
+                }
+                const couponRedemptions = (await tx.couponRedemption.deleteMany({ where: { id: { in: redemptions.map(r => r.id) } } })).count;
+                const payments = (await tx.payment.deleteMany({ where: { id: { in: paymentIds } } })).count;
+                const bookings = (await tx.booking.deleteMany({ where: { id: { in: bookingIds } } })).count;
+                await tx.contract.updateMany({ where: { renewedFromId: { in: contractIds } }, data: { renewedFromId: null } });
+                const contracts = (await tx.contract.deleteMany({ where: { id: { in: contractIds } } })).count;
+                const blockedSlotsReassigned = (await tx.blockedSlot.updateMany({ where: { createdBy: userId }, data: { createdBy: actorId } })).count;
+                // Perfil da equipe, push, notificações, cartões e elegibilidade de cupom caem por CASCADE.
+                await tx.user.delete({ where: { id: userId } });
+                return { contracts, bookings, payments, couponRedemptions, blockedSlotsReassigned };
+            });
+
+            // Revogação FINAL (token assinado por um login/refresh em corrida com a exclusão).
+            await revokeUserSessions(userId, { graceSeconds: FINAL_REVOCATION_GRACE_S });
+            const stripeCustomerDeleted = stripe?.stripeCustomerId ? await deleteStripeCustomer(stripe.stripeCustomerId) : false;
+            await logAudit('USER', userId, 'PURGED', actorId, { role: target.role, wasSoftDeleted: !!target.deletedAt, removed, stripeCustomerDeleted });
+            return { role: target.role, removed };
         } catch (err) {
             await undoRevocationIfNotDeleted(userId, previousRevocation, provisionalRevocation);
             throw err;
